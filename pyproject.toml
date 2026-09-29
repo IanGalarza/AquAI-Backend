@@ -8,7 +8,21 @@ version = "0.1.0"
 description = "Backend de AquAI desarrollado en Python."
 readme = "README.md"
 requires-python = ">=3.11"
-dependencies = []
+dependencies = [
+    "fastapi",
+    "uvicorn",
+    "sqlalchemy",
+    "alembic",
+    "psycopg",
+    "qdrant-client",
+    "langgraph",
+    "pandas",
+    "openpyxl",
+    "plotly",
+    "pymupdf",
+    "pydantic-settings",
+    "python-multipart",
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]
