@@ -13,7 +13,7 @@ dependencies = [
     "uvicorn",
     "sqlalchemy",
     "alembic",
-    "psycopg",
+    "psycopg[binary]",
     "qdrant-client",
     "langgraph",
     "pandas",

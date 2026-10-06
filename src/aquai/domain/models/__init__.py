@@ -1,1 +1,22 @@
+"""Entidades de dominio, sin dependencias de persistencia ni de los frameworks de aplicación."""
 
+from aquai.domain.models.conversation import Conversation
+from aquai.domain.models.dataset import Dataset
+from aquai.domain.models.json_types import JsonDocument, JsonValue
+from aquai.domain.models.message import Message
+from aquai.domain.models.message_source import MessageSource
+from aquai.domain.models.message_status import MessageStatus
+from aquai.domain.models.processing_status import ProcessingStatus
+from aquai.domain.models.source import Source
+
+__all__ = [
+    "Conversation",
+    "Dataset",
+    "JsonDocument",
+    "JsonValue",
+    "Message",
+    "MessageSource",
+    "MessageStatus",
+    "ProcessingStatus",
+    "Source",
+]
