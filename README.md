@@ -26,6 +26,9 @@ src/aquai/
 ├── infrastructure/
 │   ├── config/
 │   │   └── database.py          # Configuración de la conexión
+│   ├── migrations/
+│   │   ├── env.py               # Integración de Alembic con la configuración
+│   │   └── versions/            # Historial de migraciones
 │   ├── persistence/
 │   │   ├── db_context.py        # Motor y sesiones de base de datos
 │   │   ├── mapping.py           # Registro de los mapeos
@@ -38,6 +41,7 @@ tests/
 └── unit/                        # Pruebas de configuración y persistencia
 
 docker-compose.yml              # Servicio de PostgreSQL
+alembic.ini                     # Configuración de Alembic
 pyproject.toml                  # Dependencias y configuración del paquete
 .env.example                    # Ejemplo de variables de entorno
 ```
@@ -155,6 +159,36 @@ Para consultar el estado del servicio:
 ```powershell
 docker compose ps
 ```
+
+## Migraciones
+
+Alembic utiliza la conexión de `DatabaseSettings` y la metadata de
+`infrastructure/persistence/mapping.py`. Los mapeos se registran antes de
+comparar el esquema con los modelos.
+
+La migración **InitialCreate** crea las siete tablas del proyecto e incluye los
+catálogos iniciales de `ProcessingStatus` y `MessageStatus`. Revisá el archivo en
+`src/aquai/infrastructure/migrations/versions` antes de aplicarlo.
+
+Desde la raíz del proyecto, en PowerShell:
+
+| Operación | Comando |
+| --- | --- |
+| Crear una migración desde los modelos | `.\.venv\Scripts\python.exe -m alembic revision --autogenerate -m "NombreMigracion"` |
+| Aplicar todas las migraciones pendientes | `.\.venv\Scripts\python.exe -m alembic upgrade head` |
+| Revertir la última migración aplicada | `.\.venv\Scripts\python.exe -m alembic downgrade -1` |
+| Consultar la versión actual de la base | `.\.venv\Scripts\python.exe -m alembic current --verbose` |
+| Ver el historial | `.\.venv\Scripts\python.exe -m alembic history --verbose` |
+
+Para generar el SQL y revisarlo sin aplicarlo:
+
+```powershell
+.\.venv\Scripts\python.exe -m alembic upgrade head --sql
+```
+
+Al generar otra migración con `--autogenerate`, la base debe estar al día con el
+historial existente. La revisión de columnas, restricciones y datos iniciales
+forma parte del proceso antes de aplicar cada archivo.
 
 ## Pruebas
 
