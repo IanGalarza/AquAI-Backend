@@ -20,7 +20,9 @@ dependencies = [
     "openpyxl",
     "plotly",
     "pymupdf",
+    "pydantic>=2",
     "pydantic-settings",
+    "httpx",
     "python-multipart",
 ]
 

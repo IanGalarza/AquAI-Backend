@@ -200,3 +200,147 @@ Ejecutá las pruebas con:
 
 Las pruebas cubren la validación de la configuración, los mapeos de PostgreSQL,
 las relaciones entre modelos y el manejo de las sesiones.
+
+## Procesamiento Tabular Experimental
+
+El endpoint `POST /experimental/tabular/evaluate` recibe un CSV o XLSX y permite
+evaluar recetas de preparación generadas por distintos modelos locales. Este flujo
+no necesita PostgreSQL ni Qdrant y no persiste archivos, entidades ni recetas.
+El archivo original se mantiene disponible durante la solicitud y se libera al
+terminar. La carga HTTP puede usar almacenamiento temporal administrado por FastAPI.
+
+### Iniciar y Evaluar
+
+Iniciá Ollama y asegurate de tener disponible el modelo que quieras probar.
+La URL del proveedor y el modelo predeterminado se configuran con
+`TABULAR_OLLAMA_BASE_URL` y `TABULAR_DEFAULT_MODEL` en `.env` o en el entorno.
+El proyecto no descarga modelos automáticamente.
+
+```powershell
+.\.venv\Scripts\python.exe -m uvicorn aquai.main:app --reload
+```
+
+La documentación interactiva está disponible en `http://localhost:8000/docs`.
+El campo multipart `file` es obligatorio. El parámetro de consulta `model`
+reemplaza el modelo configurado para esa evaluación. El campo multipart opcional
+`known_rules` permite agregar reglas de preparación (hasta 4000 caracteres).
+
+```powershell
+curl.exe -X POST "http://localhost:8000/experimental/tabular/evaluate?model=qwen3:14b" -F "file=@D:/datos/recuentos.xlsx"
+curl.exe -X POST "http://localhost:8000/experimental/tabular/evaluate?model=otro-modelo:tag" -F "file=@D:/datos/recuentos.xlsx" -F "known_rules=Conservar todos los registros."
+```
+
+Para comparar modelos, enviá el mismo archivo y las mismas reglas en cada
+solicitud y conservá las respuestas del endpoint.
+
+### Flujo y Contrato
+
+1. Application valida nombre, extensión, contenido y tamaño del archivo.
+2. Infrastructure inspecciona el archivo con Pandas y OpenPyXL, sin una LLM.
+3. Ollama recibe un resumen estructural con muestras acotadas y el esquema JSON
+   de la receta. Se utiliza la API de chat con salida estructurada y temperatura 0.
+4. Application valida la receta con Pydantic. Tolera texto o bloques Markdown
+   alrededor del objeto JSON y conserva la respuesta original sin modificarla.
+5. Infrastructure ejecuta sólo las operaciones implementadas explícitamente.
+6. Application clasifica el resultado a partir de las comprobaciones determinísticas.
+
+Las filas de la receta empiezan en **1**, incluyendo los registros del CSV.
+Un valor entrecomillado con saltos de línea pertenece al mismo registro.
+Un CSV se representa como una hoja llamada `data`. Los encabezados no se eliminan
+durante la inspección. `header_rows` puede tener varias filas; sus valores se
+combinan con espacios. Sin encabezados se generan nombres `column_1`, `column_2`,
+etc. `data_start_row` y `data_end_row` (opcional, inclusivo) definen el rango de datos.
+
+```json
+{
+  "status": "ready",
+  "sheets": [
+    {
+      "sheet_name": "data",
+      "header_rows": [1],
+      "data_start_row": 2,
+      "transformations": [
+        {"operation": "strip_strings"},
+        {"operation": "convert_type", "columns": ["count"], "target_type": "integer"}
+      ]
+    }
+  ],
+  "warnings": [],
+  "requires_human_review": false
+}
+```
+
+| Operación | Parámetros | Comportamiento |
+| --- | --- | --- |
+| `drop_empty_rows` | Ninguno | Elimina filas completamente vacías. |
+| `drop_empty_columns` | Ninguno | Elimina columnas completamente vacías. |
+| `strip_strings` | `columns` opcional | Quita espacios al principio y al final de cadenas. |
+| `rename_columns` | `mapping` | Renombra columnas existentes. |
+| `convert_type` | `columns`, `target_type` | Convierte a `number`, `integer`, `datetime` o `boolean` y contabiliza fallos. |
+
+Las columnas de cada operación se referencian por su nombre vigente después de
+las operaciones anteriores. Campos extra, operaciones desconocidas o instrucciones
+de ejecución de código se rechazan. Las fórmulas de Excel no se recalculan: se usan
+los valores guardados en el archivo; las fórmulas sin valor guardado requieren revisión.
+
+### Resultado y Validación
+
+La respuesta incluye `model`, `structural_summary`, `recipe`, `llm_response`,
+`execution`, `validation` y `metrics`. `llm_response.content` conserva el texto
+original del modelo y `metadata` incluye las métricas devueltas por Ollama, como
+duraciones, conteos de tokens y razonamiento cuando el proveedor lo devuelve.
+Las duraciones del pipeline se expresan en milisegundos; las duraciones originales
+de Ollama conservan sus unidades del proveedor (nanosegundos).
+
+El resumen incluye dimensiones físicas, muestras con números de fila, nombres
+iniciales, nulos, tipos inferidos, hojas, celdas combinadas, fórmulas y candidatos
+de encabezado. Las muestras pueden estar truncadas; no representan todos los datos.
+
+La ejecución devuelve dimensiones antes/después, columnas finales, tipos,
+muestras procesadas, filas excluidas, filas vacías eliminadas, columnas vacías,
+conversiones fallidas, fórmulas sin valor y errores por hoja. `rows_before` cuenta
+las filas del rango de datos elegido, después de separar los encabezados.
+`excluded_nonempty_rows` cuenta registros no vacíos excluidos por ese rango.
+Las celdas de error de Excel también se informan y requieren revisión. Las
+conversiones numéricas que perderían precisión se contabilizan como fallidas.
+
+La integración sigue el contrato oficial de [chat de Ollama](https://docs.ollama.com/api/chat)
+y de [salida estructurada](https://docs.ollama.com/capabilities/structured-outputs).
+
+| Estado | Significado |
+| --- | --- |
+| `ready` | La ejecución produjo datos y no se detectaron problemas. |
+| `ready_with_warnings` | La ejecución produjo datos con advertencias o limpieza de elementos vacíos. |
+| `review_required` | Se detectaron pérdidas, conversiones fallidas, hojas omitidas con contenido, fórmulas sin valor o incertidumbre declarada. |
+| `failed` | La receta es inválida, falló el proveedor o no pudo obtenerse una estructura utilizable. |
+
+Una evaluación completada devuelve HTTP 200 incluso cuando `validation.status`
+es `failed`, para poder comparar fallos entre modelos. Una receta inválida conserva
+la respuesta original, deja `recipe` en `null` y no ejecuta transformaciones.
+Un fallo de conexión con Ollama devuelve `llm_response` en `null` y un error legible.
+Los archivos vacíos, ilegibles o no admitidos devuelven HTTP 400, los que exceden
+el tamaño configurado devuelven HTTP 413 y los parámetros HTTP inválidos devuelven 422.
+
+### Límites
+
+Los valores predeterminados son 10 MiB por archivo, 2 millones de celdas en total,
+30 hojas y 100 MiB de contenido expandido para XLSX. También se limita la lectura
+a 1000 columnas por hoja. Las muestras tienen 12 filas, hasta 50 columnas y textos
+de hasta 200 caracteres. Las listas extensas de posiciones vacías y fórmulas se
+acotan, conservando conteos y advertencias para indicar la truncación.
+Los límites configurables figuran en `.env.example`.
+
+Esta versión no procesa PDF, no ejecuta código generado por el modelo y no
+implementa interacción humana para resolver las revisiones.
+
+### Pruebas del Pipeline
+
+```powershell
+.\.venv\Scripts\python.exe -W error -m unittest discover -s tests -v
+```
+
+Las pruebas del pipeline usan archivos CSV/XLSX en memoria y un transporte HTTP
+simulado para Ollama. Verifican inspección, ejecución, validación, errores de
+entrada, contrato de recetas, intercambio de modelos y el endpoint completo sin
+conectar con bases de datos. La calidad de las recetas de un modelo real se evalúa
+enviando archivos al endpoint con Ollama en funcionamiento.

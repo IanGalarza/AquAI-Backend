@@ -1,0 +1,88 @@
+import json
+
+import httpx
+
+from aquai.application.agents.prompts.tabular import TABULAR_RECIPE_PROMPT
+from aquai.application.dtos.tabular import LLMResponse, PreparationRecipe, StructuralSummary
+from aquai.application.errors import LLMProviderError
+from aquai.infrastructure.config.tabular import TabularSettings
+
+
+class OllamaProvider:
+    def __init__(
+        self,
+        settings: TabularSettings,
+        *,
+        transport: httpx.AsyncBaseTransport | None = None,
+    ) -> None:
+        self._settings = settings
+        self._transport = transport
+
+    async def generate_recipe(
+        self,
+        summary: StructuralSummary,
+        model: str,
+        known_rules: str | None = None,
+    ) -> LLMResponse:
+        schema = PreparationRecipe.model_json_schema()
+        payload = {
+            "model": model,
+            "stream": False,
+            "format": schema,
+            "options": {"temperature": 0},
+            "messages": [
+                {
+                    "role": "system",
+                    "content": TABULAR_RECIPE_PROMPT + json.dumps(schema, ensure_ascii=False),
+                },
+                {
+                    "role": "user",
+                    "content": json.dumps(
+                        {
+                            "structural_summary": summary.model_dump(mode="json"),
+                            "known_rules": known_rules,
+                        },
+                        ensure_ascii=False,
+                    ),
+                },
+            ],
+        }
+        try:
+            async with httpx.AsyncClient(
+                timeout=self._settings.llm_timeout_seconds,
+                transport=self._transport,
+            ) as client:
+                response = await client.post(
+                    f"{self._settings.ollama_base_url}/api/chat", json=payload
+                )
+                response.raise_for_status()
+        except httpx.TimeoutException as exc:
+            raise LLMProviderError("Ollama superó el tiempo máximo de respuesta.") from exc
+        except httpx.HTTPStatusError as exc:
+            raise LLMProviderError(
+                f"Ollama respondió con un error HTTP {exc.response.status_code}."
+            ) from exc
+        except httpx.RequestError as exc:
+            raise LLMProviderError("No se pudo completar la conexión con Ollama.") from exc
+
+        try:
+            body = response.json()
+        except ValueError as exc:
+            raise LLMProviderError("Ollama devolvió una respuesta HTTP que no es JSON.") from exc
+
+        if not isinstance(body, dict) or body.get("error"):
+            raise LLMProviderError("Ollama devolvió una respuesta de protocolo inválida.")
+        message = body.get("message")
+        returned_model = body.get("model")
+        if (
+            not isinstance(message, dict)
+            or not isinstance(message.get("content"), str)
+            or not isinstance(returned_model, str)
+            or not returned_model.strip()
+            or body.get("done") is not True
+        ):
+            raise LLMProviderError("Ollama devolvió una respuesta incompleta o inválida.")
+
+        metadata = {key: value for key, value in body.items() if key != "message"}
+        metadata["message"] = {key: value for key, value in message.items() if key != "content"}
+        return LLMResponse(model=returned_model, content=message["content"], metadata=metadata)
