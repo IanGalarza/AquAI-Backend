@@ -23,7 +23,7 @@ def recipe(sheet_name: str = "data", **sheet_overrides: object) -> dict:
         "transformations": [],
     }
     sheet.update(sheet_overrides)
-    return {"status": "ready", "sheets": [sheet]}
+    return {"status": "ready", "sheets": [sheet], "warnings": [], "requires_human_review": False}
 
 
 class TabularEndpointTests(unittest.TestCase):
@@ -88,6 +88,15 @@ class TabularEndpointTests(unittest.TestCase):
         self.assertGreater(body["metrics"]["total_duration_ms"], 0)
         self.assertEqual(self.requests[0]["model"], "test-model:small")
         self.assertFalse(self.requests[0]["stream"])
+        self.assertEqual(body["response_format"], {
+            "proposed_status": "ready",
+            "json_valid": True,
+            "strict_json": True,
+            "cleanup_required": False,
+            "schema_valid": True,
+            "recipe_valid": True,
+            "recipe_executable": True,
+        })
 
     def test_known_rules_and_default_model_reach_provider(self) -> None:
         response = self.upload(data={"known_rules": "Conservar todos los registros."})
@@ -102,6 +111,8 @@ class TabularEndpointTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(response.json()["validation"]["status"], "ready")
         self.assertEqual(response.json()["llm_response"]["content"], self.raw_content)
+        self.assertTrue(response.json()["response_format"]["cleanup_required"])
+        self.assertFalse(response.json()["response_format"]["strict_json"])
 
     def test_invalid_or_executable_recipes_fail_without_executing(self) -> None:
         invalid_responses = [
@@ -174,6 +185,8 @@ class TabularEndpointTests(unittest.TestCase):
         self.assertIsNone(body["llm_response"])
         self.assertTrue(body["validation"]["errors"])
         self.assertGreater(body["metrics"]["llm_duration_ms"], 0)
+        self.assertIsNone(body["response_format"]["schema_valid"])
+        self.assertIsNone(body["response_format"]["recipe_executable"])
 
     def test_model_can_report_review_without_an_executable_recipe(self) -> None:
         self.raw_content = json.dumps({
@@ -185,6 +198,8 @@ class TabularEndpointTests(unittest.TestCase):
         body = response.json()
         self.assertEqual(body["validation"]["status"], "review_required")
         self.assertEqual(body["execution"]["sheets"], [])
+        self.assertTrue(body["response_format"]["recipe_valid"])
+        self.assertFalse(body["response_format"]["recipe_executable"])
 
     def test_failed_recipe_does_not_execute_even_if_it_includes_sheets(self) -> None:
         self.raw_content = json.dumps({**recipe(), "status": "failed"})
@@ -194,6 +209,7 @@ class TabularEndpointTests(unittest.TestCase):
         self.assertEqual(body["validation"]["status"], "failed")
         self.assertEqual(body["execution"]["sheets"], [])
         self.assertEqual(body["metrics"]["execution_duration_ms"], 0)
+        self.assertFalse(body["response_format"]["recipe_executable"])
 
     def test_invalid_uploads_never_call_the_provider(self) -> None:
         for file_name, content in [("data.pdf", b"pdf"), ("data.csv", b""), ("data.xlsx", b"broken")]:

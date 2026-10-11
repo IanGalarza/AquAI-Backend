@@ -23,6 +23,7 @@ class SheetSummary(BaseModel):
     inferred_types: list[str]
     null_counts: list[int]
     sample: list[SampleRow]
+    column_indices: list[int] = Field(default_factory=list)
     merged_cells: list[str] = Field(default_factory=list)
     formula_count: int = 0
     formula_sample: list[FormulaSample] = Field(default_factory=list)
@@ -82,10 +83,10 @@ Transformation = Annotated[
 
 class SheetRecipe(RecipeContract):
     sheet_name: str = Field(min_length=1, max_length=255)
-    header_rows: list[Annotated[int, Field(ge=1)]] = Field(default_factory=list)
+    header_rows: list[Annotated[int, Field(ge=1)]]
     data_start_row: int = Field(ge=1)
     data_end_row: int | None = Field(default=None, ge=1)
-    transformations: list[Transformation] = Field(default_factory=list, max_length=50)
+    transformations: list[Transformation] = Field(max_length=50)
 
     @model_validator(mode="after")
     def validate_row_ranges(self) -> "SheetRecipe":
@@ -100,9 +101,9 @@ class SheetRecipe(RecipeContract):
 
 class PreparationRecipe(RecipeContract):
     status: Literal["ready", "review_required", "failed"]
-    sheets: list[SheetRecipe] = Field(default_factory=list, max_length=30)
-    warnings: list[str] = Field(default_factory=list)
-    requires_human_review: bool = False
+    sheets: list[SheetRecipe] = Field(max_length=30)
+    warnings: list[Annotated[str, Field(max_length=512)]] = Field(max_length=20)
+    requires_human_review: bool
 
     @model_validator(mode="after")
     def validate_sheets(self) -> "PreparationRecipe":
@@ -111,6 +112,8 @@ class PreparationRecipe(RecipeContract):
             raise ValueError("La receta no puede repetir una hoja.")
         if self.status == "ready" and not self.sheets:
             raise ValueError("Una receta ready debe incluir al menos una hoja.")
+        if self.status == "review_required" and not self.requires_human_review:
+            raise ValueError("Una receta review_required debe indicar requires_human_review=true.")
         return self
 
 
@@ -161,6 +164,16 @@ class EvaluationMetrics(BaseModel):
     total_duration_ms: float = 0
 
 
+class ResponseFormatMetrics(BaseModel):
+    proposed_status: str | None = None
+    json_valid: bool = False
+    strict_json: bool = False
+    cleanup_required: bool = False
+    schema_valid: bool | None = None
+    recipe_valid: bool | None = None
+    recipe_executable: bool | None = None
+
+
 class TabularEvaluation(BaseModel):
     model: str
     structural_summary: StructuralSummary
@@ -169,3 +182,4 @@ class TabularEvaluation(BaseModel):
     execution: ExecutionResult = Field(default_factory=ExecutionResult)
     validation: ValidationResult
     metrics: EvaluationMetrics
+    response_format: ResponseFormatMetrics = Field(default_factory=ResponseFormatMetrics)

@@ -23,6 +23,7 @@ class SheetData:
     formulas: list[dict[str, object]] = field(default_factory=list)
     formula_count: int = 0
     formula_rows: set[int] = field(default_factory=set)
+    formula_columns: set[int] = field(default_factory=set)
     missing_formula_cache_count: int = 0
     missing_formula_cells: list[str] = field(default_factory=list)
     error_cell_count: int = 0
@@ -230,23 +231,33 @@ class TableReader:
                 )
                 data.error_cell_count = error_cell_count
                 data.error_cells = error_cells
-                for row in worksheet.iter_rows():
-                    for cell in row:
-                        if cell.data_type != "f":
-                            continue
-                        data.formula_count += 1
-                        data.formula_rows.add(cell.row)
-                        cached_value = data.frame.iat[cell.row - 1, cell.column - 1]
-                        if cached_value is None:
-                            data.missing_formula_cache_count += 1
-                            if len(data.missing_formula_cells) < 100:
-                                data.missing_formula_cells.append(cell.coordinate)
-                        if len(data.formulas) < self.sample_rows:
-                            data.formulas.append({
-                                "cell": cell.coordinate,
-                                "formula": str(cell.value)[:200],
-                                "cached_value": cached_value,
-                            })
+                formula_cells = [
+                    cell for row in worksheet.iter_rows() for cell in row if cell.data_type == "f"
+                ]
+                data.formula_count = len(formula_cells)
+                sample_count = min(self.sample_rows, data.formula_count)
+                head_count = min(3, sample_count)
+                sample_positions = set(range(head_count))
+                remaining = sample_count - head_count
+                for offset in range(remaining):
+                    sample_positions.add(
+                        head_count
+                        + (data.formula_count - head_count - 1) * (offset + 1) // remaining
+                    )
+                for index, cell in enumerate(formula_cells):
+                    data.formula_rows.add(cell.row)
+                    data.formula_columns.add(cell.column)
+                    cached_value = data.frame.iat[cell.row - 1, cell.column - 1]
+                    if cached_value is None:
+                        data.missing_formula_cache_count += 1
+                        if len(data.missing_formula_cells) < 100:
+                            data.missing_formula_cells.append(cell.coordinate)
+                    if index in sample_positions:
+                        data.formulas.append({
+                            "cell": cell.coordinate,
+                            "formula": str(cell.value)[:200],
+                            "cached_value": cached_value,
+                        })
                 sheets.append(data)
             if not sheets:
                 raise TabularInputError("El XLSX no contiene hojas de cálculo.")

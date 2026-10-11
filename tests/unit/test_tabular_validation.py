@@ -24,7 +24,9 @@ class TabularValidationTests(unittest.TestCase):
         )
         self.recipe = PreparationRecipe(
             status="ready",
-            sheets=[SheetRecipe(sheet_name="Measurements", header_rows=[1], data_start_row=2)],
+            sheets=[SheetRecipe(sheet_name="Measurements", header_rows=[1], data_start_row=2, transformations=[])],
+            warnings=[],
+            requires_human_review=False,
         )
         self.execution = ExecutionResult(sheets=[self._execution_sheet("Measurements")])
 
@@ -135,7 +137,9 @@ class TabularValidationTests(unittest.TestCase):
         self.assertTrue(result.errors)
 
     def test_recipe_without_executable_proposal_keeps_review_status(self) -> None:
-        self.recipe = PreparationRecipe(status="review_required")
+        self.recipe = PreparationRecipe(
+            status="review_required", sheets=[], warnings=[], requires_human_review=True,
+        )
         self.execution = ExecutionResult(skipped_sheets=["Measurements"])
         result = self._validate()
         self.assertEqual(result.status, EvaluationStatus.REVIEW_REQUIRED)
@@ -152,7 +156,9 @@ class TabularValidationTests(unittest.TestCase):
         self.assertTrue(result.warnings)
 
     def test_missing_execution_for_recipe_sheet_is_a_failure(self) -> None:
-        self.recipe.sheets.append(SheetRecipe(sheet_name="Second", data_start_row=1))
+        self.recipe.sheets.append(SheetRecipe(
+            sheet_name="Second", header_rows=[], data_start_row=1, transformations=[],
+        ))
         self.summary.sheets.append(self._summary_sheet("Second"))
         result = self._validate()
         self.assertEqual(result.status, EvaluationStatus.FAILED)

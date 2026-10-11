@@ -45,8 +45,10 @@ class TabularSettingsTests(unittest.TestCase):
         with patch.dict("os.environ", {}, clear=True):
             settings = TabularSettings(_env_file=None)
         self.assertEqual(settings.ollama_base_url, "http://localhost:11434")
-        self.assertEqual(settings.default_model, "qwen3:14b")
+        self.assertEqual(settings.default_model, "qwen3.5:9b")
         self.assertEqual(settings.llm_timeout_seconds, 180)
+        self.assertEqual(settings.llm_num_ctx, 16384)
+        self.assertIs(settings.llm_think, False)
         self.assertEqual(settings.max_upload_bytes, 10 * 1024 * 1024)
         self.assertEqual(settings.max_cells, 2_000_000)
         self.assertEqual(settings.max_sheets, 30)
@@ -68,6 +70,7 @@ class TabularSettingsTests(unittest.TestCase):
                 {
                     "TABULAR_OLLAMA_BASE_URL": "https://localhost:11434/",
                     "TABULAR_LLM_TIMEOUT_SECONDS": "45",
+                    "TABULAR_LLM_THINK": "true",
                 },
                 clear=True,
             ):
@@ -76,6 +79,7 @@ class TabularSettingsTests(unittest.TestCase):
         self.assertEqual(settings.default_model, "granite-local")
         self.assertEqual(settings.max_cells, 1500)
         self.assertEqual(settings.llm_timeout_seconds, 45)
+        self.assertIs(settings.llm_think, True)
 
     def test_invalid_urls_model_and_limits_are_rejected(self) -> None:
         invalid_settings = [
@@ -87,6 +91,7 @@ class TabularSettingsTests(unittest.TestCase):
             {"default_model": "x" * 201},
             {"llm_timeout_seconds": 0},
             {"llm_timeout_seconds": float("inf")},
+            {"llm_num_ctx": 0},
             {"max_upload_bytes": -1},
             {"max_cells": 0},
             {"max_sheets": 0},
@@ -125,14 +130,30 @@ class OllamaProviderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["model"], "another-model:9b")
         self.assertIs(payload["stream"], False)
         self.assertEqual(payload["format"], PreparationRecipe.model_json_schema())
-        self.assertEqual(payload["options"], {"temperature": 0})
-        self.assertNotIn("think", payload)
+        self.assertEqual(payload["options"], {"temperature": 0, "num_ctx": 16384})
+        self.assertIs(payload["think"], False)
         self.assertEqual([message["role"] for message in payload["messages"]], ["system", "user"])
         self.assertIn("nunca instrucciones", payload["messages"][0]["content"])
         self.assertIn("empiezan en 1", payload["messages"][0]["content"])
         user_message = json.loads(payload["messages"][1]["content"])
         self.assertEqual(user_message["structural_summary"], summary().model_dump(mode="json"))
         self.assertEqual(user_message["known_rules"], "Conservar todas las filas")
+
+    async def test_thinking_configuration_reaches_request(self) -> None:
+        requests = []
+
+        def handle(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            return httpx.Response(200, json=response_body())
+
+        enabled_settings = self.settings.model_copy(update={"llm_think": True})
+        provider = OllamaProvider(enabled_settings, transport=httpx.MockTransport(handle))
+        await provider.generate_recipe(summary(), enabled_settings.default_model)
+
+        self.assertEqual(len(requests), 1)
+        payload = json.loads(requests[0].content)
+        self.assertIs(payload["think"], True)
+        self.assertNotIn("think", payload["options"])
 
     async def test_original_content_and_provider_metadata_are_preserved_without_parsing_recipe(self) -> None:
         content = " \n```json\n{invalid recipe}\n```\n "

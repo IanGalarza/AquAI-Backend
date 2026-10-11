@@ -20,9 +20,14 @@ def workbook_bytes(workbook: Workbook) -> bytes:
 
 
 def recipe(sheet_name: str = "data", **overrides: object) -> PreparationRecipe:
-    sheet = {"sheet_name": sheet_name, "header_rows": [1], "data_start_row": 2}
+    sheet = {
+        "sheet_name": sheet_name, "header_rows": [1], "data_start_row": 2,
+        "transformations": [],
+    }
     sheet.update(overrides)
-    return PreparationRecipe.model_validate({"status": "ready", "sheets": [sheet]})
+    return PreparationRecipe.model_validate({
+        "status": "ready", "sheets": [sheet], "warnings": [], "requires_human_review": False,
+    })
 
 
 class TabularProcessorTests(unittest.TestCase):
@@ -67,6 +72,55 @@ class TabularProcessorTests(unittest.TestCase):
         self.assertEqual(len(sheet.sample), 12)
         self.assertEqual(sheet.sample[0].row_number, 1)
         self.assertEqual(sheet.sample[-1].row_number, 101)
+
+    def test_wide_summary_maps_columns_and_preserves_complete_dimensions(self) -> None:
+        headers = [f"field_{index}" for index in range(1, 81)]
+        values = [str(index) for index in range(1, 81)]
+        content = (",".join(headers) + "\n" + ",".join(values) + "\n").encode()
+        sheet = self.processor.inspect("wide.csv", content).sheets[0]
+        indices = list(range(1, 13)) + list(range(77, 81))
+        self.assertEqual((sheet.rows, sheet.columns), (2, 80))
+        self.assertEqual(sheet.column_indices, indices)
+        self.assertEqual(sheet.initial_columns, [headers[index - 1] for index in indices])
+        self.assertEqual(sheet.sample[1].values, [values[index - 1] for index in indices])
+        self.assertEqual(len(sheet.inferred_types), 16)
+        self.assertEqual(sheet.null_counts, [0] * 16)
+        self.assertTrue(sheet.warnings)
+
+    def test_wide_summary_ignores_styled_tail_for_representative_columns(self) -> None:
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.append([f"field_{index}" for index in range(1, 21)])
+        sheet.append(list(range(20)))
+        sheet.cell(4, 100).number_format = "0.00"
+        summary = self.processor.inspect("wide.xlsx", workbook_bytes(workbook)).sheets[0]
+        self.assertEqual((summary.rows, summary.columns), (4, 100))
+        self.assertEqual(summary.column_indices, list(range(1, 13)) + list(range(17, 21)))
+        self.assertEqual(summary.empty_column_count, 80)
+        self.assertEqual(summary.empty_columns, list(range(21, 101)))
+
+    def test_formula_sample_covers_end_and_keeps_uncached_columns_visible(self) -> None:
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.append(["value"])
+        for row in range(2, 32):
+            sheet.cell(row, 40, f"=A{row}+1")
+        summary = self.processor.inspect("wide.xlsx", workbook_bytes(workbook)).sheets[0]
+        self.assertEqual(summary.formula_count, 30)
+        self.assertEqual(len(summary.formula_sample), 12)
+        self.assertEqual(summary.formula_sample[0].cell, "AN2")
+        self.assertEqual(summary.formula_sample[-1].cell, "AN31")
+        self.assertIn(40, summary.column_indices)
+        self.assertNotIn(31, summary.empty_rows)
+
+    def test_zero_values_survive_empty_row_and_column_operations(self) -> None:
+        result = self.execute(b"a,b\n0,0\n,,\n", recipe(transformations=[
+            {"operation": "drop_empty_rows"},
+            {"operation": "drop_empty_columns"},
+        ])).sheets[0]
+        self.assertEqual((result.rows_before, result.rows_after), (2, 1))
+        self.assertEqual(result.dropped_empty_columns, ["column_3"])
+        self.assertEqual(result.sample[0].values, ["0", "0"])
 
     def test_invalid_and_empty_files_are_rejected(self) -> None:
         for filename, content in (("test.pdf", b"pdf"), ("test.csv", b""), ("test.csv", b" \n"), ("test.csv", b"a\x00b"), ("test.xlsx", b"broken")):
@@ -142,7 +196,7 @@ class TabularProcessorTests(unittest.TestCase):
         self.assertEqual(result.sample[0].values, [1, 2, 3, 4, 5])
         self.assertEqual(len(result.warnings), 2)
 
-    def test_formula_without_cache_is_reported_even_when_row_is_dropped(self) -> None:
+    def test_formula_without_cache_is_preserved_by_empty_row_cleanup(self) -> None:
         workbook = Workbook()
         sheet = workbook.active
         sheet.append(["result"])
@@ -153,9 +207,35 @@ class TabularProcessorTests(unittest.TestCase):
         self.assertNotIn(2, summary.sheets[0].empty_rows)
         result = self.processor.execute("test.xlsx", content, recipe("Sheet", transformations=[{"operation": "drop_empty_rows"}]), summary).sheets[0]
         self.assertEqual(result.unresolved_formula_cells, ["A2"])
-        self.assertEqual((result.rows_before, result.rows_after), (1, 0))
-        self.assertEqual(result.dropped_empty_rows, 1)
+        self.assertEqual((result.rows_before, result.rows_after), (1, 1))
+        self.assertEqual(result.dropped_empty_rows, 0)
+        self.assertEqual(result.sample[0].values, [None])
         self.assertTrue(result.warnings)
+
+    def test_formula_protection_survives_rename_and_bounded_diagnostics(self) -> None:
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.append(["unused", "result"])
+        for row in range(2, 123):
+            sheet.append([None, f"={row}+1"])
+        content = workbook_bytes(workbook)
+        summary = self.processor.inspect("formulas.xlsx", content)
+        self.assertEqual(summary.sheets[0].empty_columns, [])
+        result = self.processor.execute(
+            "formulas.xlsx", content,
+            recipe("Sheet", transformations=[
+                {"operation": "rename_columns", "mapping": {"result": "computed"}},
+                {"operation": "drop_empty_columns"},
+                {"operation": "drop_empty_rows"},
+            ]), summary,
+        ).sheets[0]
+        self.assertEqual(len(result.unresolved_formula_cells), 100)
+        self.assertEqual((result.rows_before, result.rows_after), (121, 121))
+        self.assertEqual(result.dropped_empty_rows, 0)
+        self.assertEqual(result.dropped_empty_columns, ["unused"])
+        self.assertEqual(result.columns_after, ["computed"])
+        self.assertEqual(result.empty_columns, [])
+        self.assertEqual(result.sample[-1].row_number, 122)
 
     def test_invalid_sheet_range_and_columns_become_sheet_errors(self) -> None:
         content = b"a,b\n1,2\n"

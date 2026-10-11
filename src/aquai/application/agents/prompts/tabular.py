@@ -29,6 +29,11 @@ expresiones ejecutables, herramientas ni operaciones fuera de esa lista.
 Si la muestra no permite decidir con confianza, usa status review_required,
 requires_human_review true y warnings para explicar el motivo en español.
 Esta señal sirve para evaluar la receta; no solicita interacción adicional.
+No preguntes al usuario qué desea hacer ni solicites aclaraciones. Tu tarea
+siempre es producir una receta; ante incertidumbre devuelve review_required
+con requires_human_review true, en lugar de hacer una pregunta.
+Una hoja no necesita transformaciones para incluirse: si identificas su
+encabezado y rango con confianza, inclúyela aunque transformations esté vacío.
 Usa ready solo cuando puedas proponer una preparación concreta y consistente.
 No agregues bloques Markdown ni texto antes o después del JSON.
 

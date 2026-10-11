@@ -28,25 +28,27 @@ class OllamaProvider:
         payload = {
             "model": model,
             "stream": False,
+            "think": self._settings.llm_think,
             "format": schema,
-            "options": {"temperature": 0},
+            "options": {"temperature": 0, "num_ctx": self._settings.llm_num_ctx},
             "messages": [
                 {
                     "role": "system",
-                    "content": TABULAR_RECIPE_PROMPT + json.dumps(schema, ensure_ascii=False),
+                    "content": TABULAR_RECIPE_PROMPT + json.dumps(
+                        schema, ensure_ascii=False, separators=(",", ":")
+                    ),
                 },
                 {
                     "role": "user",
                     "content": json.dumps(
-                        {
-                            "structural_summary": summary.model_dump(mode="json"),
-                            "known_rules": known_rules,
-                        },
+                        {"structural_summary": summary.model_dump(mode="json"), "known_rules": known_rules},
                         ensure_ascii=False,
+                        separators=(",", ":"),
                     ),
                 },
             ],
         }
+
         try:
             async with httpx.AsyncClient(
                 timeout=self._settings.llm_timeout_seconds,

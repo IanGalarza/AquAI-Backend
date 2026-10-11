@@ -114,7 +114,9 @@ class PandasTabularProcessor:
             skipped_sheets=[name for name in sheets if name not in selected],
         )
 
-    def _sample(self, frame: pd.DataFrame) -> list[SampleRow]:
+    def _sample(
+        self, frame: pd.DataFrame, column_positions: list[int] | None = None,
+    ) -> list[SampleRow]:
         size = len(frame)
         if not size:
             return []
@@ -127,7 +129,10 @@ class PandasTabularProcessor:
         return [
             SampleRow(
                 row_number=int(frame.index[position]) + 1,
-                values=[json_value(value) for value in frame.iloc[position, :50]],
+                values=[json_value(value) for value in (
+                    frame.iloc[position, column_positions]
+                    if column_positions is not None else frame.iloc[position, :50]
+                )],
             )
             for position in sorted(positions)
         ]
@@ -140,7 +145,17 @@ class PandasTabularProcessor:
             for index in frame.index[empty.all(axis=1)]
             if int(index) + 1 not in sheet.formula_rows
         ]
-        empty_columns = [int(index) + 1 for index in frame.columns[empty.all(axis=0)]]
+        empty_columns = [
+            int(index) + 1 for index in frame.columns[empty.all(axis=0)]
+            if int(index) + 1 not in sheet.formula_columns
+        ]
+        column_positions = list(range(len(frame.columns)))
+        if len(column_positions) > 16:
+            populated_columns = [
+                int(index) for index in frame.columns
+                if int(index) + 1 not in empty_columns or int(index) + 1 in sheet.formula_columns
+            ]
+            column_positions = sorted(set(column_positions[:12] + populated_columns[-4:]))
         warnings = []
         if not frame.size or len(empty_rows) == len(frame):
             warnings.append("La hoja no contiene valores para procesar.")
@@ -154,8 +169,12 @@ class PandasTabularProcessor:
                 f"La hoja contiene {len(sheet.merged_cells)} rangos combinados; "
                 "se muestran los primeros 100."
             )
-        if len(frame.columns) > 50:
-            warnings.append("Las muestras muestran únicamente las primeras 50 columnas.")
+        if len(column_positions) < len(frame.columns):
+            warnings.append(
+                "Las muestras y los metadatos por columna están acotados; "
+                "column_indices indica sus posiciones originales. "
+                "Las dimensiones y los totales incluyen toda la hoja."
+            )
         if sheet.missing_formula_cache_count:
             warnings.append(
                 f"Hay {sheet.missing_formula_cache_count} fórmulas sin valor almacenado; "
@@ -175,16 +194,17 @@ class PandasTabularProcessor:
                     break
         initial = [
             str(json_value(value)) if not is_empty(value) else f"column_{index + 1}"
-            for index, value in enumerate(frame.iloc[0])
-        ] if len(frame) else [f"column_{index + 1}" for index in range(len(frame.columns))]
+            for index, value in zip(column_positions, frame.iloc[0, column_positions], strict=True)
+        ] if len(frame) else [f"column_{index + 1}" for index in column_positions]
         return SheetSummary(
             name=sheet.name,
             rows=len(frame),
             columns=len(frame.columns),
+            column_indices=[index + 1 for index in column_positions],
             initial_columns=initial,
-            inferred_types=[infer_type(frame[column]) for column in frame.columns],
-            null_counts=[int(empty[column].sum()) for column in frame.columns],
-            sample=self._sample(frame),
+            inferred_types=[infer_type(frame[column]) for column in column_positions],
+            null_counts=[int(empty[column].sum()) for column in column_positions],
+            sample=self._sample(frame, column_positions),
             merged_cells=sheet.merged_cells[:100],
             formula_count=sheet.formula_count,
             formula_sample=[
@@ -283,15 +303,21 @@ class PandasTabularProcessor:
                 "Los encabezados seleccionados contienen valores numéricos; "
                 "podrían ser registros."
             )
+        formula_columns = {names[column - 1] for column in sheet.formula_columns}
         for transformation in recipe.transformations:
             try:
-                frame = self._transform(frame, transformation, result)
+                frame = self._transform(
+                    frame, transformation, result, sheet.formula_rows, formula_columns,
+                )
             except (ValueError, TypeError, OverflowError) as error:
                 result.errors.append(str(error))
                 break
         result.rows_after = len(frame)
         result.columns_after = list(frame.columns)
-        result.empty_columns = [name for name in frame.columns if frame[name].map(is_empty).all()]
+        result.empty_columns = [
+            name for name in frame.columns
+            if name not in formula_columns and frame[name].map(is_empty).all()
+        ]
         result.inferred_types = {name: infer_type(frame[name]) for name in frame.columns}
         result.sample = self._sample(frame)
         return result
@@ -308,13 +334,24 @@ class PandasTabularProcessor:
                 return False
         return False
 
-    def _transform(self, frame: pd.DataFrame, transformation: object, result: SheetExecution) -> pd.DataFrame:
+    def _transform(
+        self,
+        frame: pd.DataFrame,
+        transformation: object,
+        result: SheetExecution,
+        formula_rows: set[int],
+        formula_columns: set[str],
+    ) -> pd.DataFrame:
         if isinstance(transformation, DropEmptyRows):
             empty = frame.map(is_empty).all(axis=1)
+            empty &= ~(frame.index + 1).isin(formula_rows)
             result.dropped_empty_rows += int(empty.sum())
             return frame.loc[~empty].copy()
         if isinstance(transformation, DropEmptyColumns):
-            empty_columns = [name for name in frame.columns if frame[name].map(is_empty).all()]
+            empty_columns = [
+                name for name in frame.columns
+                if name not in formula_columns and frame[name].map(is_empty).all()
+            ]
             result.dropped_empty_columns.extend(empty_columns)
             return frame.drop(columns=empty_columns)
         if isinstance(transformation, RenameColumns):
@@ -322,6 +359,9 @@ class PandasTabularProcessor:
             names = [transformation.mapping.get(name, name) for name in frame.columns]
             if any(not name.strip() for name in names) or len(names) != len(set(names)):
                 raise ValueError("El renombrado produce nombres vacíos o columnas duplicadas.")
+            renamed_formulas = {transformation.mapping.get(name, name) for name in formula_columns}
+            formula_columns.clear()
+            formula_columns.update(renamed_formulas)
             return frame.rename(columns=transformation.mapping)
         if isinstance(transformation, StripStrings):
             selected = transformation.columns if transformation.columns is not None else list(frame.columns)

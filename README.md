@@ -214,6 +214,9 @@ terminar. La carga HTTP puede usar almacenamiento temporal administrado por Fast
 Iniciá Ollama y asegurate de tener disponible el modelo que quieras probar.
 La URL del proveedor y el modelo predeterminado se configuran con
 `TABULAR_OLLAMA_BASE_URL` y `TABULAR_DEFAULT_MODEL` en `.env` o en el entorno.
+El modelo predeterminado es `qwen3.5:9b`, con contexto de 16384 tokens y
+`think=false`. El contexto y el pensamiento se configuran con
+`TABULAR_LLM_NUM_CTX` y `TABULAR_LLM_THINK`.
 El proyecto no descarga modelos automáticamente.
 
 ```powershell
@@ -226,7 +229,7 @@ reemplaza el modelo configurado para esa evaluación. El campo multipart opciona
 `known_rules` permite agregar reglas de preparación (hasta 4000 caracteres).
 
 ```powershell
-curl.exe -X POST "http://localhost:8000/experimental/tabular/evaluate?model=qwen3:14b" -F "file=@D:/datos/recuentos.xlsx"
+curl.exe -X POST "http://localhost:8000/experimental/tabular/evaluate" -F "file=@D:/datos/recuentos.xlsx"
 curl.exe -X POST "http://localhost:8000/experimental/tabular/evaluate?model=otro-modelo:tag" -F "file=@D:/datos/recuentos.xlsx" -F "known_rules=Conservar todos los registros."
 ```
 
@@ -294,7 +297,10 @@ de Ollama conservan sus unidades del proveedor (nanosegundos).
 
 El resumen incluye dimensiones físicas, muestras con números de fila, nombres
 iniciales, nulos, tipos inferidos, hojas, celdas combinadas, fórmulas y candidatos
-de encabezado. Las muestras pueden estar truncadas; no representan todos los datos.
+de encabezado. `column_indices` relaciona los metadatos y las muestras con las
+posiciones originales de las columnas, que empiezan en 1. En tablas anchas se
+incluyen las primeras 12 columnas y hasta 4 de las últimas columnas con contenido
+o fórmulas. Las dimensiones y los conteos totales se calculan sobre toda la hoja.
 
 La ejecución devuelve dimensiones antes/después, columnas finales, tipos,
 muestras procesadas, filas excluidas, filas vacías eliminadas, columnas vacías,
@@ -325,8 +331,9 @@ el tamaño configurado devuelven HTTP 413 y los parámetros HTTP inválidos devu
 
 Los valores predeterminados son 10 MiB por archivo, 2 millones de celdas en total,
 30 hojas y 100 MiB de contenido expandido para XLSX. También se limita la lectura
-a 1000 columnas por hoja. Las muestras tienen 12 filas, hasta 50 columnas y textos
-de hasta 200 caracteres. Las listas extensas de posiciones vacías y fórmulas se
+a 1000 columnas por hoja. Las muestras estructurales tienen hasta 12 filas y 16
+columnas; las muestras de ejecución muestran hasta 50 columnas. Los textos se
+acotan a 200 caracteres. Las listas extensas de posiciones vacías y fórmulas se
 acotan, conservando conteos y advertencias para indicar la truncación.
 Los límites configurables figuran en `.env.example`.
 

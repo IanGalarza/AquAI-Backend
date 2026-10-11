@@ -23,6 +23,7 @@ dependencies = [
     "pydantic>=2",
     "pydantic-settings",
     "httpx",
+    "jsonschema>=4",
     "python-multipart",
 ]
 

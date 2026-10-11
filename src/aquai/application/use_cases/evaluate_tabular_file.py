@@ -8,7 +8,10 @@ from aquai.application.dtos.tabular import (
 )
 from aquai.application.errors import FileTooLargeError, LLMProviderError, TabularInputError
 from aquai.application.interfaces.tabular import LLMProvider, TabularProcessor
-from aquai.application.services.tabular_recipe import parse_preparation_recipe
+from aquai.application.services.tabular_recipe import (
+    RecipeParseError,
+    parse_preparation_recipe_with_metrics,
+)
 from aquai.application.services.tabular_validation import TabularValidationService
 from aquai.domain.enums.tabular import EvaluationStatus
 
@@ -69,8 +72,11 @@ class EvaluateTabularFile:
         if result.llm_response is not None:
             result.model = result.llm_response.model
             try:
-                result.recipe = parse_preparation_recipe(result.llm_response.content)
-            except ValueError as exc:
+                parsed = parse_preparation_recipe_with_metrics(result.llm_response.content)
+                result.recipe = parsed.recipe
+                result.response_format = parsed.response_format
+            except RecipeParseError as exc:
+                result.response_format = exc.response_format
                 result.validation.errors.append(str(exc))
 
         if result.recipe is not None:
@@ -83,6 +89,7 @@ class EvaluateTabularFile:
             stage_started = perf_counter()
             result.validation = self._validator.validate(summary, result.recipe, result.execution)
             metrics.validation_duration_ms = self._elapsed_ms(stage_started)
+            result.response_format.recipe_executable = self._is_executable(result)
 
         metrics.total_duration_ms = self._elapsed_ms(started)
         return result
@@ -100,6 +107,22 @@ class EvaluateTabularFile:
         if len(content) > self._max_upload_bytes:
             raise FileTooLargeError("El archivo supera el tamaño máximo permitido.")
         return normalized_name
+
+    @staticmethod
+    def _is_executable(result: TabularEvaluation) -> bool:
+        recipe = result.recipe
+        if recipe is None or recipe.status == "failed" or not recipe.sheets or result.validation.errors:
+            return False
+        planned_names = {sheet.sheet_name for sheet in recipe.sheets}
+        executed_names = {sheet.sheet_name for sheet in result.execution.sheets}
+        return (
+            planned_names == executed_names
+            and len(recipe.sheets) == len(result.execution.sheets)
+            and all(
+                sheet.rows_after > 0 and bool(sheet.columns_after) and not sheet.errors
+                for sheet in result.execution.sheets
+            )
+        )
 
     @staticmethod
     def _elapsed_ms(started: float) -> float:
