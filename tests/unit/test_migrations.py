@@ -28,7 +28,7 @@ INITIAL_REVISION_TABLES = {
     "Source", "ProcessingStatus", "Dataset", "Conversation", "Message",
     "MessageStatus", "MessageSource",
 }
-PENDING_MIGRATION_TABLES = {"SourceRecipe", "ValidationStatus"}
+SOURCE_RECIPE_REVISION_TABLES = {"SourceRecipe", "ValidationStatus"}
 
 
 class MigrationTests(unittest.TestCase):
@@ -86,7 +86,7 @@ class MigrationTests(unittest.TestCase):
         self.assertIsNone(self.revision.down_revision)
         self.assertEqual(self.revision.doc, "InitialCreate")
         self.assertEqual(set(self.created_tables), INITIAL_REVISION_TABLES)
-        self.assertEqual(set(metadata.tables), INITIAL_REVISION_TABLES | PENDING_MIGRATION_TABLES)
+        self.assertEqual(set(metadata.tables), INITIAL_REVISION_TABLES | SOURCE_RECIPE_REVISION_TABLES)
         self.assertEqual(len(self.created_tables), 7)
         self.assertNotIn("SERIAL", self.upgrade_sql)
 
