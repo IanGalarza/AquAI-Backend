@@ -11,8 +11,35 @@
       "pages": [1, 2],
       "verification": "verified_document",
       "sha256": "793085ddabc8f49aa6a27bee65883f0edf40d4f00b8bc54254db06ce48b73bc0"
+    },
+    "rdlp_user_confirmation_20261011": {
+      "verification": "user_confirmation",
+      "confirmed_by": "usuario",
+      "date": "2026-10-11",
+      "source_reference": "Aclaración del usuario en la conversación de AquAI del 2026-10-11",
+      "statement": "El usuario confirmó que las muestras cuestionadas en la anotación son distintas. La anotación original se conserva como antecedente histórico."
     }
   },
+  "file_specific_rules": [
+    {
+      "id": "rdlp_disputed_samples_distinct",
+      "version": "1.0.0",
+      "profile": "self_sampling",
+      "file_name": "Tabla completa ciano RdlP.xlsx",
+      "sha256": "79770bdd190fcd08dd8351e18f2f1450d0b250bdeb8b9588e5129492a82cc025",
+      "origin": "rdlp_user_confirmation_20261011",
+      "text": "Para esta versión exacta del archivo, el usuario confirmó que los registros de muestreo cuestionados en la nota original corresponden a muestras distintas: conservarlos como observaciones independientes; los números de campaña corresponden a períodos diferentes según las leyendas y el PDF de anotaciones. Conservar esos períodos sin inventar días exactos, junto con la anotación y su historia, sin solicitar revisión únicamente por esa anotación ni por compartir localidad. No deduplicar por localidad ni modificar datos. La independencia confirmada se refiere sólo a los registros cuestionados y no convierte copias coincidentes entre hojas en observaciones adicionales. Mantener los controles generales de duplicados y coincidencias entre hojas; esta aclaración no resuelve otras incertidumbres.",
+      "identity_clarifications": [
+        {
+          "rule_id": "rdlp_disputed_samples_distinct",
+          "original_note": "No se si habrá alguna repetida con las 13 y 14 PL y Bal",
+          "statement": "El usuario confirmó que los registros de muestreo cuestionados en esta anotación corresponden a muestras distintas: conservarlos como observaciones independientes; los números de campaña corresponden a períodos diferentes según las leyendas y el PDF de anotaciones. Esta independencia se refiere sólo a los registros cuestionados y no a copias coincidentes entre hojas. Conservar períodos, anotación y localidades; la anotación y la coincidencia de localidad no requieren revisión por sí solas ni autorizan deduplicar.",
+          "confirmed_by": "usuario",
+          "source_reference": "Aclaración del usuario en la conversación de AquAI del 2026-10-11"
+        }
+      ]
+    }
+  ],
   "common": [
     {
       "id": "preserve_original_values",

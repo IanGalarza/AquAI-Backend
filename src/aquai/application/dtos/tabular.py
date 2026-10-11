@@ -10,6 +10,51 @@ class SampleRow(BaseModel):
     values: list[JsonValue]
 
 
+class SourceRowMatch(BaseModel):
+    left_row: int = Field(ge=1, strict=True)
+    right_row: int = Field(ge=1, strict=True)
+
+
+class RecordOverlap(BaseModel):
+    left_sheet: str = Field(min_length=1)
+    right_sheet: str = Field(min_length=1)
+    left_header_rows: list[Annotated[int, Field(ge=1, strict=True)]]
+    right_header_rows: list[Annotated[int, Field(ge=1, strict=True)]]
+    left_start_column: int = Field(ge=1, strict=True)
+    left_end_column: int = Field(ge=1, strict=True)
+    right_start_column: int = Field(ge=1, strict=True)
+    right_end_column: int = Field(ge=1, strict=True)
+    left_record_count: int = Field(ge=0, strict=True)
+    right_record_count: int = Field(ge=0, strict=True)
+    matches: list[SourceRowMatch]
+    left_only_rows: list[Annotated[int, Field(ge=1, strict=True)]]
+    right_only_rows: list[Annotated[int, Field(ge=1, strict=True)]]
+    comparison: Literal["exact_values_headers_and_formulas"] = "exact_values_headers_and_formulas"
+    policy: Literal["preserve_sources_do_not_add_matches"] = "preserve_sources_do_not_add_matches"
+    ambiguous_repeated_rows: bool = False
+
+    @model_validator(mode="after")
+    def coherent_source_rows(self) -> "RecordOverlap":
+        if self.left_start_column > self.left_end_column or self.right_start_column > self.right_end_column:
+            raise ValueError("Los rangos de columnas de la relación deben estar ordenados.")
+        if self.left_end_column - self.left_start_column != self.right_end_column - self.right_start_column:
+            raise ValueError("La comparación exacta requiere el mismo ancho de columnas en ambos orígenes.")
+        for side in ("left", "right"):
+            headers = getattr(self, f"{side}_header_rows")
+            if headers != sorted(set(headers)):
+                raise ValueError(f"{side}_header_rows debe contener filas únicas y ordenadas.")
+            matched_rows = [getattr(match, f"{side}_row") for match in self.matches]
+            exclusive_rows = getattr(self, f"{side}_only_rows")
+            rows = matched_rows + exclusive_rows
+            if len(rows) != len(set(rows)):
+                raise ValueError(f"Cada fila de origen {side} debe aparecer una sola vez entre coincidencias y exclusivas.")
+            if set(headers).intersection(rows):
+                raise ValueError(f"Las filas de encabezado {side} no pueden contarse como registros.")
+            if getattr(self, f"{side}_record_count") != len(rows):
+                raise ValueError(f"{side}_record_count debe coincidir con las coincidencias más las filas exclusivas.")
+        return self
+
+
 class FormulaSample(BaseModel):
     cell: str
     formula: str
@@ -31,6 +76,26 @@ class StructuralRegion(BaseModel):
     nonempty_cells: int = Field(default=0, ge=0)
     sample: list[SampleRow] = Field(default_factory=list)
     column_indices: list[int] = Field(default_factory=list)
+
+
+class SheetContentEvidence(BaseModel):
+    """Conteo completo de contenido, independiente de muestras y del formato."""
+
+    sheet_name: str
+    inspected_cells: int = Field(ge=0)
+    value_cells: int = Field(ge=0)
+    formula_cells: int = Field(ge=0)
+    verification: Literal["full_sheet_values_and_formulas"] = "full_sheet_values_and_formulas"
+
+    @model_validator(mode="after")
+    def coherent_content_counts(self) -> "SheetContentEvidence":
+        if max(self.value_cells, self.formula_cells) > self.inspected_cells:
+            raise ValueError("Los conteos de contenido no pueden superar las celdas examinadas.")
+        return self
+
+    @property
+    def is_empty(self) -> bool:
+        return self.value_cells == 0 and self.formula_cells == 0
 
 
 class SheetSummary(BaseModel):
@@ -55,6 +120,7 @@ class SheetSummary(BaseModel):
     possible_header_rows: list[int] = Field(default_factory=list)
     regions: list[StructuralRegion] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
+    content_evidence: SheetContentEvidence | None = None
 
 
 class StructuralSummary(BaseModel):
@@ -62,6 +128,7 @@ class StructuralSummary(BaseModel):
     file_type: Literal["csv", "xlsx"]
     file_size_bytes: int
     sheets: list[SheetSummary]
+    record_overlaps: list[RecordOverlap] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
     csv_encoding: str | None = None
     csv_delimiter: str | None = None
@@ -266,6 +333,18 @@ class PreparationRecipe(RecipeContract):
         return self
 
 
+class RecordIdentityClarification(BaseModel):
+    """Aclaración humana verificada por el servicio de reglas para una nota concreta."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    rule_id: str = Field(min_length=1)
+    original_note: str = Field(min_length=1)
+    statement: str = Field(min_length=1)
+    confirmed_by: str = Field(min_length=1)
+    source_reference: str = Field(min_length=1)
+
+
 class TabularFinding(BaseModel):
     code: str
     message: str
@@ -322,11 +401,29 @@ class SheetExecution(BaseModel):
     findings: list[TabularFinding] = Field(default_factory=list)
 
 
+class EmptySheetTreatment(BaseModel):
+    """Tratamiento determinístico registrado sin editar la propuesta original."""
+
+    sheet_name: str
+    evidence: SheetContentEvidence
+    skipped_block_ids: list[str] = Field(default_factory=list)
+    action: Literal["verified_empty_no_table"] = "verified_empty_no_table"
+
+
 class ExecutionResult(BaseModel):
     sheets: list[SheetExecution] = Field(default_factory=list)
     skipped_sheets: list[str] = Field(default_factory=list)
     coverage: list[SheetCoverage] = Field(default_factory=list)
     findings: list[TabularFinding] = Field(default_factory=list)
+    record_overlaps: list[RecordOverlap] = Field(default_factory=list)
+    sheet_content_evidence: list[SheetContentEvidence] = Field(default_factory=list)
+    empty_sheets: list[EmptySheetTreatment] = Field(default_factory=list)
+
+
+class OriginalProposalState(BaseModel):
+    status: Literal["ready", "review_required", "failed"]
+    requires_human_review: bool
+    warnings: list[str]
 
 
 class ValidationResult(BaseModel):
@@ -334,6 +431,8 @@ class ValidationResult(BaseModel):
     warnings: list[str] = Field(default_factory=list)
     errors: list[str] = Field(default_factory=list)
     findings: list[TabularFinding] = Field(default_factory=list)
+    original_proposal: OriginalProposalState | None = None
+    review_reasons: list[TabularFinding] = Field(default_factory=list)
 
 
 class LLMResponse(BaseModel):

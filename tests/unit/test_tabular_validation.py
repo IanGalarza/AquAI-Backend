@@ -4,6 +4,8 @@ from aquai.application.dtos.tabular import (
     ExecutionResult,
     FormulaSample,
     PreparationRecipe,
+    RecordIdentityClarification,
+    RecordOverlap,
     SheetExecution,
     SheetCoverage,
     RenameColumns,
@@ -13,6 +15,7 @@ from aquai.application.dtos.tabular import (
     StructuralSummary,
     StructuralRegion,
     TabularFinding,
+    SourceRowMatch,
     ValidationResult,
 )
 from aquai.application.services.tabular_validation import TabularValidationService
@@ -80,6 +83,215 @@ class TabularValidationTests(unittest.TestCase):
         self.assertEqual(result.warnings, [])
         self.assertEqual(result.errors, [])
 
+    def _add_overlapping_view(self, ambiguous: bool = False) -> None:
+        self.summary.sheets.append(self._summary_sheet("Sorted", rows=3))
+        self.recipe.sheets.append(SheetRecipe(
+            sheet_name="Sorted", block_id="sorted", role="observations",
+            header_rows=[1], data_start_row=2, data_end_row=3,
+            data_start_column=1, data_end_column=2, transformations=[],
+        ))
+        self.execution.sheets.append(self._execution_sheet(
+            "Sorted", block_id="sorted", source_rows=3, rows_before=2, rows_after=2, data_end_row=3,
+        ))
+        relation = RecordOverlap(
+            left_sheet="Measurements", right_sheet="Sorted",
+            left_header_rows=[1], right_header_rows=[1],
+            left_start_column=1, left_end_column=2, right_start_column=1, right_end_column=2,
+            left_record_count=3, right_record_count=2,
+            matches=[SourceRowMatch(left_row=2, right_row=3), SourceRowMatch(left_row=4, right_row=2)],
+            left_only_rows=[3], right_only_rows=[], ambiguous_repeated_rows=ambiguous,
+        )
+        self.summary.record_overlaps = [relation]
+        self.execution.record_overlaps = [relation.model_copy(deep=True)]
+
+    def test_exact_overlapping_views_preserve_both_sources_without_requiring_review(self) -> None:
+        self._add_overlapping_view()
+        result = self._validate()
+        self.assertEqual(result.status, EvaluationStatus.READY_WITH_WARNINGS)
+        self.assertEqual(result.errors, [])
+        finding = next(item for item in result.findings if item.code == "source_record_overlap")
+        self.assertFalse(finding.requires_review)
+        self.assertEqual(finding.range, "A2:B4")
+        self.assertIn("2 registros", finding.message)
+        self.assertIn("1 registros exclusivos", finding.message)
+        self.assertEqual([item.rows_after for item in self.execution.sheets], [3, 2])
+        self.assertEqual(self.execution.record_overlaps[0].policy, "preserve_sources_do_not_add_matches")
+
+    def test_missing_executed_overlap_evidence_is_an_error(self) -> None:
+        self._add_overlapping_view()
+        self.execution.record_overlaps = []
+        result = self._validate()
+        self.assertEqual(result.status, EvaluationStatus.FAILED)
+        self.assertTrue(any(item.code == "record_overlap_evidence_mismatch" for item in result.findings))
+
+    def test_overlap_evidence_multiplicity_must_be_preserved(self) -> None:
+        self._add_overlapping_view()
+        relation = self.summary.record_overlaps[0]
+        for source_count, execution_count in ((1, 2), (2, 1)):
+            with self.subTest(source_count=source_count, execution_count=execution_count):
+                self.summary.record_overlaps = [relation] * source_count
+                self.execution.record_overlaps = [relation] * execution_count
+                result = self._validate()
+                self.assertEqual(result.status, EvaluationStatus.FAILED)
+                self.assertTrue(any(item.code == "record_overlap_evidence_mismatch" for item in result.findings))
+
+    def test_overlap_evidence_order_does_not_change_validation(self) -> None:
+        self._add_overlapping_view()
+        relation = self.summary.record_overlaps[0]
+        reverse = RecordOverlap.model_validate({
+            **relation.model_dump(), "left_sheet": "Sorted", "right_sheet": "Measurements",
+            "left_record_count": 2, "right_record_count": 3,
+            "matches": [{"left_row": match.right_row, "right_row": match.left_row}
+                        for match in relation.matches],
+            "left_only_rows": [], "right_only_rows": [3],
+        })
+        self.summary.record_overlaps = [relation, reverse]
+        self.execution.record_overlaps = [reverse, relation]
+        result = self._validate()
+        self.assertEqual(result.status, EvaluationStatus.READY_WITH_WARNINGS)
+        self.assertFalse(result.errors)
+        self.assertFalse(any(item.code == "record_overlap_evidence_mismatch" for item in result.findings))
+
+    def test_repeated_identical_content_inside_a_view_requires_identity_review(self) -> None:
+        self._add_overlapping_view(ambiguous=True)
+        self.assertEqual(self._validate().status, EvaluationStatus.REVIEW_REQUIRED)
+
+    def test_internal_repetitions_require_review_without_claiming_shared_records(self) -> None:
+        self._add_overlapping_view()
+        original = self.summary.record_overlaps[0].model_dump()
+        for ambiguous in (False, True):
+            with self.subTest(ambiguous=ambiguous):
+                relation = RecordOverlap.model_validate({
+                    **original, "matches": [], "left_only_rows": [2, 3, 4], "right_only_rows": [2, 3],
+                    "ambiguous_repeated_rows": ambiguous,
+                })
+                self.summary.record_overlaps = [relation]
+                self.execution.record_overlaps = [relation.model_copy(deep=True)]
+                result = self._validate()
+                expected = EvaluationStatus.REVIEW_REQUIRED if ambiguous else EvaluationStatus.READY
+                self.assertEqual(result.status, expected)
+                self.assertFalse(result.errors)
+                self.assertFalse(any(item.code == "source_record_overlap" for item in result.findings))
+                repetitions = [item for item in result.findings if item.code == "source_repeated_record_content"]
+                self.assertEqual(len(repetitions), int(ambiguous))
+                if repetitions:
+                    self.assertTrue(repetitions[0].requires_review)
+                    self.assertIn("No hay registros compartidos", repetitions[0].message)
+                self.assertEqual(self.execution.record_overlaps[0].matches, [])
+
+    def test_source_duplicate_uncertainty_is_located_and_deduplicated_across_samples(self) -> None:
+        note = SampleRow(row_number=3, values=["A", "No sé si hay alguna repetida con otra campaña."])
+        self.summary.sheets[0].column_indices = [1, 2]
+        self.summary.sheets[0].sample = [note]
+        self.summary.sheets[0].regions = [StructuralRegion(
+            region_id="records", start_row=2, end_row=4, start_column=1, end_column=2,
+            kind="observations", reason="Registros por sitio.", sample=[note], column_indices=[1, 2],
+        )]
+        result = self._validate()
+        self.assertEqual(result.status, EvaluationStatus.REVIEW_REQUIRED)
+        findings = [item for item in result.findings if item.code == "source_record_identity_uncertainty"]
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0].cell, "B3")
+        self.assertEqual(findings[0].sheet_name, "Measurements")
+        self.assertEqual(self.execution.sheets[0].rows_after, 3)
+
+    def test_uncertain_identity_notes_allow_line_breaks_and_impersonal_wording(self) -> None:
+        self.summary.sheets[0].column_indices = [1, 2]
+        for text in ("No se sabe si hay registros repetidos.", "No sé si hay alguna\nrepetida.",
+                     "No\tse\nsabe si hay alguna duplicada."):
+            with self.subTest(text=text):
+                note = SampleRow(row_number=3, values=["A", text])
+                self.summary.sheets[0].sample = [note]
+                result = self._validate()
+                self.assertEqual(result.status, EvaluationStatus.REVIEW_REQUIRED)
+                findings = [item for item in result.findings if item.code == "source_record_identity_uncertainty"]
+                self.assertEqual(len(findings), 1)
+                self.assertEqual(findings[0].cell, "B3")
+                self.assertEqual(note.values[1], text)
+
+    def _confirmed_note_context(self) -> tuple[RecordIdentityClarification, ...]:
+        text = "No sé si hay alguna repetida con otra campaña."
+        self.summary.sheets[0].column_indices = [1, 2]
+        self.summary.sheets[0].sample = [
+            SampleRow(row_number=2, values=["A", 0]),
+            SampleRow(row_number=3, values=["A", text]),
+            SampleRow(row_number=4, values=["A", 42]),
+        ]
+        return (RecordIdentityClarification(
+            rule_id="reviewed_note", original_note=text,
+            statement="Son mediciones distintas; conservarlas independientes y usar sus períodos originales.",
+            confirmed_by="el usuario", source_reference="confirmación humana verificada",
+        ),)
+
+    def test_confirmed_note_is_historical_evidence_not_a_review_trigger(self) -> None:
+        context = self._confirmed_note_context()
+        source_before = self.summary.model_dump()
+        recipe_before = self.recipe.model_dump()
+        result = self.service.validate(
+            self.summary, self.recipe, self.execution, identity_clarifications=context,
+        )
+        self.assertEqual(result.status, EvaluationStatus.READY_WITH_WARNINGS)
+        self.assertFalse(result.errors)
+        self.assertFalse(any(item.requires_review for item in result.findings))
+        finding = next(item for item in result.findings if item.code == "source_record_identity_clarified")
+        self.assertEqual((finding.sheet_name, finding.cell), ("Measurements", "B3"))
+        self.assertIn(context[0].original_note, finding.message)
+        self.assertIn(context[0].rule_id, finding.message)
+        self.assertIn("usuario", finding.message)
+        self.assertEqual(self.summary.model_dump(), source_before)
+        self.assertEqual(self.recipe.model_dump(), recipe_before)
+        self.assertEqual(self.execution.sheets[0].rows_after, 3)
+
+    def test_note_confirmation_does_not_cover_another_uncertain_note(self) -> None:
+        context = self._confirmed_note_context()
+        self.summary.sheets[0].sample[-1].values[1] = "Posible registro duplicado sin verificar."
+        result = self.service.validate(
+            self.summary, self.recipe, self.execution, identity_clarifications=context,
+        )
+        self.assertEqual(result.status, EvaluationStatus.REVIEW_REQUIRED)
+        unresolved = next(item for item in result.findings if item.code == "source_record_identity_uncertainty")
+        self.assertEqual(unresolved.cell, "B4")
+        self.assertTrue(unresolved.requires_review)
+
+    def test_note_confirmation_preserves_duplicate_and_overlap_integrity_checks(self) -> None:
+        context = self._confirmed_note_context()
+        self._add_overlapping_view(ambiguous=True)
+        result = self.service.validate(
+            self.summary, self.recipe, self.execution, identity_clarifications=context,
+        )
+        self.assertEqual(result.status, EvaluationStatus.REVIEW_REQUIRED)
+        overlap = next(item for item in result.findings if item.code == "source_record_overlap")
+        self.assertTrue(overlap.requires_review)
+        self.assertEqual(self.execution.record_overlaps, self.summary.record_overlaps)
+        self.execution.record_overlaps = []
+        result = self.service.validate(
+            self.summary, self.recipe, self.execution, identity_clarifications=context,
+        )
+        self.assertEqual(result.status, EvaluationStatus.FAILED)
+        self.assertTrue(any(item.code == "record_overlap_evidence_mismatch" for item in result.findings))
+
+    def test_note_confirmation_does_not_clear_an_unknown_block(self) -> None:
+        context = self._confirmed_note_context()
+        self.recipe = PreparationRecipe(
+            status="review_required", sheets=[self.recipe.sheets[0].model_copy(update={"role": "unknown"})],
+            warnings=["Hay un bloque cuyo rol sigue sin resolver."], requires_human_review=True,
+        )
+        self.execution.sheets[0].role = "unknown"
+        result = self.service.validate(
+            self.summary, self.recipe, self.execution, identity_clarifications=context,
+        )
+        self.assertEqual(result.status, EvaluationStatus.REVIEW_REQUIRED)
+        self.assertTrue(any(item.code == "unresolved_block_role" for item in result.findings))
+        self.assertFalse(next(item for item in result.findings
+                              if item.code == "source_record_identity_clarified").requires_review)
+
+    def test_observation_notes_without_explicit_uncertainty_do_not_create_identity_review(self) -> None:
+        self.summary.sheets[0].column_indices = [1, 2]
+        for text in ("No hay duplicados.", "No hay\nduplicados."):
+            with self.subTest(text=text):
+                self.summary.sheets[0].sample = [SampleRow(row_number=3, values=["A", text])]
+                self.assertEqual(self._validate().status, EvaluationStatus.READY)
+
     def test_expected_empty_cleanup_only_requires_warnings(self) -> None:
         self.execution.sheets[0] = self._execution_sheet(
             "Measurements",
@@ -138,12 +350,16 @@ class TabularValidationTests(unittest.TestCase):
         self.assertTrue(any("Espacios eliminados" in warning for warning in result.warnings))
         self.assertTrue(any("completamente vacías" in warning for warning in result.warnings))
 
-    def test_model_review_flags_are_preserved(self) -> None:
+    def test_model_review_flags_are_preserved_as_history_separate_from_current_findings(self) -> None:
         for flag in ("status", "requires_human_review"):
             with self.subTest(flag=flag):
                 self.recipe.status = "review_required" if flag == "status" else "ready"
                 self.recipe.requires_human_review = flag == "requires_human_review"
-                self.assertEqual(self._validate().status, EvaluationStatus.REVIEW_REQUIRED)
+                result = self._validate()
+                self.assertEqual(result.status, EvaluationStatus.READY)
+                self.assertEqual(result.original_proposal.status, self.recipe.status)
+                self.assertEqual(result.original_proposal.requires_human_review, self.recipe.requires_human_review)
+                self.assertEqual(result.review_reasons, [])
 
     def test_failed_recipe_cannot_be_overridden_by_successful_execution(self) -> None:
         self.recipe.status = "failed"
@@ -191,12 +407,12 @@ class TabularValidationTests(unittest.TestCase):
         self.summary.sheets.append(self._summary_sheet("Second"))
         self.assertEqual(self._validate().status, EvaluationStatus.REVIEW_REQUIRED)
 
-    def test_empty_skipped_sheet_uses_exact_count_when_indices_are_truncated(self) -> None:
+    def test_empty_indices_and_counts_without_content_verification_cannot_clear_omission(self) -> None:
         self.summary.sheets.append(
             self._summary_sheet("Empty", rows=500, empty_rows=list(range(1, 101)), empty_row_count=500)
         )
         self.execution.skipped_sheets = ["Empty"]
-        self.assertEqual(self._validate().status, EvaluationStatus.READY_WITH_WARNINGS)
+        self.assertEqual(self._validate().status, EvaluationStatus.REVIEW_REQUIRED)
 
     def test_skipped_sheet_with_unresolved_formulas_is_not_classified_as_empty(self) -> None:
         self.summary.sheets.append(

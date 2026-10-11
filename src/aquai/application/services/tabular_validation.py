@@ -1,10 +1,13 @@
 import re
 import unicodedata
+from collections import Counter
 from numbers import Number
 
 from aquai.application.dtos.tabular import (
     ExecutionResult,
+    OriginalProposalState,
     PreparationRecipe,
+    RecordIdentityClarification,
     RenameColumns,
     SheetExecution,
     SheetRecipe,
@@ -23,16 +26,19 @@ class TabularValidationService:
         summary: StructuralSummary,
         recipe: PreparationRecipe,
         execution: ExecutionResult,
+        *,
+        identity_clarifications: tuple[RecordIdentityClarification, ...] = (),
     ) -> ValidationResult:
-        warnings = list(summary.warnings) + list(recipe.warnings)
+        # La propuesta archivada es antecedente; el estado vigente depende de los controles actuales.
+        warnings = list(summary.warnings)
         errors: list[str] = []
         findings = list(execution.findings)
-        requires_review = recipe.requires_human_review or recipe.status == "review_required"
+        requires_review = False
+        empty_names, empty_findings = self._verified_empty_sheets(summary, recipe, execution)
+        findings.extend(empty_findings)
 
         if recipe.status == "failed":
             errors.append("La receta indica que el archivo no pudo prepararse.")
-        if requires_review:
-            warnings.append("La receta solicita revisión humana.")
 
         source_sheets = {sheet.name: sheet for sheet in summary.sheets}
         planned_names = {sheet.sheet_name for sheet in recipe.sheets}
@@ -70,7 +76,9 @@ class TabularValidationService:
 
         for name in sorted(planned_names - source_sheets.keys()):
             errors.append(f"La receta referencia una hoja inexistente: '{name}'.")
-        for name, block_id in sorted(planned_blocks - executed_blocks, key=str):
+        treated_blocks = {(block.sheet_name, block.block_id) for block in recipe.sheets
+                          if block.sheet_name in empty_names}
+        for name, block_id in sorted(planned_blocks - executed_blocks - treated_blocks, key=str):
             errors.append(f"No se ejecutó {self._block_label(name, block_id)} incluido en la receta.")
         for name, block_id in sorted(executed_blocks - planned_blocks, key=str):
             errors.append(f"Se ejecutó {self._block_label(name, block_id)} sin estar incluido en la receta.")
@@ -106,16 +114,15 @@ class TabularValidationService:
                 ))
 
         omitted_names = skipped_names | (source_sheets.keys() - executed_names)
-        for name in sorted(omitted_names):
+        for name in sorted(omitted_names - empty_names):
             sheet = source_sheets.get(name)
             if sheet is None:
-                requires_review = True
-                warnings.append(f"Se informó una hoja omitida desconocida: '{name}'.")
-            elif self._has_source_data(sheet):
-                requires_review = True
-                warnings.append(f"Se omitió la hoja '{name}', que contiene datos.")
+                message = f"Se informó una hoja omitida desconocida: '{name}'."
             else:
-                warnings.append(f"Se omitió la hoja vacía '{name}'.")
+                message = (f"Se omitió la hoja '{name}', que contiene datos."
+                           if self._has_source_data(sheet) else
+                           f"Se omitió la hoja '{name}' sin un tratamiento de vacío verificado.")
+            findings.append(TabularFinding(code="unhandled_source_sheet", message=message, sheet_name=name))
 
         for sheet in execution.sheets:
             plan = plans.get((sheet.sheet_name, sheet.block_id))
@@ -145,15 +152,25 @@ class TabularValidationService:
                         severity="error",
                     ))
             findings.extend(sheet.findings)
-            sheet_warnings, sheet_errors, sheet_requires_review = self._validate_sheet(
+            sheet_warnings, sheet_errors, sheet_findings = self._validate_sheet(
                 sheet, coverage_available=sheet.sheet_name in coverage_names,
             )
             warnings.extend(sheet_warnings)
             errors.extend(sheet_errors)
-            requires_review = requires_review or sheet_requires_review
+            findings.extend(sheet_findings)
 
-        findings.extend(self._validate_regions(summary, recipe))
+        findings.extend(self._validate_regions(summary, recipe, empty_names))
         findings.extend(self._validate_unit_labels(summary, recipe))
+        findings.extend(self._validate_record_overlaps(summary, execution))
+        findings.extend(self._validate_record_identity_notes(summary, identity_clarifications))
+        if recipe.status == "review_required" and not recipe.sheets and len(empty_names) != len(source_sheets):
+            findings.append(TabularFinding(
+                code="unplanned_recipe", message="La receta no propone ninguna hoja para ejecutar; requiere revisión.",
+            ))
+        elif (not any(sheet.rows_after > 0 and sheet.columns_after for sheet in execution.sheets)
+              and len(empty_names) != len(source_sheets)):
+            errors.append("La ejecución no produjo ninguna tabla con filas y columnas de datos.")
+
         for finding in findings:
             prefix = f"Hoja '{finding.sheet_name}': " if finding.sheet_name else ""
             if finding.severity == "error":
@@ -161,11 +178,6 @@ class TabularValidationService:
             else:
                 warnings.append(prefix + finding.message)
             requires_review = requires_review or finding.requires_review
-
-        if recipe.status == "review_required" and not recipe.sheets:
-            warnings.append("La receta no propone ninguna hoja para ejecutar; requiere revisión.")
-        elif not any(sheet.rows_after > 0 and sheet.columns_after for sheet in execution.sheets):
-            errors.append("La ejecución no produjo ninguna tabla con filas y columnas de datos.")
 
         if errors:
             status = EvaluationStatus.FAILED
@@ -181,15 +193,175 @@ class TabularValidationService:
             warnings=list(dict.fromkeys(warnings)),
             errors=list(dict.fromkeys(errors)),
             findings=list({finding.model_dump_json(): finding for finding in findings}.values()),
+            original_proposal=OriginalProposalState(
+                status=recipe.status, requires_human_review=recipe.requires_human_review,
+                warnings=list(recipe.warnings),
+            ),
+            review_reasons=list({finding.model_dump_json(): finding for finding in findings
+                                 if finding.requires_review}.values()),
         )
+
+    def _verified_empty_sheets(
+        self, summary: StructuralSummary, recipe: PreparationRecipe, execution: ExecutionResult,
+    ) -> tuple[set[str], list[TabularFinding]]:
+        sources = {sheet.name: sheet for sheet in summary.sheets}
+        evidence = {item.sheet_name: item for item in execution.sheet_content_evidence}
+        verified: set[str] = set()
+        findings: list[TabularFinding] = []
+        if len(evidence) != len(execution.sheet_content_evidence):
+            findings.append(TabularFinding(
+                code="empty_sheet_evidence_mismatch", message="La ejecución repite evidencia de contenido de una hoja.",
+                severity="error",
+            ))
+        for treatment in execution.empty_sheets:
+            source = sources.get(treatment.sheet_name)
+            expected_ids = [block.block_id for block in recipe.sheets if block.sheet_name == treatment.sheet_name]
+            proof = treatment.evidence
+            coherent = (
+                source is not None and source.content_evidence is not None
+                and proof.sheet_name == treatment.sheet_name and proof.is_empty
+                and proof.inspected_cells == source.rows * source.columns
+                and proof == source.content_evidence == evidence.get(treatment.sheet_name)
+                and source.formula_count == 0 and source.error_cell_count == 0
+                and Counter(treatment.skipped_block_ids) == Counter(expected_ids)
+                and treatment.sheet_name not in verified
+                and not any(sheet.sheet_name == treatment.sheet_name for sheet in execution.sheets)
+                and all(coverage.nonempty_cells == 0 for coverage in execution.coverage
+                        if coverage.sheet_name == treatment.sheet_name)
+            )
+            if not coherent:
+                findings.append(TabularFinding(
+                    code="empty_sheet_evidence_mismatch",
+                    message="El tratamiento de hoja vacía no coincide con la inspección completa y la ejecución.",
+                    sheet_name=treatment.sheet_name, severity="error",
+                ))
+                continue
+            verified.add(treatment.sheet_name)
+            findings.append(TabularFinding(
+                code="verified_empty_sheet",
+                message=(f"Hoja vacía verificada: {proof.inspected_cells} celdas examinadas, "
+                         "0 valores y 0 fórmulas. No se genera tabla; la receta original se conserva."),
+                sheet_name=treatment.sheet_name, requires_review=False,
+            ))
+        return verified, findings
 
     def _block_label(self, sheet_name: str, block_id: str | None) -> str:
         if block_id is None:
             return f"la hoja '{sheet_name}'"
         return f"el bloque '{block_id}' de la hoja '{sheet_name}'"
 
+    def _validate_record_overlaps(
+        self, summary: StructuralSummary, execution: ExecutionResult,
+    ) -> list[TabularFinding]:
+        """Expone relaciones de contenido sin anexar ni deduplicar observaciones."""
+        findings = []
+        source_relations = Counter(relation.model_dump_json() for relation in summary.record_overlaps)
+        executed_relations = Counter(relation.model_dump_json() for relation in execution.record_overlaps)
+        if source_relations != executed_relations:
+            findings.append(TabularFinding(
+                code="record_overlap_evidence_mismatch",
+                message="La ejecución no conserva las relaciones de registros observadas en la fuente.",
+                severity="error",
+            ))
+        for relation in summary.record_overlaps:
+            if not relation.matches:
+                if relation.ambiguous_repeated_rows:
+                    findings.append(TabularFinding(
+                        code="source_repeated_record_content",
+                        message=(
+                            f"No hay registros compartidos entre '{relation.left_sheet}' y "
+                            f"'{relation.right_sheet}', pero se informa contenido repetido dentro de "
+                            "al menos uno de los orígenes. Conservar registros y procedencias; "
+                            "confirmar identidad antes de anexar o deduplicar."
+                        ),
+                    ))
+                continue
+            rows = [match.left_row for match in relation.matches] + relation.left_only_rows
+            findings.append(TabularFinding(
+                code="source_record_overlap",
+                message=(
+                    f"Hay {len(relation.matches)} registros de contenido exacto compartido con "
+                    f"'{relation.right_sheet}'; {len(relation.left_only_rows)} registros exclusivos "
+                    f"de esta hoja y {len(relation.right_only_rows)} de la otra. Conservar ambas "
+                    "procedencias sin sumar coincidencias como observaciones independientes."
+                    + (" La fuente repite contenido dentro de una hoja: confirmar identidad antes de deduplicar."
+                       if relation.ambiguous_repeated_rows else "")
+                ),
+                sheet_name=relation.left_sheet,
+                range=(
+                    f"{self._column_label(relation.left_start_column)}{min(rows)}:"
+                    f"{self._column_label(relation.left_end_column)}{max(rows)}"
+                ),
+                requires_review=relation.ambiguous_repeated_rows,
+            ))
+        return findings
+
+    def _validate_record_identity_notes(
+        self, summary: StructuralSummary,
+        clarifications: tuple[RecordIdentityClarification, ...] = (),
+    ) -> list[TabularFinding]:
+        """Las dudas explícitas de la fuente se conservan como evidencia para revisión."""
+        findings = []
+        seen = set()
+        clarified_notes = {
+            self._normalized_note(clarification.original_note): clarification
+            for clarification in clarifications
+        }
+        uncertainty = re.compile(
+            r"\b(?:no (?:se(?: sabe)?|sabemos) si|posibles?|possible|potential)\b.{0,100}"
+            r"\b(?:repetid\w*|duplicad\w*|duplicates?|repeated)\b", re.IGNORECASE,
+        )
+        for sheet in summary.sheets:
+            samples = [(sheet.sample, sheet.column_indices)] + [
+                (region.sample, region.column_indices) for region in sheet.regions
+            ]
+            for sample, positions in samples:
+                if not positions:
+                    continue
+                for row in sample:
+                    for column, value in zip(positions, row.values):
+                        if not isinstance(value, str):
+                            continue
+                        normalized = self._normalized_note(value)
+                        key = (sheet.name, row.row_number, column)
+                        if key in seen or not uncertainty.search(normalized):
+                            continue
+                        seen.add(key)
+                        clarification = clarified_notes.get(normalized)
+                        if clarification is not None:
+                            findings.append(TabularFinding(
+                                code="source_record_identity_clarified",
+                                message=(
+                                    f"La nota original {value!r} se conserva como antecedente. "
+                                    f"Aclarada por {clarification.confirmed_by}: {clarification.statement} "
+                                    f"Regla {clarification.rule_id}; fuente: {clarification.source_reference}."
+                                ),
+                                sheet_name=sheet.name,
+                                cell=f"{self._column_label(column)}{row.row_number}",
+                                requires_review=False,
+                            ))
+                            continue
+                        findings.append(TabularFinding(
+                            code="source_record_identity_uncertainty",
+                            message=(
+                                "La nota original declara posibles repeticiones. Se conservan los registros "
+                                "y sus notas; confirmar su identidad antes de anexar o deduplicar."
+                            ),
+                            sheet_name=sheet.name,
+                            cell=f"{self._column_label(column)}{row.row_number}",
+                        ))
+        return findings
+
+    @staticmethod
+    def _normalized_note(value: str) -> str:
+        normalized = "".join(
+            character for character in unicodedata.normalize("NFKD", value.casefold())
+            if not unicodedata.combining(character)
+        )
+        return " ".join(normalized.split())
+
     def _validate_regions(
-        self, summary: StructuralSummary, recipe: PreparationRecipe,
+        self, summary: StructuralSummary, recipe: PreparationRecipe, empty_names: set[str] | None = None,
     ) -> list[TabularFinding]:
         findings: list[TabularFinding] = []
         sources = {sheet.name: sheet for sheet in summary.sheets}
@@ -198,6 +370,8 @@ class TabularValidationService:
             "summary": "summary", "repeated_header": "header", "header": "header",
         }
         for block in recipe.sheets:
+            if block.sheet_name in (empty_names or set()):
+                continue
             source = sources.get(block.sheet_name)
             if source is None:
                 continue
@@ -368,6 +542,8 @@ class TabularValidationService:
         return labels
 
     def _has_source_data(self, sheet: SheetSummary) -> bool:
+        if sheet.content_evidence is not None:
+            return not sheet.content_evidence.is_empty or sheet.formula_count > 0 or sheet.error_cell_count > 0
         empty_rows = max(sheet.empty_row_count, len(set(sheet.empty_rows)))
         empty_columns = max(sheet.empty_column_count, len(set(sheet.empty_columns)))
         return sheet.formula_count > 0 or sheet.error_cell_count > 0 or (
@@ -376,11 +552,16 @@ class TabularValidationService:
 
     def _validate_sheet(
         self, sheet: SheetExecution, *, coverage_available: bool = False,
-    ) -> tuple[list[str], list[str], bool]:
+    ) -> tuple[list[str], list[str], list[TabularFinding]]:
         prefix = f"Hoja '{sheet.sheet_name}': "
         warnings = [prefix + warning for warning in sheet.warnings]
         errors = [prefix + error for error in sheet.errors]
-        requires_review = False
+        findings: list[TabularFinding] = []
+
+        def review(code: str, message: str) -> None:
+            findings.append(TabularFinding(
+                code=code, message=message, sheet_name=sheet.sheet_name, block_id=sheet.block_id,
+            ))
 
         counts = (
             sheet.source_rows,
@@ -403,60 +584,43 @@ class TabularValidationService:
             errors.append(prefix + "La tabla final no tiene columnas.")
 
         if sheet.excluded_nonempty_rows and not coverage_available:
-            requires_review = True
-            warnings.append(
-                prefix + f"Se excluyeron {sheet.excluded_nonempty_rows} filas no vacías del rango de datos."
-            )
+            review("excluded_source_rows", f"Se excluyeron {sheet.excluded_nonempty_rows} filas no vacías del rango de datos.")
         if sheet.suspicious_header_rows:
-            requires_review = True
-            warnings.append(prefix + "Los encabezados seleccionados podrían contener registros de datos.")
+            review("suspicious_header_rows", "Los encabezados seleccionados podrían contener registros de datos.")
 
         # rows_before ya excluye los encabezados declarados en la receta.
         row_difference = sheet.rows_before - sheet.dropped_empty_rows - sheet.rows_after
         if row_difference > 0:
-            requires_review = True
-            warnings.append(
-                prefix + f"Se perdieron {row_difference} filas sin una eliminación de vacíos que lo explique."
-            )
+            review("unexplained_row_loss", f"Se perdieron {row_difference} filas sin una eliminación de vacíos que lo explique.")
         elif row_difference < 0:
-            requires_review = True
-            warnings.append(prefix + "Las cantidades de filas antes y después no concuerdan con la limpieza informada.")
+            review("row_count_mismatch", "Las cantidades de filas antes y después no concuerdan con la limpieza informada.")
 
         column_difference = (
             len(sheet.columns_before) - len(sheet.dropped_empty_columns) - len(sheet.columns_after)
         )
         if column_difference:
-            requires_review = True
-            warnings.append(
-                prefix + "Las cantidades de columnas antes y después no concuerdan con la limpieza informada."
-            )
+            review("column_count_mismatch", "Las cantidades de columnas antes y después no concuerdan con la limpieza informada.")
         if (
             len(set(sheet.columns_before)) != len(sheet.columns_before)
             or len(set(sheet.columns_after)) != len(sheet.columns_after)
         ):
-            requires_review = True
-            warnings.append(prefix + "Se detectaron nombres de columnas duplicados.")
+            review("duplicate_column_names", "Se detectaron nombres de columnas duplicados.")
         if any(not column.strip() for column in sheet.columns_after):
-            requires_review = True
-            warnings.append(prefix + "La tabla final contiene columnas sin nombre.")
+            review("unnamed_columns", "La tabla final contiene columnas sin nombre.")
 
         for column, failures in sheet.conversion_failures.items():
             if failures > 0:
-                requires_review = True
-                warnings.append(prefix + f"Fallaron {failures} conversiones en la columna '{column}'.")
+                review("conversion_failures", f"Fallaron {failures} conversiones en la columna '{column}'.")
         if (
             sheet.source_nonempty_cells is not None
             and sheet.preserved_nonempty_cells is not None
             and sheet.source_nonempty_cells != sheet.preserved_nonempty_cells
         ):
-            requires_review = True
-            warnings.append(prefix + "La cantidad de celdas no vacías no se conservó durante las transformaciones.")
+            review("nonempty_value_loss", "La cantidad de celdas no vacías no se conservó durante las transformaciones.")
         if sheet.unresolved_formula_cells or sheet.unresolved_formula_count:
-            requires_review = True
-            warnings.append(prefix + "Hay fórmulas cuyo resultado no está disponible.")
+            review("unresolved_formula_cache", "Hay fórmulas cuyo resultado no está disponible.")
         if sheet.error_cells or sheet.error_cell_count:
-            requires_review = True
-            warnings.append(prefix + "La hoja contiene celdas con errores de Excel.")
+            review("excel_error_cells", "La hoja contiene celdas con errores de Excel.")
 
         if sheet.empty_columns:
             warnings.append(prefix + "La tabla final contiene columnas completamente vacías.")
@@ -465,4 +629,4 @@ class TabularValidationService:
         if sheet.dropped_empty_columns:
             warnings.append(prefix + f"Se eliminaron {len(sheet.dropped_empty_columns)} columnas vacías.")
 
-        return warnings, errors, requires_review
+        return warnings, errors, findings

@@ -66,6 +66,8 @@ de rol header ni una copia de los registros para representar su cabecera.
 Si varias filas forman el encabezado, sus valores se combinan por columna
 con un espacio. No uses el encabezado de la tabla principal para una
 leyenda o bloque auxiliar cuya estructura sea diferente.
+Incluye las filas de unidades y subencabezados que correspondan al bloque
+en header_rows; esas filas describen columnas y no son registros observados.
 
 Si un bloque no tiene encabezado identificable, usa header_rows vacío.
 El ejecutor generará nombres técnicos como column_1, column_2, etc.
@@ -101,6 +103,11 @@ La presencia de fórmulas no convierte toda una hoja en derived.
 Determina el rol de cada bloque por su función, no sólo por sus tipos
 de celda. No mezcles mediciones, presencia binaria, porcentajes y totales
 como si fueran observaciones equivalentes.
+Una medición por sitio, fecha o entidad puede expresarse en porcentaje.
+El símbolo % o una unidad de medida no demuestra que sea un resumen:
+mantén las magnitudes de un mismo registro juntas cuando la evidencia
+muestre que son mediciones relacionadas, y separa agregados o derivados
+cuando su función esté documentada.
 
 Un bloque puede tener transformations vacío, pero igualmente requiere
 identificación, rol, encabezados y límites explícitos.
@@ -139,6 +146,19 @@ COBERTURA E INCERTIDUMBRE
 
 Contabiliza la información relevante mediante bloques o encabezados
 referenciados, sin mezclar roles para aparentar cobertura completa.
+Una hoja sin valores ni fórmulas puede omitirse. Las dimensiones de una
+hoja con sólo formato no son contenido desconocido que necesite un bloque.
+
+record_overlaps informa coincidencias exactas de registros completos con
+encabezados, valores y fórmulas compatibles entre hojas. Sus recuentos son
+completos aunque las listas enviadas sean muestras acotadas. Conserva cada
+procedencia y los registros exclusivos; las coincidencias no deben sumarse
+como observaciones independientes. No inventes coincidencias ni deduzcas
+identidad a partir de nombres parecidos o de una clave incompleta.
+La igualdad de contenido tampoco resuelve por sí sola la identidad
+científica de registros que la fuente declara como posibles repeticiones.
+Conserva esas notas y registra review_required con sus coordenadas;
+no anexes, dedupliques ni corrijas valores para resolver esa duda.
 
 Si puedes localizar una región pero no determinar su significado,
 inclúyela como unknown, sin transformaciones, e indica review_required.

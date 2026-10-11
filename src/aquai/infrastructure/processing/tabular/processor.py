@@ -2,6 +2,7 @@
 
 import math
 import re
+from collections import Counter, defaultdict, deque
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 from numbers import Number
@@ -15,12 +16,15 @@ from aquai.application.dtos.tabular import (
     ConvertType,
     DropEmptyColumns,
     DropEmptyRows,
+    EmptySheetTreatment,
     ExecutionResult,
     FormulaSample,
     PreparationRecipe,
+    RecordOverlap,
     RenameColumns,
     SampleRow,
     SheetExecution,
+    SheetContentEvidence,
     SheetRecipe,
     SheetSummary,
     SheetCoverage,
@@ -28,6 +32,7 @@ from aquai.application.dtos.tabular import (
     TabularFinding,
     StripStrings,
     StructuralSummary,
+    SourceRowMatch,
 )
 from aquai.infrastructure.processing.tabular.reader import SheetData, TableReader
 
@@ -79,11 +84,13 @@ class PandasTabularProcessor:
 
     def inspect(self, file_name: str, content: bytes) -> StructuralSummary:
         table = self.reader.read(file_name, content)
+        summaries = [self._summarize(sheet) for sheet in table.sheets]
         return StructuralSummary(
             file_name=file_name,
             file_type=table.file_type,
             file_size_bytes=len(content),
-            sheets=[self._summarize(sheet) for sheet in table.sheets],
+            sheets=summaries,
+            record_overlaps=self._record_overlaps(table.sheets, summaries),
             warnings=table.warnings,
             csv_encoding=table.csv_encoding,
             csv_delimiter=table.csv_delimiter,
@@ -99,6 +106,19 @@ class PandasTabularProcessor:
         table = self.reader.read(file_name, content)
         sheets = {sheet.name: sheet for sheet in table.sheets}
         selected = {sheet.sheet_name for sheet in recipe.sheets}
+        content_evidence = {
+            sheet.name: self._content_evidence(sheet) for sheet in table.sheets
+        }
+        empty_sheets = [
+            EmptySheetTreatment(
+                sheet_name=sheet.name,
+                evidence=content_evidence[sheet.name],
+                skipped_block_ids=[
+                    block.block_id for block in recipe.sheets if block.sheet_name == sheet.name
+                ],
+            )
+            for sheet in table.sheets if content_evidence[sheet.name].is_empty
+        ]
         executions = []
         for sheet_recipe in recipe.sheets:
             sheet = sheets.get(sheet_recipe.sheet_name)
@@ -119,20 +139,125 @@ class PandasTabularProcessor:
                     columns_after=[],
                     errors=["La hoja indicada por la receta no existe en el archivo."],
                 ))
-            else:
+            elif not content_evidence[sheet.name].is_empty:
                 executions.append(self._execute_sheet(sheet, sheet_recipe))
         return ExecutionResult(
             sheets=executions,
             skipped_sheets=[name for name in sheets if name not in selected],
             coverage=[self._coverage(sheet, recipe) for sheet in table.sheets],
             findings=[finding for execution in executions for finding in execution.findings],
+            record_overlaps=self._record_overlaps(table.sheets, [
+                item for item in summary.sheets
+                if item.name in content_evidence and not content_evidence[item.name].is_empty
+            ]),
+            sheet_content_evidence=list(content_evidence.values()),
+            empty_sheets=empty_sheets,
         )
+
+    def _value_key(self, value: object) -> tuple:
+        """Compara valores completos y tipos sin recortar textos, códigos ni espacios."""
+        if value is None or value is pd.NA or value is pd.NaT:
+            return ("missing",)
+        if not isinstance(value, str) and bool(pd.isna(value)):
+            return ("missing",)
+        if hasattr(value, "item"):
+            value = value.item()
+        return (type(value).__qualname__, value)
+
+    def _cell_key(self, sheet: SheetData, row: int, column: int) -> tuple:
+        formula = sheet.formula_cells.get((row, column))
+        source_type = "excel_error" if (row, column) in sheet.error_positions else "value"
+        if formula is not None:
+            return ("formula", formula.expression, source_type, self._value_key(formula.cached_value))
+        return ("literal", source_type, self._value_key(sheet.frame.iat[row - 1, column - 1]))
+
+    def _record_overlaps(
+        self, sheets: list[SheetData], summaries: list[SheetSummary],
+    ) -> list[RecordOverlap]:
+        """Relaciona multiconjuntos de filas originales; no fusiona, suma ni elimina datos."""
+        sources = {sheet.name: sheet for sheet in sheets}
+        compatible = defaultdict(list)
+        for summary in summaries:
+            sheet = sources.get(summary.name)
+            if sheet is None:
+                continue
+            bands = defaultdict(list)
+            for region in summary.regions:
+                if region.kind == "observations":
+                    bands[(region.start_row, region.end_row)].append(region)
+            for (start_row, end_row), regions in bands.items():
+                first = min(region.start_column for region in regions)
+                last = max(region.end_column for region in regions)
+                prior = [region for region in summary.regions
+                         if region.kind in {"header", "repeated_header"} and region.end_row < start_row
+                         and max(first, region.start_column) <= min(last, region.end_column)]
+                if not prior:
+                    continue
+                header = max(prior, key=lambda region: region.end_row)
+                header_rows = list(range(header.start_row, header.end_row + 1))
+                header_key = tuple(tuple(self._cell_key(sheet, row, column)
+                                        for column in range(first, last + 1)) for row in header_rows)
+                compatible[header_key].append((sheet, header_rows, start_row, end_row, first, last))
+        overlaps = []
+        for bands in compatible.values():
+            if len(bands) < 2:
+                continue
+            keyed_bands = []
+            for sheet, headers, start, end, first, last in bands:
+                records = [(row, tuple(self._cell_key(sheet, row, column)
+                                       for column in range(first, last + 1)))
+                           for row in range(start, end + 1)]
+                keyed_bands.append((sheet, headers, first, last, records))
+            for index, (left, left_headers, left_first, left_last, left_records) in enumerate(keyed_bands):
+                for right, right_headers, right_first, right_last, right_records in keyed_bands[index + 1:]:
+                    if left.name == right.name:
+                        continue
+                    right_by_value = defaultdict(deque)
+                    for row, key in right_records:
+                        right_by_value[key].append(row)
+                    matches, left_only = [], []
+                    for row, key in left_records:
+                        candidates = right_by_value[key]
+                        if candidates:
+                            matches.append(SourceRowMatch(left_row=row, right_row=candidates.popleft()))
+                        else:
+                            left_only.append(row)
+                    right_only = sorted(row for rows in right_by_value.values() for row in rows)
+                    repeated = any(count > 1 for count in Counter(key for _, key in left_records).values()) or any(
+                        count > 1 for count in Counter(key for _, key in right_records).values()
+                    )
+                    overlaps.append(RecordOverlap(
+                        left_sheet=left.name, right_sheet=right.name,
+                        left_header_rows=left_headers, right_header_rows=right_headers,
+                        left_start_column=left_first, left_end_column=left_last,
+                        right_start_column=right_first, right_end_column=right_last,
+                        left_record_count=len(left_records), right_record_count=len(right_records),
+                        matches=matches, left_only_rows=left_only, right_only_rows=right_only,
+                        comparison="exact_values_headers_and_formulas",
+                        policy="preserve_sources_do_not_add_matches", ambiguous_repeated_rows=repeated,
+                    ))
+        return overlaps
 
     def _occupied_cells(self, sheet: SheetData) -> np.ndarray:
         occupied = ~sheet.frame.map(is_empty).to_numpy(dtype=bool)
         for row, column in sheet.formula_cells:
             occupied[row - 1, column - 1] = True
         return occupied
+
+    def _content_evidence(self, sheet: SheetData) -> SheetContentEvidence:
+        """Verifica toda la hoja; un literal que contiene espacios es un valor.
+
+        El lector conserva todas las celdas y expresiones, incluso las fórmulas
+        sin caché. Ni las muestras ni las dimensiones de formato prueban que
+        una hoja esté vacía: se cuentan los valores efectivos de todas las
+        celdas y las expresiones completas antes de decidirlo.
+        """
+        return SheetContentEvidence(
+            sheet_name=sheet.name,
+            inspected_cells=int(sheet.frame.size),
+            value_cells=int(sheet.frame.count().sum()),
+            formula_cells=len(sheet.formula_cells),
+        )
 
     def _coverage(self, sheet: SheetData, recipe: PreparationRecipe) -> SheetCoverage:
         occupied = self._occupied_cells(sheet)
@@ -187,6 +312,7 @@ class PandasTabularProcessor:
 
     def _summarize(self, sheet: SheetData) -> SheetSummary:
         frame = sheet.frame
+        content_evidence = self._content_evidence(sheet)
         empty = frame.map(is_empty)
         empty_rows = [
             int(index) + 1
@@ -205,8 +331,8 @@ class PandasTabularProcessor:
             ]
             column_positions = sorted(set(column_positions[:12] + populated_columns[-4:]))
         warnings = []
-        if not frame.size or len(empty_rows) == len(frame):
-            warnings.append("La hoja no contiene valores para procesar.")
+        if content_evidence.is_empty:
+            warnings.append("La hoja está vacía: se verificó que no contiene valores ni fórmulas.")
         if len(empty_rows) > 100 or len(empty_columns) > 100:
             warnings.append(
                 "Los índices de filas y columnas vacías se limitaron a los primeros 100; "
@@ -284,6 +410,7 @@ class PandasTabularProcessor:
             possible_header_rows=header_candidates,
             regions=self._regions(sheet, warnings),
             warnings=warnings,
+            content_evidence=content_evidence,
         )
 
     def _regions(self, sheet: SheetData, warnings: list[str]) -> list[StructuralRegion]:
@@ -295,6 +422,7 @@ class PandasTabularProcessor:
         first_row = int(np.flatnonzero(counts)[0])
         initial = frame.iloc[first_row]
         header_columns = [index for index, value in enumerate(initial) if not is_empty(value)]
+        initial_headers = set(self._initial_header_rows(sheet))
         baseline = max(1, int(np.median(counts[counts > 0])))
         formula_mask = np.zeros(occupied.shape, dtype=bool)
         for row, column in sheet.formula_cells:
@@ -306,7 +434,11 @@ class PandasTabularProcessor:
                 continue
             values = frame.iloc[index]
             labels = [str(value).strip().casefold() for value in values if isinstance(value, str)]
-            if index == first_row:
+            if index + 1 in initial_headers:
+                kind = "header"
+            elif kinds and kinds[-1] in {"header", "repeated_header"} and self._is_unit_row(sheet, index):
+                kind = kinds[-1]
+            elif index == first_row:
                 header_text_count = sum(
                     isinstance(value, str) and not self._is_numeric(value)
                     for value in values if not is_empty(value)
@@ -354,6 +486,41 @@ class PandasTabularProcessor:
             start = end
         return regions
 
+    def _is_unit_label(self, value: object) -> bool:
+        if not isinstance(value, str):
+            return False
+        label = value.strip().casefold().replace("µ", "u").replace("μ", "u")
+        label = label.replace("⁻", "-").replace("¹", "1").replace("²", "2").replace("³", "3")
+        bare = r"(?:%|°\s*[cfk]|(?:[munpk]?g|[mun]?mol|[mun]?s|(?:[mun]?l)|cm|mm|m|ppm|ppb|unt|ntu))"
+        ratio = (r"\b(?:[munpk]?g|[mun]?mol|[mun]?s|cells?|cel(?:ulas)?|colonias?|ind(?:ividuos)?)"
+                 r"(?:\s+[a-z]+[0-9]*)?\s*(?:/|\s)\s*(?:[mun]?l|[cm]?m|kg|g)"
+                 r"(?:\s*\^?\s*-?[123])?\b")
+        return bool(re.fullmatch(r"\(?\s*" + bare + r"\s*\)?", label)
+                    or re.search(ratio, label) or re.search(r"°\s*[cfk]\b", label))
+
+    def _initial_header_rows(self, sheet: SheetData) -> list[int]:
+        """Reconoce unidades iniciales por su evidencia textual, sin tratar códigos como unidades."""
+        occupied = self._occupied_cells(sheet)
+        nonempty_rows = np.flatnonzero(occupied.any(axis=1))
+        if not len(nonempty_rows):
+            return []
+        first = int(nonempty_rows[0])
+        initial = [value for value in sheet.frame.iloc[first] if not is_empty(value)]
+        if sum(isinstance(value, str) and not self._is_numeric(value) for value in initial) < len(initial) / 2:
+            return []
+        headers = [first + 1]
+        for index in range(first + 1, min(first + 6, len(sheet.frame))):
+            if not self._is_unit_row(sheet, index):
+                break
+            headers.append(index + 1)
+        return headers
+
+    def _is_unit_row(self, sheet: SheetData, index: int) -> bool:
+        values = [value for value in sheet.frame.iloc[index] if not is_empty(value)]
+        return (bool(values) and index + 1 not in sheet.formula_rows
+                and all(isinstance(value, str) for value in values)
+                and sum(self._is_unit_label(value) for value in values) >= max(1, math.ceil(len(values) * 0.6)))
+
     def _same_value(self, left: object, right: object) -> bool:
         if is_empty(left) or is_empty(right):
             return is_empty(left) and is_empty(right)
@@ -369,21 +536,27 @@ class PandasTabularProcessor:
         if row_kind != "observations":
             first, last = int(populated[0]), int(populated[-1])
             return [row_kind if first <= column <= last else None for column in range(len(counts))]
+        presence_columns = {
+            column for column, value in enumerate(initial)
+            if isinstance(value, str) and re.search(r"\b(?:presencias?|presence(?:s)?)\b", value, re.IGNORECASE)
+        }
         percentage_columns = {
             column - 1 for (_, column), formula in sheet.formula_cells.items()
             if re.search(r"\*\s*100\s*/|/\s*[^+*-]+\*\s*100", formula.expression)
+            and (re.search(r"\b(?:SUM|COUNT(?:IF|IFS|A)?|SUMPRODUCT|AVERAGE)\s*\(", formula.expression, re.IGNORECASE)
+                 or any(re.search(
+                     rf"(?<![A-Za-z0-9_])\$?{get_column_letter(presence + 1)}\$?\d+", formula.expression,
+                     re.IGNORECASE,
+                 ) for presence in presence_columns))
         }
-        narrow_summary = len(sheet.frame.columns) <= 5 and any(
-            re.search(r"presencias?|porcentajes?|percentage|%", str(value), re.IGNORECASE)
-            for value in initial if isinstance(value, str)
-        )
+        narrow_summary = len(sheet.frame.columns) <= 5 and bool(presence_columns)
         kinds = []
         for column, count in enumerate(counts):
             if not count:
                 kinds.append(None)
-            elif narrow_summary or column in percentage_columns or re.search(
-                r"presencias?|porcentajes?|percentage|%", str(initial.iloc[column]), re.IGNORECASE,
-            ):
+            elif (narrow_summary or column in percentage_columns or column in presence_columns
+                  or (str(initial.iloc[column]).strip() == "%" and any(
+                      abs(column - presence) == 1 for presence in presence_columns))):
                 kinds.append("summary")
             elif formula_counts[column] >= count * 0.6:
                 kinds.append("derived")

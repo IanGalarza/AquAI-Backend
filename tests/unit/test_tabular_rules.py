@@ -1,5 +1,6 @@
 import json
 import unittest
+from copy import deepcopy
 from unittest.mock import patch
 
 import httpx
@@ -38,6 +39,9 @@ def structural_summary(
 
 
 class TabularRuleServiceTests(unittest.TestCase):
+    reviewed_file = "Tabla completa ciano RdlP.xlsx"
+    reviewed_sha256 = "79770bdd190fcd08dd8351e18f2f1450d0b250bdeb8b9588e5129492a82cc025"
+
     def setUp(self) -> None:
         self.service = TabularRuleService(FileTabularRuleCatalog())
 
@@ -108,6 +112,112 @@ class TabularRuleServiceTests(unittest.TestCase):
         self.assertEqual(notes["pages"], [1, 2])
         self.assertEqual(notes["verification"], "verified_document")
         self.assertEqual(len(notes["sha256"]), 64)
+
+    def test_reviewed_file_confirmation_is_auditable_and_preserves_campaign_guidance(self) -> None:
+        composition = self.service.compose(
+            structural_summary(self.reviewed_file), "self_sampling", source_sha256=self.reviewed_sha256,
+        )
+        self.assertEqual(len(composition.identity_clarifications), 1)
+        clarification = composition.identity_clarifications[0]
+        self.assertEqual(clarification.original_note, "No se si habrá alguna repetida con las 13 y 14 PL y Bal")
+        self.assertEqual(clarification.confirmed_by, "usuario")
+        self.assertIn("2026-10-11", clarification.source_reference)
+        applied = composition.metadata["file_specific_rules"]
+        self.assertEqual(len(applied), 1)
+        self.assertEqual(applied[0]["id"], clarification.rule_id)
+        self.assertEqual(applied[0]["sha256"], self.reviewed_sha256)
+        self.assertEqual(applied[0]["file_name"], self.reviewed_file)
+        self.assertEqual(applied[0]["scope"], "file_specific")
+        self.assertEqual(composition.prompt_rules["file_specific_rules"], applied)
+        for text in (applied[0]["text"], clarification.statement):
+            self.assertIn("conservarlos como observaciones independientes", text)
+            self.assertIn("períodos diferentes según las leyendas y el PDF de anotaciones", text)
+            self.assertIn("sólo", text)
+            self.assertIn("copias coincidentes entre hojas", text)
+        origin = composition.metadata["origins"][applied[0]["origin"]]
+        self.assertEqual(origin["verification"], "user_confirmation")
+        self.assertEqual(origin["date"], "2026-10-11")
+        self.assertEqual(composition.metadata["version"], "1.0.0")
+        campaign = next(rule for rule in composition.metadata["profile_rules"]
+                        if rule["id"] == "sampling_campaign_periods")
+        self.assertEqual(campaign["version"], "1.0.0")
+        self.assertIn("1 = noviembre de 2005", campaign["text"])
+        self.assertIn("2 = marzo-abril de 2006", campaign["text"])
+        self.assertIn("leyenda", campaign["text"])
+        self.assertEqual(composition.metadata["origins"]["researcher_notes"]["pages"], [1, 2])
+        overlap = next(rule for rule in composition.metadata["profile_rules"]
+                       if rule["id"] == "sampling_workbook_overlap")
+        self.assertIn("comprobar el solapamiento", overlap["text"])
+        self.assertIn("no deduplicar por semejanza", overlap["text"])
+
+    def test_file_confirmation_accepts_only_casefolded_exact_basename(self) -> None:
+        for name in (self.reviewed_file.upper(), f"uploads/{self.reviewed_file}",
+                     f"uploads\\{self.reviewed_file}"):
+            with self.subTest(name=name):
+                composition = self.service.compose(
+                    structural_summary(name), "self_sampling", source_sha256=self.reviewed_sha256,
+                )
+                self.assertEqual(len(composition.identity_clarifications), 1)
+
+    def test_confirmation_requires_matching_profile_name_and_real_content_digest(self) -> None:
+        origin = FileTabularRuleCatalog().load()["file_specific_rules"][0]["origin"]
+        for name, profile, digest in (
+            (self.reviewed_file, "self_sampling", None),
+            (self.reviewed_file, "self_sampling", "0" * 64),
+            ("another.xlsx", "self_sampling", self.reviewed_sha256),
+            ("Tabla completa ciano RdlṔ.xlsx", "self_sampling", self.reviewed_sha256),
+            (f" {self.reviewed_file}", "self_sampling", self.reviewed_sha256),
+            (self.reviewed_file, None, self.reviewed_sha256),
+            (self.reviewed_file, "biological_counts", self.reviewed_sha256),
+        ):
+            with self.subTest(name=name, profile=profile, digest=digest):
+                composition = self.service.compose(
+                    structural_summary(name), profile, source_sha256=digest,
+                )
+                self.assertEqual(composition.identity_clarifications, ())
+                self.assertNotIn("file_specific_rules", composition.metadata)
+                self.assertNotIn("file_specific_rules", composition.prompt_rules)
+                self.assertNotIn(origin, composition.metadata["origins"])
+        composition = self.service.compose(
+            structural_summary(self.reviewed_file), "self_sampling",
+            additional=f"source_sha256={self.reviewed_sha256}; muestras confirmadas distintas",
+        )
+        self.assertEqual(composition.identity_clarifications, ())
+
+    def test_specific_rule_keeps_its_own_version_and_uses_catalog_scope(self) -> None:
+        catalog = deepcopy(FileTabularRuleCatalog().load())
+        rule = catalog["file_specific_rules"][0]
+        rule.update({"version": "2.3.4", "profile": "cyanobacterial_alerts",
+                     "file_name": "OtherAlerts.csv", "sha256": "f" * 64})
+        with patch.object(FileTabularRuleCatalog, "load", return_value=catalog):
+            service = TabularRuleService(FileTabularRuleCatalog())
+        composition = service.compose(
+            structural_summary("OtherAlerts.csv"), "cyanobacterial_alerts", source_sha256="f" * 64,
+        )
+        self.assertEqual(len(composition.identity_clarifications), 1)
+        self.assertEqual(composition.metadata["file_specific_rules"][0]["version"], "2.3.4")
+        self.assertEqual(composition.metadata["version"], "1.0.0")
+        self.assertTrue(all(rule["version"] == "1.0.0" for rule in composition.metadata["profile_rules"]))
+
+    def test_unmatched_confirmation_preserves_existing_profile_compositions(self) -> None:
+        catalog = deepcopy(FileTabularRuleCatalog().load())
+        catalog.pop("file_specific_rules")
+        with patch.object(FileTabularRuleCatalog, "load", return_value=catalog):
+            baseline = TabularRuleService(FileTabularRuleCatalog())
+        for name, profile, sheets in (
+            ("datos biologicos tesis.xlsx", "biological_counts", ("Recuentos", "Cianobacterias", "Hoja3", "Hoja1")),
+            (self.reviewed_file, "self_sampling", ("data",)),
+            ("other.xlsx", None, ("data",)),
+        ):
+            with self.subTest(profile=profile):
+                source = structural_summary(name, sheets)
+                expected = baseline.compose(source, profile, source_sha256="0" * 64)
+                actual = self.service.compose(source, profile, source_sha256="0" * 64)
+                self.assertEqual(actual.metadata, expected.metadata)
+                self.assertEqual(actual.prompt_rules, expected.prompt_rules)
+                self.assertEqual(actual.findings, expected.findings)
+                self.assertEqual(actual.review_reasons, expected.review_reasons)
+                self.assertEqual(actual.identity_clarifications, ())
 
 
 class TabularRuleEndpointTests(unittest.TestCase):

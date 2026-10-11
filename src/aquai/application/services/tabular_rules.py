@@ -9,6 +9,7 @@ from pydantic import JsonValue
 from aquai.application.dtos.tabular import (
     ConvertType,
     PreparationRecipe,
+    RecordIdentityClarification,
     RenameColumns,
     SheetRecipe,
     SheetSummary,
@@ -24,6 +25,7 @@ class RuleComposition:
     prompt_rules: dict[str, JsonValue]
     review_reasons: list[str]
     findings: list[dict[str, JsonValue]]
+    identity_clarifications: tuple[RecordIdentityClarification, ...] = ()
 
 
 def _normalized(value: str) -> str:
@@ -53,6 +55,8 @@ class TabularRuleService:
         summary: StructuralSummary,
         profile: str | None = None,
         additional: str | None = None,
+        *,
+        source_sha256: str | None = None,
     ) -> RuleComposition:
         selected = self.validate_profile(profile)
         version = self._catalog["version"]
@@ -62,10 +66,15 @@ class TabularRuleService:
             self._versioned_rules(profiles[selected]["rules"], version, selected)
             if selected else []
         )
+        file_specific_rules = self._file_specific_rules(summary, selected, source_sha256)
+        identity_clarifications = tuple(
+            RecordIdentityClarification.model_validate(clarification)
+            for rule in file_specific_rules for clarification in rule.get("identity_clarifications", [])
+        )
         evidence, findings = self._profile_evidence(summary, selected)
         findings.extend(self._additional_conflicts(additional, common + profile_rules))
         review_reasons = [finding["message"] for finding in findings if finding["requires_review"]]
-        used_sources = {rule["origin"] for rule in common + profile_rules}
+        used_sources = {rule["origin"] for rule in common + profile_rules + file_specific_rules}
         origins = {
             key: deepcopy(value) for key, value in self._catalog["sources"].items()
             if key in used_sources
@@ -91,7 +100,23 @@ class TabularRuleService:
             "file_evidence": evidence,
             "conflicts": review_reasons,
         }
-        return RuleComposition(metadata, prompt_rules, review_reasons, findings)
+        if file_specific_rules:
+            metadata["file_specific_rules"] = file_specific_rules
+            prompt_rules["file_specific_rules"] = deepcopy(file_specific_rules)
+        return RuleComposition(metadata, prompt_rules, review_reasons, findings, identity_clarifications)
+
+    def _file_specific_rules(
+        self, summary: StructuralSummary, selected: str | None, source_sha256: str | None,
+    ) -> list[dict[str, JsonValue]]:
+        if selected is None or source_sha256 is None:
+            return []
+        file_name = PurePath(summary.file_name.replace("\\", "/")).name
+        return [
+            {**deepcopy(rule), "scope": "file_specific"}
+            for rule in self._catalog.get("file_specific_rules", [])
+            if rule["profile"] == selected and rule["file_name"].casefold() == file_name.casefold()
+            and rule["sha256"] == source_sha256
+        ]
 
     def validate_recipe(
         self,

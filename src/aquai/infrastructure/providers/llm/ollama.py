@@ -91,10 +91,22 @@ class OllamaProvider:
 
     @staticmethod
     def _compact_summary(summary: StructuralSummary) -> dict:
-        document = summary.model_dump(mode="json")
+        document = summary.model_dump(mode="json", exclude={"record_overlaps"})
         document["sheets"] = [
             sheet.model_dump(mode="json", exclude_defaults=True) for sheet in summary.sheets
         ]
+        document["record_overlaps"] = []
+        for relation in summary.record_overlaps:
+            overlap = relation.model_dump(mode="json", exclude={"matches", "left_only_rows", "right_only_rows"})
+            overlap["matches_count"] = len(relation.matches)
+            overlap["exclusive_counts"] = {"left": len(relation.left_only_rows), "right": len(relation.right_only_rows)}
+            overlap["samples_truncated"] = (
+                len(relation.matches) > 8 or len(relation.left_only_rows) > 12 or len(relation.right_only_rows) > 12
+            )
+            overlap["matches"] = [match.model_dump(mode="json") for match in relation.matches[:8]]
+            overlap["left_only_rows"] = relation.left_only_rows[:12]
+            overlap["right_only_rows"] = relation.right_only_rows[:12]
+            document["record_overlaps"].append(overlap)
         for sheet in document["sheets"]:
             for formula in sheet.get("formula_sample", []):
                 expression = formula["formula"]

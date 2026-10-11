@@ -117,6 +117,137 @@ class TabularProcessorTests(unittest.TestCase):
         self.assertIn(40, summary.column_indices)
         self.assertNotIn(31, summary.empty_rows)
 
+    def test_verified_empty_sheet_is_recorded_without_generating_data_tables(self) -> None:
+        for styled in (False, True):
+            with self.subTest(styled=styled):
+                workbook = Workbook()
+                sheet = workbook.active
+                sheet.title = "Auxiliary"
+                if styled:
+                    sheet.cell(176, 26).number_format = "0.00"
+                content = workbook_bytes(workbook)
+                preparation = PreparationRecipe.model_validate({
+                    "status": "review_required", "requires_human_review": True,
+                    "warnings": ["Resolver el rol de la hoja auxiliar."],
+                    "sheets": [
+                        {
+                            "sheet_name": "Auxiliary", "block_id": identifier,
+                            "role": role, "header_rows": [],
+                            "data_start_row": 1, "data_end_row": 176,
+                            "data_start_column": start_column, "data_end_column": end_column,
+                            "transformations": [],
+                        }
+                        for identifier, role, start_column, end_column in (
+                            ("unresolved", "unknown", 1, 13), ("planned", "observations", 14, 26),
+                        )
+                    ],
+                })
+                original_recipe = preparation.model_dump_json()
+                summary = self.processor.inspect("auxiliary.xlsx", content)
+                evidence = summary.sheets[0].content_evidence
+                self.assertTrue(evidence.is_empty)
+                self.assertEqual((evidence.value_cells, evidence.formula_cells), (0, 0))
+                self.assertEqual(evidence.inspected_cells, 176 * 26 if styled else 0)
+                self.assertEqual(evidence.verification, "full_sheet_values_and_formulas")
+                execution = self.processor.execute("auxiliary.xlsx", content, preparation, summary)
+                self.assertEqual(execution.sheets, [])
+                self.assertEqual(execution.findings, [])
+                self.assertEqual(execution.sheet_content_evidence, [evidence])
+                treatment = execution.empty_sheets[0]
+                self.assertEqual(treatment.sheet_name, "Auxiliary")
+                self.assertEqual(treatment.action, "verified_empty_no_table")
+                self.assertEqual(treatment.evidence, evidence)
+                self.assertEqual(treatment.skipped_block_ids, ["unresolved", "planned"])
+                self.assertEqual(execution.coverage[0].nonempty_cells, 0)
+                self.assertEqual(preparation.model_dump_json(), original_recipe)
+
+    def test_unselected_empty_sheet_is_still_registered_separately(self) -> None:
+        workbook = Workbook()
+        workbook.active.title = "Measurements"
+        workbook.active.append(["value"])
+        workbook.active.append([5])
+        workbook.create_sheet("Unused").cell(20, 15).number_format = "0.00"
+        content = workbook_bytes(workbook)
+        summary = self.processor.inspect("measurements.xlsx", content)
+        execution = self.processor.execute("measurements.xlsx", content, recipe("Measurements"), summary)
+        self.assertEqual([block.sheet_name for block in execution.sheets], ["Measurements"])
+        self.assertEqual(execution.sheets[0].sample[0].values, [5])
+        self.assertEqual(execution.skipped_sheets, ["Unused"])
+        self.assertEqual([item.sheet_name for item in execution.empty_sheets], ["Unused"])
+        self.assertEqual(execution.empty_sheets[0].skipped_block_ids, [])
+        self.assertEqual(len(execution.sheet_content_evidence), 2)
+        self.assertEqual(len(execution.coverage), 2)
+
+    def test_sheet_emptiness_scans_values_outside_all_sampled_rows(self) -> None:
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.cell(300, 50).number_format = "0.00"
+        sheet.cell(157, 30, "exclusive observation")
+        summary = self.processor.inspect("sparse.xlsx", workbook_bytes(workbook)).sheets[0]
+        self.assertNotIn(157, [sample.row_number for sample in summary.sample])
+        self.assertTrue(all(value is None for sample in summary.sample for value in sample.values))
+        self.assertEqual(summary.content_evidence.inspected_cells, 300 * 50)
+        self.assertEqual(summary.content_evidence.value_cells, 1)
+        self.assertFalse(summary.content_evidence.is_empty)
+
+    def test_formula_only_sheet_without_any_cached_values_is_not_empty(self) -> None:
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.cell(200, 30).number_format = "0.00"
+        sheet.cell(157, 17, "=1+1")
+        content = workbook_bytes(workbook)
+        preparation = PreparationRecipe.model_validate({
+            "status": "review_required", "requires_human_review": True,
+            "warnings": ["Resolver el rol."], "sheets": [{
+                "sheet_name": "Sheet", "block_id": "unresolved", "role": "unknown",
+                "header_rows": [], "data_start_row": 1, "data_end_row": 200,
+                "data_start_column": 1, "data_end_column": 30, "transformations": [],
+            }],
+        })
+        summary = self.processor.inspect("formula-only.xlsx", content)
+        evidence = summary.sheets[0].content_evidence
+        self.assertEqual((evidence.value_cells, evidence.formula_cells), (0, 1))
+        self.assertFalse(evidence.is_empty)
+        self.assertFalse(any("está vacía" in warning for warning in summary.sheets[0].warnings))
+        execution = self.processor.execute("formula-only.xlsx", content, preparation, summary)
+        self.assertEqual(execution.empty_sheets, [])
+        self.assertEqual(len(execution.sheets), 1)
+        self.assertEqual(execution.sheets[0].unresolved_formula_cells, ["Q157"])
+        self.assertEqual(execution.sheets[0].formula_sample[0].formula, "=1+1")
+        self.assertEqual(execution.sheet_content_evidence, [evidence])
+        self.assertIn("unresolved_block_role", [finding.code for finding in execution.findings])
+
+    def test_zero_false_and_whitespace_are_values_when_verifying_sheet_emptiness(self) -> None:
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.append([0])
+        sheet.append([False])
+        sheet.append(["   "])
+        summary = self.processor.inspect("literal-values.xlsx", workbook_bytes(workbook)).sheets[0]
+        self.assertEqual(summary.content_evidence.value_cells, 3)
+        self.assertFalse(summary.content_evidence.is_empty)
+        self.assertFalse(any("está vacía" in warning for warning in summary.warnings))
+
+    def test_execution_rechecks_content_instead_of_trusting_empty_summary_evidence(self) -> None:
+        empty_workbook = Workbook()
+        empty_content = workbook_bytes(empty_workbook)
+        empty_summary = self.processor.inspect("same.xlsx", empty_content)
+        workbook = Workbook()
+        workbook.active.append(["value"])
+        workbook.active.append([9])
+        content = workbook_bytes(workbook)
+        execution = self.processor.execute("same.xlsx", content, recipe("Sheet"), empty_summary)
+        self.assertEqual(execution.empty_sheets, [])
+        self.assertFalse(execution.sheet_content_evidence[0].is_empty)
+        self.assertEqual(execution.sheet_content_evidence[0].value_cells, 2)
+        self.assertEqual(execution.sheets[0].sample[0].values, [9])
+
+        populated_summary = self.processor.inspect("same.xlsx", content)
+        execution = self.processor.execute("same.xlsx", empty_content, recipe("Sheet"), populated_summary)
+        self.assertEqual(execution.sheets, [])
+        self.assertTrue(execution.sheet_content_evidence[0].is_empty)
+        self.assertEqual(execution.empty_sheets[0].skipped_block_ids, ["main"])
+
     def test_zero_values_survive_empty_row_and_column_operations(self) -> None:
         result = self.execute(b"a,b\n0,0\n,,\n", recipe(data_end_row=3, data_end_column=3, transformations=[
             {"operation": "drop_empty_rows"},
@@ -627,6 +758,164 @@ class TabularProcessorTests(unittest.TestCase):
         self.assertEqual(block.findings[0].cell, "B2")
         self.assertEqual(block.findings[0].block_id, "main")
         self.assertEqual(block.source_nonempty_cells, block.preserved_nonempty_cells)
+
+    def test_initial_unit_rows_and_percent_measurements_are_header_and_observations(self) -> None:
+        for unit in ("Cel mL-1", "cells/mL"):
+            with self.subTest(unit=unit):
+                workbook = Workbook()
+                sheet = workbook.active
+                sheet.append(["site", "period", "count", "% O2"])
+                sheet.append([None, None, unit, "%"])
+                sheet.append(["C1", "1/2018", 0, 95])
+                sheet.append(["C2", "03/04/2024", "nd", 100])
+                sheet.cell(100, 8).number_format = "0.00"
+                summary = self.processor.inspect("measurements.xlsx", workbook_bytes(workbook)).sheets[0]
+                self.assertEqual([(region.kind, region.start_row, region.end_row,
+                                   region.start_column, region.end_column) for region in summary.regions], [
+                    ("header", 1, 2, 1, 4), ("observations", 3, 4, 1, 4),
+                ])
+
+    def test_not_detected_codes_and_periods_are_not_unit_headers(self) -> None:
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.append(["status", "code", "period"])
+        sheet.append(["nd", "00123", "1/2018"])
+        sheet.append(["n.d", "C1", "03/04/2024"])
+        summary = self.processor.inspect("codes.xlsx", workbook_bytes(workbook)).sheets[0]
+        self.assertEqual([(region.kind, region.start_row, region.end_row) for region in summary.regions], [
+            ("header", 1, 1), ("observations", 2, 3),
+        ])
+
+    def test_percent_magnitudes_stay_observations_next_to_derived_and_presence_summaries(self) -> None:
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.append(["taxon", "sample", "% O2", "calculation", "presencias", "%", "ratio"])
+        sheet.append(["A", 0, 95, "=B2+1", "A", 0.5, "=SUM(B2:B3)*100/SUM(B2:B3)"])
+        sheet.append(["B", 2, 100, "=B3+1", "B", 1, "=SUM(B2:B3)/SUM(B2:B3)*100"])
+        summary = self.processor.inspect("roles.xlsx", workbook_bytes(workbook)).sheets[0]
+        self.assertEqual([(region.kind, region.start_column, region.end_column)
+                          for region in summary.regions if region.start_row == 2], [
+            ("observations", 1, 3), ("derived", 4, 4), ("summary", 5, 7),
+        ])
+
+    def test_percentage_formula_for_individual_measurements_does_not_prove_a_summary(self) -> None:
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.append(["site", "oxygen", "capacity", "% saturation"])
+        sheet.append(["A", 4, 8, "=B2/C2*100"])
+        sheet.append(["B", 5, 10, "=B3/C3*100"])
+        summary = self.processor.inspect("saturation.xlsx", workbook_bytes(workbook)).sheets[0]
+        self.assertFalse(any(region.kind == "summary" for region in summary.regions))
+        self.assertEqual([(region.kind, region.start_column, region.end_column)
+                          for region in summary.regions if region.start_row == 2], [
+            ("observations", 1, 3), ("derived", 4, 4),
+        ])
+
+    def test_full_record_overlap_preserves_reordered_matches_exclusives_and_original_bounds(self) -> None:
+        workbook = Workbook()
+        left = workbook.active
+        left.title = "Original"
+        right = workbook.create_sheet("Ordered")
+        headers = ["site", "period", "value", "code"]
+        units = [None, None, "mg/L", None]
+        records = [["A", "1/2018", 0, "00123"], ["B", "03/04/2024", 2, "nd"],
+                   ["C", "2024-03", 3, "<0,001"]]
+        for row in [headers, units] + records:
+            left.append(row)
+        for row in [headers, units, records[2], records[0], ["D", "2024-04", 4, "n.d"]]:
+            right.append([None] + row)
+        left.cell(100, 8).number_format = "0.00"
+        content = workbook_bytes(workbook)
+        summary = self.processor.inspect("views.xlsx", content)
+        self.assertEqual(len(summary.record_overlaps), 1)
+        overlap = summary.record_overlaps[0]
+        self.assertEqual((overlap.left_header_rows, overlap.right_header_rows), ([1, 2], [1, 2]))
+        self.assertEqual((overlap.left_start_column, overlap.left_end_column,
+                          overlap.right_start_column, overlap.right_end_column), (1, 4, 2, 5))
+        self.assertEqual((overlap.left_record_count, overlap.right_record_count), (3, 3))
+        self.assertEqual([(match.left_row, match.right_row) for match in overlap.matches], [(3, 4), (5, 3)])
+        self.assertEqual((overlap.left_only_rows, overlap.right_only_rows), ([4], [5]))
+        self.assertFalse(overlap.ambiguous_repeated_rows)
+        self.assertEqual(overlap.policy, "preserve_sources_do_not_add_matches")
+        preparation = PreparationRecipe.model_validate({
+            "status": "ready", "warnings": [], "requires_human_review": False,
+            "sheets": [{
+                "sheet_name": name, "block_id": name.casefold(), "role": "observations", "header_rows": [1, 2],
+                "data_start_row": 3, "data_end_row": 5, "data_start_column": first,
+                "data_end_column": first + 3, "transformations": [],
+            } for name, first in (("Original", 1), ("Ordered", 2))],
+        })
+        execution = self.processor.execute("views.xlsx", content, preparation, summary)
+        self.assertEqual(execution.record_overlaps, summary.record_overlaps)
+        self.assertEqual([block.rows_after for block in execution.sheets], [3, 3])
+        self.assertEqual([row.values for row in execution.sheets[0].sample], records)
+        self.assertEqual(execution.sheets[1].sample[-1].values, ["D", "2024-04", 4, "n.d"])
+
+    def test_overlap_compares_full_unsampled_values_types_codes_and_units(self) -> None:
+        cases = (
+            ("mg/L", "mg/L", "x" * 250, "x" * 249 + "y", 0),
+            ("mg/L", "mg/L", True, 1, 0),
+            ("mg/L", "mg/L", "00123", "123", 0),
+            ("mg/L", "ug/L", "same", "same", None),
+        )
+        for left_unit, right_unit, left_value, right_value, expected_matches in cases:
+            with self.subTest(left=left_value, right=right_value, units=(left_unit, right_unit)):
+                workbook = Workbook()
+                for index, (unit, value) in enumerate(((left_unit, left_value), (right_unit, right_value))):
+                    sheet = workbook.active if index == 0 else workbook.create_sheet("Other")
+                    sheet.append(["site", "measurement", "note"])
+                    sheet.append([None, unit, None])
+                    sheet.append(["A", 0, value])
+                summary = self.processor.inspect("compare.xlsx", workbook_bytes(workbook))
+                if expected_matches is None:
+                    self.assertEqual(summary.record_overlaps, [])
+                else:
+                    self.assertEqual(len(summary.record_overlaps), 1)
+                    overlap = summary.record_overlaps[0]
+                    self.assertEqual(len(overlap.matches), expected_matches)
+                    self.assertEqual((overlap.left_only_rows, overlap.right_only_rows), ([3], [3]))
+
+    def test_overlap_compares_original_formula_expressions_not_just_missing_caches(self) -> None:
+        workbook = Workbook()
+        for index, expression in enumerate(("=1+1", "=1+2")):
+            sheet = workbook.active if index == 0 else workbook.create_sheet("Other")
+            sheet.append(["site", "measurement", "calculation"])
+            sheet.append([None, "mg/L", None])
+            sheet.append(["A", 0, expression])
+            sheet.append(["B", 1, "literal"])
+            sheet.append(["C", 2, "literal"])
+        summary = self.processor.inspect("formulas.xlsx", workbook_bytes(workbook))
+        overlap = summary.record_overlaps[0]
+        self.assertEqual([(match.left_row, match.right_row) for match in overlap.matches], [(4, 4), (5, 5)])
+        self.assertEqual((overlap.left_only_rows, overlap.right_only_rows), ([3], [3]))
+
+    def test_overlap_preserves_internal_repetitions_as_an_ambiguous_multiset(self) -> None:
+        workbook = Workbook()
+        for index, records in enumerate(([["A", 0], ["A", 0], ["B", 1]], [["A", 0], ["B", 1]])):
+            sheet = workbook.active if index == 0 else workbook.create_sheet("Other")
+            sheet.append(["site", "measurement"])
+            sheet.append([None, "mg/L"])
+            for row in records:
+                sheet.append(row)
+        summary = self.processor.inspect("repeated.xlsx", workbook_bytes(workbook))
+        overlap = summary.record_overlaps[0]
+        self.assertEqual((overlap.left_record_count, overlap.right_record_count), (3, 2))
+        self.assertEqual([(match.left_row, match.right_row) for match in overlap.matches], [(3, 3), (5, 4)])
+        self.assertEqual((overlap.left_only_rows, overlap.right_only_rows), ([4], []))
+        self.assertTrue(overlap.ambiguous_repeated_rows)
+
+    def test_repeated_header_units_do_not_create_overlap_with_the_same_sheet(self) -> None:
+        workbook = Workbook()
+        sheet = workbook.active
+        for row in (["site", "measurement"], [None, "mg/L"], ["A", 0], [],
+                    ["site", "measurement"], [None, "mg/L"], ["A", 0]):
+            sheet.append(row)
+        summary = self.processor.inspect("bands.xlsx", workbook_bytes(workbook))
+        self.assertEqual(summary.record_overlaps, [])
+        self.assertEqual([(region.kind, region.start_row, region.end_row) for region in summary.sheets[0].regions], [
+            ("header", 1, 2), ("observations", 3, 3),
+            ("repeated_header", 5, 6), ("observations", 7, 7),
+        ])
 
     def test_unknown_preserves_original_values_and_requires_review(self) -> None:
         content = b"code,value\n00123,0\nnd,<0.001\n"

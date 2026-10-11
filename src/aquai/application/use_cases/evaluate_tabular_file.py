@@ -1,5 +1,6 @@
 import asyncio
 import json
+from hashlib import sha256
 from collections import Counter
 from time import perf_counter
 
@@ -73,7 +74,9 @@ class EvaluateTabularFile:
         rule_composition = None
         prompt_rules = known_rules
         if self._rule_service is not None:
-            rule_composition = self._rule_service.compose(summary, rule_profile, known_rules)
+            rule_composition = self._rule_service.compose(
+                summary, rule_profile, known_rules, source_sha256=sha256(content).hexdigest(),
+            )
             result.applied_rules = rule_composition.metadata
             prompt_rules = json.dumps(
                 rule_composition.prompt_rules, ensure_ascii=False, separators=(",", ":")
@@ -113,7 +116,13 @@ class EvaluateTabularFile:
                 )
                 metrics.execution_duration_ms = self._elapsed_ms(stage_started)
             stage_started = perf_counter()
-            result.validation = self._validator.validate(summary, result.recipe, result.execution)
+            if rule_composition is not None and rule_composition.identity_clarifications:
+                result.validation = self._validator.validate(
+                    summary, result.recipe, result.execution,
+                    identity_clarifications=rule_composition.identity_clarifications,
+                )
+            else:
+                result.validation = self._validator.validate(summary, result.recipe, result.execution)
             metrics.validation_duration_ms = self._elapsed_ms(stage_started)
             result.response_format.recipe_executable = self._is_executable(result)
 
@@ -129,6 +138,10 @@ class EvaluateTabularFile:
                 and result.validation.status != EvaluationStatus.FAILED
             ):
                 result.validation.status = EvaluationStatus.REVIEW_REQUIRED
+
+        result.validation.review_reasons = list({
+            finding.model_dump_json(): finding for finding in result.validation.findings if finding.requires_review
+        }.values())
 
         metrics.total_duration_ms = self._elapsed_ms(started)
         return result
@@ -154,8 +167,10 @@ class EvaluateTabularFile:
             return False
         planned_blocks = Counter((sheet.sheet_name, sheet.block_id) for sheet in recipe.sheets)
         executed_blocks = Counter((sheet.sheet_name, sheet.block_id) for sheet in result.execution.sheets)
+        treated_blocks = Counter((treatment.sheet_name, block_id) for treatment in result.execution.empty_sheets
+                                 for block_id in treatment.skipped_block_ids)
         return (
-            planned_blocks == executed_blocks
+            planned_blocks == executed_blocks + treated_blocks
             and all(
                 sheet.rows_after > 0 and bool(sheet.columns_after) and not sheet.errors
                 for sheet in result.execution.sheets

@@ -110,6 +110,54 @@ class TabularEndpointTests(unittest.TestCase):
         self.assertEqual(user_message["known_rules"], "Conservar todos los registros.")
         self.assertEqual(self.requests[0]["model"], self.settings.default_model)
 
+    def test_unit_headers_and_exact_views_keep_periods_exclusives_and_source_uncertainty(self) -> None:
+        workbook = Workbook()
+        original = workbook.active
+        original.title = "Original"
+        sorted_sheet = workbook.create_sheet("Sorted")
+        empty_sheet = workbook.create_sheet("Empty")
+        empty_sheet["A40"].number_format = "0.00"
+        headers = ["site", "period", "count", "oxygen", "note"]
+        units = [None, None, "cells/mL", "%", None]
+        first = ["001", "3-4/2006", 0, 85, "No sé si hay alguna repetida con otra campaña."]
+        second = ["002", "12/2009-01/2010", "<0,001", 90, None]
+        exclusive = ["003", "2021", 10, None, None]
+        for sheet, rows in ((original, [first, second, exclusive]), (sorted_sheet, [second, first])):
+            sheet.append(headers)
+            sheet.append(units)
+            for row in rows:
+                sheet.append(row)
+        content = BytesIO()
+        workbook.save(content)
+        workbook.close()
+        blocks = [recipe(
+            sheet_name=name, block_id=name.lower(), header_rows=[1, 2],
+            data_start_row=3, data_end_row=end, data_end_column=5,
+        )["sheets"][0] for name, end in (("Original", 5), ("Sorted", 4))]
+        self.raw_content = json.dumps({
+            "status": "ready", "sheets": blocks, "warnings": [], "requires_human_review": False,
+        })
+        response = self.upload(content.getvalue(), file_name="measurements.xlsx")
+        self.assertEqual(response.status_code, 200, response.text)
+        result = response.json()
+        self.assertEqual(result["validation"]["status"], "review_required")
+        self.assertEqual(result["validation"]["errors"], [])
+        self.assertTrue(any(item["code"] == "source_record_identity_uncertainty"
+                            for item in result["validation"]["findings"]))
+        self.assertFalse(any(item["code"] == "structural_role_conflict"
+                             for item in result["validation"]["findings"]))
+        self.assertEqual(len(result["execution"]["sheets"]), 2)
+        self.assertEqual([sheet["rows_after"] for sheet in result["execution"]["sheets"]], [3, 2])
+        self.assertIn("oxygen %", result["execution"]["sheets"][0]["columns_after"])
+        self.assertEqual(result["execution"]["sheets"][0]["sample"][0]["values"], first)
+        self.assertEqual(result["execution"]["sheets"][0]["sample"][1]["values"], second)
+        overlap = result["execution"]["record_overlaps"][0]
+        self.assertEqual(overlap["matches"], [{"left_row": 3, "right_row": 4}, {"left_row": 4, "right_row": 3}])
+        self.assertEqual(overlap["left_only_rows"], [5])
+        self.assertEqual(overlap["right_only_rows"], [])
+        self.assertEqual(overlap["policy"], "preserve_sources_do_not_add_matches")
+        self.assertEqual(len(self.requests), 1)
+
     def test_multiple_blocks_keep_totals_and_legend_without_reporting_data_loss(self) -> None:
         observations = recipe(
             block_id="observations", role="observations", data_end_row=3,
