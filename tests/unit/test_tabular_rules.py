@@ -6,7 +6,14 @@ from unittest.mock import patch
 import httpx
 from fastapi.testclient import TestClient
 
-from aquai.application.dtos.tabular import PreparationRecipe, SheetSummary, StructuralSummary
+from aquai.application.dtos.tabular import (
+    FormulaSample,
+    PreparationRecipe,
+    SampleRow,
+    SheetContentEvidence,
+    SheetSummary,
+    StructuralSummary,
+)
 from aquai.application.errors import TabularInputError
 from aquai.application.services.tabular_rules import TabularRuleService
 from aquai.application.use_cases.evaluate_tabular_file import EvaluateTabularFile
@@ -399,3 +406,163 @@ class TabularRuleRecipeTests(unittest.TestCase):
             "datos biologicos tesis.xlsx", ("Hoja1", "Recuentos", "Cianobacterias", "Hoja3")
         )
         self.assertEqual(self.findings(source, "biological_counts", role="observations"), [])
+
+
+class ConfiguredSheetRoleTests(unittest.TestCase):
+    reviewed_file = "BaseCiano_PARA BELEN_5MAR2024 (2).xlsx"
+
+    def setUp(self) -> None:
+        self.service = TabularRuleService(FileTabularRuleCatalog())
+
+    def source(self, file_name: str | None = None, sheets: tuple[str, ...] | None = None):
+        source = structural_summary(
+            file_name or self.reviewed_file, sheets or ("REFERENCIAS", "BASE CIANO", "BASE FQ"),
+        )
+        source.sheets[0].initial_columns = ["campo", "significado"]
+        source.sheets[0].sample = [SampleRow(
+            row_number=2, values=["ID Datos Físicoquimicos/Recuento spp toxicas", "id de BASE FQ"],
+        )]
+        return source
+
+    def recipe(self, source: StructuralSummary, role: str):
+        return PreparationRecipe.model_validate({
+            "status": "review_required" if role == "unknown" else "ready",
+            "requires_human_review": role == "unknown",
+            "warnings": ["La función del bloque permanece incierta."] if role == "unknown" else [],
+            "sheets": [{
+                "sheet_name": source.sheets[0].name, "block_id": "dictionary",
+                "role": role, "header_rows": [] if role == "header" else [1],
+                "data_start_row": 2, "data_end_row": 3,
+                "data_start_column": 1, "data_end_column": 2, "transformations": [],
+            }],
+        })
+
+    def validate(self, source: StructuralSummary, role: str, profile="belen_cyanobacteria"):
+        recipe = self.recipe(source, role)
+        composition = self.service.compose(source, profile)
+        return self.service.validate_recipe(source, recipe, composition)
+
+    def test_documentary_sheet_cannot_become_observations_under_verified_profile(self) -> None:
+        source = self.source()
+        findings = self.validate(source, "observations")
+        self.assertEqual(len(findings), 1)
+        finding = findings[0]
+        self.assertEqual(finding["code"], "rule_profile_role_conflict")
+        self.assertEqual(finding["sheet_name"], "REFERENCIAS")
+        self.assertEqual(finding["block_id"], "dictionary")
+        self.assertEqual(finding["range"], "A2:B3")
+        self.assertTrue(finding["requires_review"])
+        self.assertIn("belen_documentary_sheets", finding["message"])
+        self.assertIn("belen_cyanobacteria", finding["message"])
+        self.assertIn("legend, header", finding["message"])
+
+    def test_documentary_legend_and_header_roles_are_allowed_without_rewriting_data(self) -> None:
+        source = self.source()
+        for role in ("legend", "header"):
+            with self.subTest(role=role):
+                recipe = self.recipe(source, role)
+                source_before = source.model_dump()
+                recipe_before = recipe.model_dump()
+                composition = self.service.compose(source, "belen_cyanobacteria")
+                composition_before = deepcopy(composition.metadata)
+                self.assertEqual(self.service.validate_recipe(source, recipe, composition), [])
+                self.assertEqual(source.model_dump(), source_before)
+                self.assertEqual(recipe.model_dump(), recipe_before)
+                self.assertEqual(composition.metadata, composition_before)
+                self.assertEqual(recipe.sheets[0].transformations, [])
+                self.assertEqual(source.sheets[0].sample[0].values, [
+                    "ID Datos Físicoquimicos/Recuento spp toxicas", "id de BASE FQ",
+                ])
+
+    def test_unknown_documentary_role_requires_review_without_being_coerced(self) -> None:
+        source = self.source()
+        recipe = self.recipe(source, "unknown")
+        before = recipe.model_dump()
+        findings = self.service.validate_recipe(
+            source, recipe, self.service.compose(source, "belen_cyanobacteria"),
+        )
+        self.assertEqual(len(findings), 1)
+        self.assertTrue(findings[0]["requires_review"])
+        self.assertIn("'unknown'", findings[0]["message"])
+        self.assertEqual(recipe.model_dump(), before)
+
+    def test_complete_empty_evidence_exempts_unknown_documentary_role(self) -> None:
+        source = self.source()
+        source.sheets[0].sample = []
+        source.sheets[0].content_evidence = SheetContentEvidence(
+            sheet_name="REFERENCIAS", inspected_cells=6, value_cells=0, formula_cells=0,
+        )
+        self.assertEqual(self.validate(source, "unknown"), [])
+
+    def test_empty_samples_do_not_exempt_documentary_roles_without_complete_evidence(self) -> None:
+        for evidence in (
+            None,
+            SheetContentEvidence(sheet_name="REFERENCIAS", inspected_cells=2, value_cells=0, formula_cells=0),
+            SheetContentEvidence(sheet_name="REFERENCIAS", inspected_cells=6, value_cells=1, formula_cells=0),
+            SheetContentEvidence(sheet_name="another sheet", inspected_cells=6, value_cells=0, formula_cells=0),
+        ):
+            with self.subTest(evidence=evidence):
+                source = self.source()
+                source.sheets[0].sample = []
+                source.sheets[0].empty_row_count = 3
+                source.sheets[0].empty_column_count = 2
+                source.sheets[0].content_evidence = evidence
+                findings = self.validate(source, "unknown")
+                self.assertEqual(len(findings), 1)
+                self.assertTrue(findings[0]["requires_review"])
+
+    def test_uncached_formula_keeps_documentary_unknown_nonempty(self) -> None:
+        source = self.source()
+        source.sheets[0].sample = []
+        source.sheets[0].formula_count = 1
+        source.sheets[0].missing_formula_cache_count = 1
+        source.sheets[0].formula_sample = [FormulaSample(cell="B2", formula="=1+1")]
+        source.sheets[0].content_evidence = SheetContentEvidence(
+            sheet_name="REFERENCIAS", inspected_cells=6, value_cells=0, formula_cells=1,
+        )
+        findings = self.validate(source, "unknown")
+        self.assertEqual(len(findings), 1)
+        self.assertTrue(findings[0]["requires_review"])
+        self.assertIn("'unknown'", findings[0]["message"])
+
+    def test_documentary_policy_requires_the_file_and_expected_sheets_to_be_verified(self) -> None:
+        for source in (self.source("other.xlsx"), self.source(sheets=("REFERENCIAS", "BASE CIANO"))):
+            with self.subTest(file_name=source.file_name, sheets=[sheet.name for sheet in source.sheets]):
+                composition = self.service.compose(source, "belen_cyanobacteria")
+                self.assertTrue(composition.review_reasons)
+                self.assertEqual(self.service.validate_recipe(
+                    source, self.recipe(source, "observations"), composition,
+                ), [])
+
+    def test_documentary_policy_does_not_spread_to_other_profiles_or_other_sheets(self) -> None:
+        for profile, source in (
+            (None, self.source()),
+            ("self_sampling", self.source("Tabla completa ciano RdlP.xlsx")),
+            ("biological_counts", self.source(
+                "datos biologicos tesis.xlsx", ("REFERENCIAS", "Recuentos", "Cianobacterias", "Hoja3", "Hoja1"),
+            )),
+            ("belen_cyanobacteria", self.source(sheets=("BASE CIANO", "BASE FQ", "REFERENCIAS"))),
+        ):
+            with self.subTest(profile=profile, sheet=source.sheets[0].name):
+                self.assertEqual(self.validate(source, "observations", profile), [])
+
+    def test_sheet_role_policy_is_configurable_for_an_unrelated_profile_and_sheet(self) -> None:
+        catalog = deepcopy(FileTabularRuleCatalog().load())
+        catalog["profiles"]["synthetic_documentary"] = {
+            "name": "Fixture genérica", "file_names": ["synthetic.xlsx"],
+            "required_sheets": ["Codes", "Measurements"],
+            "rules": [{
+                "id": "synthetic_sheet_role", "origin": "corrected_guidance",
+                "text": "Conservar el diccionario de códigos.",
+                "sheet_role_requirements": [{"sheet_name": "Codes", "allowed_roles": ["legend", "summary"]}],
+            }],
+        }
+        with patch.object(FileTabularRuleCatalog, "load", return_value=catalog):
+            service = TabularRuleService(FileTabularRuleCatalog())
+        source = self.source("synthetic.xlsx", ("Codes", "Measurements"))
+        composition = service.compose(source, "synthetic_documentary")
+        rejected = service.validate_recipe(source, self.recipe(source, "observations"), composition)
+        self.assertEqual(len(rejected), 1)
+        self.assertIn("synthetic_sheet_role", rejected[0]["message"])
+        self.assertEqual(rejected[0]["sheet_name"], "Codes")
+        self.assertEqual(service.validate_recipe(source, self.recipe(source, "summary"), composition), [])

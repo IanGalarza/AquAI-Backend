@@ -22,5 +22,5 @@ dist/
 .coverage.*
 htmlcov/
 
-# Informes locales de evaluaciones tabulares solicitadas
-/outputs/tabular-evaluation-*/
+# Informes y respaldos locales de evaluaciones tabulares solicitadas
+/outputs/tabular-evaluation-*

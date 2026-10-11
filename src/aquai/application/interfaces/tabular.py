@@ -6,6 +6,7 @@ from aquai.application.dtos.tabular import (
     PreparationRecipe,
     StructuralSummary,
 )
+from aquai.application.dtos.tabular_policies import PreparationPolicies
 
 
 class TabularProcessor(Protocol):
@@ -17,6 +18,8 @@ class TabularProcessor(Protocol):
         content: bytes,
         recipe: PreparationRecipe,
         summary: StructuralSummary,
+        *,
+        policies: PreparationPolicies | None = None,
     ) -> ExecutionResult: ...
 
 

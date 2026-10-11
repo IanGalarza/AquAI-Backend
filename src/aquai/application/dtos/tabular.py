@@ -1,8 +1,15 @@
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_serializer, model_validator
 
 from aquai.domain.enums.tabular import EvaluationStatus
+from aquai.application.dtos.tabular_policies import (
+    AssociationDiagnostic,
+    AuxiliaryRowTreatment,
+    CellNormalization,
+    SourceHeaderEvidence,
+    TemporalDateTreatment,
+)
 
 
 class SampleRow(BaseModel):
@@ -383,6 +390,7 @@ class SheetExecution(BaseModel):
     excluded_nonempty_rows: int = 0
     suspicious_header_rows: list[int] = Field(default_factory=list)
     dropped_empty_rows: int = 0
+    auxiliary_rows_removed: int = 0
     dropped_empty_columns: list[str] = Field(default_factory=list)
     conversion_failures: dict[str, int] = Field(default_factory=dict)
     empty_columns: list[str] = Field(default_factory=list)
@@ -399,6 +407,13 @@ class SheetExecution(BaseModel):
     warnings: list[str] = Field(default_factory=list)
     errors: list[str] = Field(default_factory=list)
     findings: list[TabularFinding] = Field(default_factory=list)
+
+    @model_serializer(mode="wrap")
+    def serialize_system_rows(self, handler):
+        value = handler(self)
+        if not self.auxiliary_rows_removed:
+            value.pop("auxiliary_rows_removed", None)
+        return value
 
 
 class EmptySheetTreatment(BaseModel):
@@ -418,6 +433,19 @@ class ExecutionResult(BaseModel):
     record_overlaps: list[RecordOverlap] = Field(default_factory=list)
     sheet_content_evidence: list[SheetContentEvidence] = Field(default_factory=list)
     empty_sheets: list[EmptySheetTreatment] = Field(default_factory=list)
+    normalizations: list[CellNormalization] = Field(default_factory=list)
+    auxiliary_rows: list[AuxiliaryRowTreatment] = Field(default_factory=list)
+    associations: list[AssociationDiagnostic] = Field(default_factory=list)
+    source_headers: list[SourceHeaderEvidence] = Field(default_factory=list)
+    temporal_dates: list[TemporalDateTreatment] = Field(default_factory=list)
+
+    @model_serializer(mode="wrap")
+    def serialize_system_treatments(self, handler):
+        value = handler(self)
+        for name in ("normalizations", "auxiliary_rows", "associations", "source_headers", "temporal_dates"):
+            if not getattr(self, name):
+                value.pop(name, None)
+        return value
 
 
 class OriginalProposalState(BaseModel):

@@ -1,6 +1,7 @@
 import re
 import unicodedata
 from collections import Counter
+from datetime import date, datetime
 from numbers import Number
 
 from aquai.application.dtos.tabular import (
@@ -18,6 +19,7 @@ from aquai.application.dtos.tabular import (
     ValidationResult,
 )
 from aquai.domain.enums.tabular import EvaluationStatus
+from aquai.application.dtos.tabular_policies import PreparationPolicies
 
 
 class TabularValidationService:
@@ -28,6 +30,7 @@ class TabularValidationService:
         execution: ExecutionResult,
         *,
         identity_clarifications: tuple[RecordIdentityClarification, ...] = (),
+        preparation_policies: PreparationPolicies | None = None,
     ) -> ValidationResult:
         # La propuesta archivada es antecedente; el estado vigente depende de los controles actuales.
         warnings = list(summary.warnings)
@@ -36,6 +39,18 @@ class TabularValidationService:
         requires_review = False
         empty_names, empty_findings = self._verified_empty_sheets(summary, recipe, execution)
         findings.extend(empty_findings)
+        source_headers, header_findings = self._verified_source_headers(summary, execution, preparation_policies)
+        findings.extend(header_findings)
+        auxiliary_rows, auxiliary_findings = self._verified_auxiliary_rows(
+            summary, recipe, execution, preparation_policies, source_headers,
+        )
+        findings.extend(auxiliary_findings)
+        findings.extend(self._validate_associations(summary, execution, preparation_policies, source_headers))
+        findings.extend(self._validate_temporal_dates(summary, recipe, execution, preparation_policies, source_headers))
+        auxiliary_cells_by_sheet = Counter(
+            treatment.sheet_name for treatments in auxiliary_rows.values()
+            for treatment in treatments for _ in treatment.auxiliary_cells
+        )
 
         if recipe.status == "failed":
             errors.append("La receta indica que el archivo no pudo prepararse.")
@@ -50,14 +65,25 @@ class TabularValidationService:
 
         for sheet in summary.sheets:
             warnings.extend(f"Hoja '{sheet.name}': {warning}" for warning in sheet.warnings)
-            if sheet.missing_formula_cache_count:
+            remaining_missing = sheet.missing_formula_cache_count - auxiliary_cells_by_sheet[sheet.name]
+            if remaining_missing < 0:
+                findings.append(TabularFinding(
+                    code="auxiliary_row_evidence_mismatch", sheet_name=sheet.name,
+                    message="El tratamiento auxiliar excede las fórmulas sin caché de la fuente.", severity="error",
+                ))
+            if remaining_missing > 0:
+                auxiliary_coordinates = {
+                    formula.cell for treatments in auxiliary_rows.values() for treatment in treatments
+                    if treatment.sheet_name == sheet.name for formula in treatment.auxiliary_cells
+                }
                 missing_sample = next(
-                    (formula.cell for formula in sheet.formula_sample if not formula.cache_available), None,
+                    (formula.cell for formula in sheet.formula_sample
+                     if not formula.cache_available and formula.cell not in auxiliary_coordinates), None,
                 )
                 findings.append(TabularFinding(
                     code="source_missing_formula_cache",
                     message=(
-                        f"Fórmulas sin resultado almacenado en la fuente: {sheet.missing_formula_cache_count}. "
+                        f"Fórmulas sin resultado almacenado en la fuente: {remaining_missing}. "
                         "El control incluye cabeceras y regiones separadas."
                     ),
                     sheet_name=sheet.name,
@@ -152,14 +178,18 @@ class TabularValidationService:
                         severity="error",
                     ))
             findings.extend(sheet.findings)
+            treatments = auxiliary_rows.get((sheet.sheet_name, sheet.block_id), [])
+            removed_treatments = [treatment for treatment in treatments if treatment.removed_from_observations]
             sheet_warnings, sheet_errors, sheet_findings = self._validate_sheet(
                 sheet, coverage_available=sheet.sheet_name in coverage_names,
+                auxiliary_rows=len(removed_treatments),
+                auxiliary_formula_cells=sum(len(treatment.auxiliary_cells) for treatment in removed_treatments),
             )
             warnings.extend(sheet_warnings)
             errors.extend(sheet_errors)
             findings.extend(sheet_findings)
 
-        findings.extend(self._validate_regions(summary, recipe, empty_names))
+        findings.extend(self._validate_regions(summary, recipe, empty_names, preparation_policies, auxiliary_rows, source_headers))
         findings.extend(self._validate_unit_labels(summary, recipe))
         findings.extend(self._validate_record_overlaps(summary, execution))
         findings.extend(self._validate_record_identity_notes(summary, identity_clarifications))
@@ -200,6 +230,323 @@ class TabularValidationService:
             review_reasons=list({finding.model_dump_json(): finding for finding in findings
                                  if finding.requires_review}.values()),
         )
+
+    def _validate_temporal_dates(self, summary, recipe, execution, policies, source_headers):
+        """Una advertencia temporal sólo queda resuelta con selección y procedencia corroboradas."""
+        sources = {sheet.name: sheet for sheet in summary.sheets}
+        plans = {(block.sheet_name, block.block_id): block for block in recipe.sheets}
+        temporal_policies = [policy for policy in policies.date_columns if policy.temporal_priority] if policies else []
+        reported = [*execution.findings, *(finding for sheet in execution.sheets for finding in sheet.findings)]
+        findings, verified = [], Counter()
+        seen = set()
+        for treatment in execution.temporal_dates:
+            source = sources.get(treatment.sheet_name)
+            plan = plans.get((treatment.sheet_name, treatment.block_id))
+            position = self._cell_position(treatment.date_cell)
+            policy = next((policy for policy in temporal_policies
+                           if (policy.sheet_name, policy.rule_id, policy.version, policy.origin)
+                           == (treatment.sheet_name, treatment.rule_id, treatment.version, treatment.origin)
+                           and position is not None and position[1] in policy.column_indices), None)
+            fields = {"date": position[1], **policy.related_date_columns} if position and policy else {}
+            key = (treatment.sheet_name, treatment.block_id, treatment.date_cell)
+            valid = (
+                source is not None and plan is not None and policy is not None
+                and plan.role == "observations"
+                and position[0] == treatment.source_row
+                and plan.data_start_row <= treatment.source_row <= plan.data_end_row
+                and plan.data_start_column <= position[1] <= plan.data_end_column
+                and self._policy_headers_match(source, policy.expected_headers, source_headers, policy.header_row)
+                and key not in seen and treatment.original_values.keys() == fields.keys()
+                and all(self._cell_position(treatment.original_evidence[field].cell)
+                        == (treatment.source_row, column) for field, column in fields.items())
+                and self._temporal_selection_matches_originals(treatment, policy)
+            )
+            if valid:
+                sampled = next((row for row in source.sample if row.row_number == treatment.source_row), None)
+                if sampled is not None:
+                    columns = source.column_indices or list(range(1, len(source.initial_columns) + 1))
+                    sampled_values = dict(zip(columns, sampled.values))
+                    valid = all(column not in sampled_values or sampled_values[column] == treatment.original_values[field]
+                                for field, column in fields.items())
+            seen.add(key)
+            if not valid:
+                findings.append(TabularFinding(
+                    code="temporal_date_evidence_mismatch", sheet_name=treatment.sheet_name,
+                    block_id=treatment.block_id, cell=treatment.date_cell, severity="error",
+                    message="La selección temporal no coincide con la política corroborada, sus valores o su procedencia original.",
+                ))
+                continue
+            verified[(treatment.sheet_name, treatment.block_id, position[1])] += 1
+            unresolved_reported = any(
+                finding.code == "temporal_date_unresolved" and finding.requires_review
+                and (finding.sheet_name, finding.block_id, finding.cell)
+                == (treatment.sheet_name, treatment.block_id, treatment.date_cell)
+                for finding in reported
+            )
+            if treatment.resolution == "review_required" and not unresolved_reported:
+                findings.append(TabularFinding(
+                    code="temporal_date_unresolved", sheet_name=treatment.sheet_name,
+                    block_id=treatment.block_id, cell=treatment.date_cell,
+                    message=(f"Fila {treatment.source_row}: ni Código Fecha ni Fecha permiten determinar una fecha válida; "
+                             "Mes y Año se conservan únicamente como contraste. Revisar los valores originales."),
+                ))
+            elif treatment.resolution == "user_priority" and treatment.discrepancies and not any(
+                finding.code == "temporal_priority_discrepancies_resolved" and not finding.requires_review
+                and (finding.sheet_name, finding.block_id, finding.cell)
+                == (treatment.sheet_name, treatment.block_id, treatment.date_cell)
+                for finding in reported
+            ):
+                findings.append(TabularFinding(
+                    code="temporal_priority_discrepancies_resolved", sheet_name=treatment.sheet_name,
+                    block_id=treatment.block_id, cell=treatment.date_cell, requires_review=False,
+                    message=(f"Fecha {treatment.normalized_date} seleccionada desde {treatment.source_cell} por "
+                             f"{treatment.rule_id} v{treatment.version}: "
+                             + "; ".join(discrepancy.message for discrepancy in treatment.discrepancies)
+                             + " Se conservan los originales; la política no constituye una confirmación científica."),
+                ))
+        for policy in temporal_policies:
+            for sheet in execution.sheets:
+                if sheet.sheet_name != policy.sheet_name or sheet.role != "observations":
+                    continue
+                plan = plans.get((sheet.sheet_name, sheet.block_id))
+                if plan is None:
+                    continue
+                for column in policy.column_indices:
+                    if plan.data_start_column <= column <= plan.data_end_column:
+                        count = verified[(sheet.sheet_name, sheet.block_id, column)]
+                        if count != sheet.rows_after:
+                            findings.append(TabularFinding(
+                                code="temporal_date_evidence_missing", sheet_name=sheet.sheet_name,
+                                block_id=sheet.block_id, severity="error",
+                                message=(f"La selección temporal conserva {count} registros con evidencia válida, "
+                                         f"pero el bloque tiene {sheet.rows_after} observaciones. No se resuelve la revisión sin esa procedencia."),
+                            ))
+        return findings
+
+    @staticmethod
+    def _temporal_selection_matches_originals(treatment, policy):
+        value = treatment.original_values.get("date_code")
+        numeric = isinstance(value, Number) and not isinstance(value, bool)
+        if numeric:
+            try:
+                text = str(int(value)) if value == int(value) and value >= 0 else ""
+            except (ValueError, OverflowError, TypeError):
+                text = ""
+            code_evidence = treatment.original_evidence.get("date_code")
+            if (len(text) == 7 and code_evidence is not None
+                    and code_evidence.source_kind == "native_number"
+                    and code_evidence.number_format == "00000000"):
+                text = "0" + text
+        else:
+            text = value.strip() if isinstance(value, str) else ""
+        chosen_code = None
+        if re.fullmatch(r"[0-9]{8}", text):
+            try:
+                chosen_code = date(int(text[4:]), int(text[2:4]), int(text[:2])).isoformat()
+            except ValueError:
+                pass
+        chosen_date = None
+        original_date = treatment.original_values.get("date")
+        if isinstance(original_date, str):
+            text = original_date.strip()
+            if re.fullmatch(r"\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:\d{2})?)?", text):
+                try:
+                    chosen_date = datetime.fromisoformat(text.replace("Z", "+00:00")).date().isoformat()
+                except ValueError:
+                    pass
+            if chosen_date is None:
+                for explicit_format in policy.text_formats:
+                    try:
+                        chosen_date = datetime.strptime(text, explicit_format).date().isoformat()
+                    except ValueError:
+                        continue
+                    break
+        chosen = chosen_code or chosen_date
+        return (
+            treatment.resolution == "review_required" and chosen is None
+            or treatment.resolution == "user_priority" and chosen is not None
+            and treatment.normalized_date == chosen
+            and treatment.source_field == ("date_code" if chosen_code else "date")
+            and (not chosen_code or treatment.code_interpretation == (
+                "numeric_leading_zero" if numeric and len(str(int(value))) == 7 else "exact_8_digits"
+            ))
+        )
+
+    def _verified_source_headers(self, summary, execution, policies):
+        sources = {sheet.name: sheet for sheet in summary.sheets}
+        expected = set()
+        if policies:
+            for group in (policies.date_columns, policies.number_columns, policies.confirmed_cells, policies.observation_rows):
+                expected.update((policy.sheet_name, policy.header_row) for policy in group)
+            for policy in policies.associations:
+                expected.update(((policy.source_sheet, policy.header_row), (policy.target_sheet, policy.header_row)))
+        verified, findings = {}, []
+        seen = set()
+        for proof in execution.source_headers:
+            key = (proof.sheet_name, proof.row_number)
+            source = sources.get(proof.sheet_name)
+            compact = dict(zip(source.column_indices or range(1, len(source.initial_columns) + 1),
+                               source.initial_columns)) if source else {}
+            sampled_formula_columns = {
+                position[1] for cell in source.formula_sample
+                if (position := self._cell_position(cell.cell)) is not None and position[0] == proof.row_number
+            } if source else set()
+            valid = (
+                source is not None and key in expected and key not in seen
+                and proof.row_number <= source.rows and proof.inspected_columns == source.columns
+                and set(proof.values) == set(range(1, source.columns + 1))
+                and set(proof.formula_columns).issubset(proof.values)
+                and len(set(proof.formula_columns)) == len(proof.formula_columns)
+                and len(proof.formula_columns) <= source.formula_count
+                and sampled_formula_columns.issubset(proof.formula_columns)
+                and (proof.row_number != 1 or all(
+                    self._summary_header_value(proof.values.get(column), column) == name
+                    for column, name in compact.items()
+                ))
+            )
+            seen.add(key)
+            if not valid:
+                verified.pop(key, None)
+                findings.append(TabularFinding(
+                    code="source_header_evidence_mismatch", sheet_name=proof.sheet_name,
+                    severity="error", message="La prueba de encabezados originales es incompleta o contradice la fuente inspeccionada.",
+                ))
+            else:
+                verified[key] = proof
+        for sheet_name, row in sorted(expected - verified.keys()):
+            findings.append(TabularFinding(
+                code="source_header_evidence_missing", sheet_name=sheet_name, cell=f"A{row}",
+                severity="error", message="Falta la fila completa de encabezados originales requerida por las políticas corroboradas.",
+            ))
+        return verified, findings
+
+    @staticmethod
+    def _summary_header_value(value, column):
+        if value is None or isinstance(value, str) and not value.strip():
+            return f"column_{column}"
+        return value[:200] if isinstance(value, str) else str(value)
+
+    def _verified_auxiliary_rows(self, summary, recipe, execution, policies, source_headers):
+        sources = {sheet.name: sheet for sheet in summary.sheets}
+        plans = {(block.sheet_name, block.block_id): block for block in recipe.sheets}
+        verified = {}
+        findings = []
+        seen = set()
+        for treatment in execution.auxiliary_rows:
+            source = sources.get(treatment.sheet_name)
+            block = plans.get((treatment.sheet_name, treatment.block_id))
+            policy = next((policy for policy in policies.observation_rows
+                           if (policy.sheet_name, policy.rule_id, policy.version, policy.origin)
+                           == (treatment.sheet_name, treatment.rule_id, treatment.version, treatment.origin)), None) if policies else None
+            coordinates = [self._cell_position(cell.cell) for cell in treatment.auxiliary_cells]
+            sampled_formulas = {cell.cell: cell for cell in source.formula_sample} if source else {}
+            key = (treatment.sheet_name, treatment.row_number)
+            valid = (
+                source is not None and block is not None and policy is not None
+                and block.role in {"observations", "derived", "legend", "unknown"}
+                and treatment.removed_from_observations == (block.role == "observations")
+                and self._policy_headers_match(source, policy.expected_headers, source_headers, policy.header_row)
+                and treatment.inspected_columns == source.columns
+                and block.data_start_row <= treatment.row_number <= block.data_end_row
+                and key not in seen
+                and len(set(coordinates)) == len(coordinates)
+                and all(position is not None and position[0] == treatment.row_number
+                        and position[1] in policy.auxiliary_column_indices
+                        and block.data_start_column <= position[1] <= block.data_end_column
+                        for position in coordinates)
+                and all(cell.cached_value is None and not cell.cache_available and cell.formula.startswith("=")
+                        for cell in treatment.auxiliary_cells)
+                and all(cell.cell not in sampled_formulas or (
+                    sampled_formulas[cell.cell].formula == cell.formula
+                    and not sampled_formulas[cell.cell].cache_available
+                    and sampled_formulas[cell.cell].cached_value is None
+                ) for cell in treatment.auxiliary_cells)
+            )
+            if not valid:
+                findings.append(TabularFinding(
+                    code="auxiliary_row_evidence_mismatch", sheet_name=treatment.sheet_name,
+                    block_id=treatment.block_id, message="El tratamiento de fila auxiliar no tiene evidencia completa y política corroborada.",
+                    severity="error",
+                ))
+                continue
+            seen.add(key)
+            verified.setdefault((treatment.sheet_name, treatment.block_id), []).append(treatment)
+            findings.append(TabularFinding(
+                code="auxiliary_row_preserved", sheet_name=treatment.sheet_name, block_id=treatment.block_id,
+                cell=treatment.auxiliary_cells[0].cell, requires_review=False,
+                message=(f"Fila {treatment.row_number} sin valores observacionales: se conservan "
+                         "las fórmulas auxiliares como evidencia. " + (
+                             "Se omite la fila analítica." if treatment.removed_from_observations
+                             else "Se conserva el bloque auxiliar sin convertirlo en observaciones."
+                         )),
+            ))
+        return verified, findings
+
+    def _validate_associations(self, summary, execution, policies, source_headers):
+        """Los vínculos son diagnósticos: no incorporan, filtran ni multiplican filas."""
+        sources = {sheet.name: sheet for sheet in summary.sheets}
+        findings = []
+        seen = set()
+        for diagnostic in execution.associations:
+            source = sources.get(diagnostic.source_sheet)
+            target = sources.get(diagnostic.target_sheet)
+            policy = next((policy for policy in policies.associations
+                           if (policy.source_sheet, policy.target_sheet, policy.rule_id, policy.version, policy.origin)
+                           == (diagnostic.source_sheet, diagnostic.target_sheet, diagnostic.rule_id,
+                               diagnostic.version, diagnostic.origin)), None) if policies else None
+            position = self._cell_position(diagnostic.source_cell)
+            key = (diagnostic.rule_id, diagnostic.source_sheet, diagnostic.source_row, diagnostic.source_cell)
+            expected_status = ("missing" if not diagnostic.target_rows else
+                               "matched" if len(diagnostic.target_rows) == 1 else "ambiguous")
+            valid = (
+                source is not None and target is not None and policy is not None
+                and position == (diagnostic.source_row, policy.source_column)
+                and policy.source_start_row <= diagnostic.source_row <= source.rows
+                and self._policy_headers_match(source, {policy.source_column: policy.expected_source_header}, source_headers, policy.header_row)
+                and self._policy_headers_match(target, {policy.target_column: policy.expected_target_header}, source_headers, policy.header_row)
+                and all(policy.target_start_row <= row <= target.rows for row in diagnostic.target_rows)
+                and len(set(diagnostic.target_rows)) == len(diagnostic.target_rows)
+                and diagnostic.status == expected_status and key not in seen
+            )
+            if not valid:
+                findings.append(TabularFinding(
+                    code="association_evidence_mismatch", sheet_name=diagnostic.source_sheet,
+                    cell=diagnostic.source_cell, severity="error",
+                    message="El diagnóstico de asociación no coincide con la política y la procedencia corroboradas.",
+                ))
+                continue
+            seen.add(key)
+            if diagnostic.status == "ambiguous":
+                findings.append(TabularFinding(
+                    code="ambiguous_optional_association", sheet_name=diagnostic.source_sheet,
+                    cell=diagnostic.source_cell,
+                    message=(f"La asociación opcional {diagnostic.rule_id} tiene varios destinos en "
+                             f"'{diagnostic.target_sheet}', filas {', '.join(map(str, diagnostic.target_rows))}. "
+                             "Se conservan los registros originales sin realizar la asociación."),
+                ))
+        return findings
+
+    @staticmethod
+    def _cell_position(cell):
+        match = re.fullmatch(r"([A-Z]+)([1-9][0-9]*)", cell)
+        if match is None:
+            return None
+        column = 0
+        for character in match[1]:
+            column = column * 26 + ord(character) - ord("A") + 1
+        return int(match[2]), column
+
+    @staticmethod
+    def _policy_headers_match(source, expected_headers, source_headers=None, header_row=1):
+        if source_headers is not None:
+            proof = source_headers.get((source.name, header_row))
+            return proof is not None and all(
+                column not in proof.formula_columns and proof.values.get(column) == expected
+                for column, expected in expected_headers.items()
+            )
+        positions = source.column_indices or list(range(1, len(source.initial_columns) + 1))
+        actual = dict(zip(positions, source.initial_columns))
+        return all(actual.get(column) == expected for column, expected in expected_headers.items())
 
     def _verified_empty_sheets(
         self, summary: StructuralSummary, recipe: PreparationRecipe, execution: ExecutionResult,
@@ -362,6 +709,9 @@ class TabularValidationService:
 
     def _validate_regions(
         self, summary: StructuralSummary, recipe: PreparationRecipe, empty_names: set[str] | None = None,
+        preparation_policies: PreparationPolicies | None = None,
+        auxiliary_rows: dict | None = None,
+        source_headers: dict | None = None,
     ) -> list[TabularFinding]:
         findings: list[TabularFinding] = []
         sources = {sheet.name: sheet for sheet in summary.sheets}
@@ -403,6 +753,23 @@ class TabularValidationService:
                     continue
                 expected_role = expected_roles.get(region.kind)
                 if expected_role is not None and block.role != expected_role:
+                    if (region.kind == "derived" and block.role == "legend"
+                        and self._derived_auxiliary_legend(region, block, (auxiliary_rows or {}).get(
+                            (block.sheet_name, block.block_id), [],
+                        ))):
+                        continue
+                    if region.kind == "derived" and block.role == "observations" and preparation_policies:
+                        identity_columns = {
+                            column for policy in preparation_policies.observation_rows
+                            if policy.sheet_name == source.name and self._policy_headers_match(
+                                source, policy.expected_headers, source_headers, policy.header_row,
+                            )
+                            for column in policy.auxiliary_column_indices
+                        }
+                        if (set(range(region.start_column, region.end_column + 1)).issubset(identity_columns)
+                            and identity_columns.issubset(range(block.data_start_column, block.data_end_column + 1))
+                            and set(range(block.data_start_column, block.data_end_column + 1)) - identity_columns):
+                            continue
                     if self._candidate_contradicted(source, region, block):
                         continue
                     findings.append(TabularFinding(
@@ -438,6 +805,22 @@ class TabularValidationService:
                         range=self._block_range(block, source),
                     ))
         return findings
+
+    def _derived_auxiliary_legend(self, region, block, treatments):
+        """Sólo una intersección enteramente probada como fórmula auxiliar puede ser leyenda."""
+        first_row, last_row = max(block.data_start_row, region.start_row), min(block.data_end_row, region.end_row)
+        first_column = max(block.data_start_column, region.start_column)
+        last_column = min(block.data_end_column, region.end_column)
+        proofs = {treatment.row_number: treatment for treatment in treatments
+                  if not treatment.removed_from_observations}
+        for row in range(first_row, last_row + 1):
+            treatment = proofs.get(row)
+            if treatment is None:
+                return False
+            positions = {self._cell_position(cell.cell) for cell in treatment.auxiliary_cells}
+            if not all((row, column) in positions for column in range(first_column, last_column + 1)):
+                return False
+        return first_row <= last_row and first_column <= last_column
 
     def _candidate_contradicted(
         self, source: SheetSummary, region: StructuralRegion, block: SheetRecipe,
@@ -552,6 +935,7 @@ class TabularValidationService:
 
     def _validate_sheet(
         self, sheet: SheetExecution, *, coverage_available: bool = False,
+        auxiliary_rows: int = 0, auxiliary_formula_cells: int = 0,
     ) -> tuple[list[str], list[str], list[TabularFinding]]:
         prefix = f"Hoja '{sheet.sheet_name}': "
         warnings = [prefix + warning for warning in sheet.warnings]
@@ -570,6 +954,7 @@ class TabularValidationService:
             sheet.rows_after,
             sheet.excluded_nonempty_rows,
             sheet.dropped_empty_rows,
+            sheet.auxiliary_rows_removed,
             sheet.formula_count,
             sheet.unresolved_formula_count,
             sheet.error_cell_count,
@@ -589,7 +974,9 @@ class TabularValidationService:
             review("suspicious_header_rows", "Los encabezados seleccionados podrían contener registros de datos.")
 
         # rows_before ya excluye los encabezados declarados en la receta.
-        row_difference = sheet.rows_before - sheet.dropped_empty_rows - sheet.rows_after
+        if sheet.auxiliary_rows_removed != auxiliary_rows:
+            errors.append(prefix + "Las filas auxiliares omitidas no coinciden con su evidencia verificada.")
+        row_difference = sheet.rows_before - sheet.dropped_empty_rows - auxiliary_rows - sheet.rows_after
         if row_difference > 0:
             review("unexplained_row_loss", f"Se perdieron {row_difference} filas sin una eliminación de vacíos que lo explique.")
         elif row_difference < 0:
@@ -614,7 +1001,7 @@ class TabularValidationService:
         if (
             sheet.source_nonempty_cells is not None
             and sheet.preserved_nonempty_cells is not None
-            and sheet.source_nonempty_cells != sheet.preserved_nonempty_cells
+            and sheet.source_nonempty_cells != sheet.preserved_nonempty_cells + auxiliary_formula_cells
         ):
             review("nonempty_value_loss", "La cantidad de celdas no vacías no se conservó durante las transformaciones.")
         if sheet.unresolved_formula_cells or sheet.unresolved_formula_count:

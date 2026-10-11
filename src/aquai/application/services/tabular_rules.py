@@ -16,6 +16,14 @@ from aquai.application.dtos.tabular import (
     StructuralSummary,
 )
 from aquai.application.errors import TabularInputError
+from aquai.application.dtos.tabular_policies import (
+    AssociationPolicy,
+    ConfirmedCellPolicy,
+    DateColumnPolicy,
+    NumberColumnPolicy,
+    ObservationRowPolicy,
+    PreparationPolicies,
+)
 from aquai.application.interfaces.tabular_rules import TabularRuleCatalog
 
 
@@ -26,6 +34,7 @@ class RuleComposition:
     review_reasons: list[str]
     findings: list[dict[str, JsonValue]]
     identity_clarifications: tuple[RecordIdentityClarification, ...] = ()
+    preparation_policies: PreparationPolicies | None = None
 
 
 def _normalized(value: str) -> str:
@@ -72,6 +81,7 @@ class TabularRuleService:
             for rule in file_specific_rules for clarification in rule.get("identity_clarifications", [])
         )
         evidence, findings = self._profile_evidence(summary, selected)
+        preparation_policies = self._preparation_policies(evidence, profile_rules, file_specific_rules)
         findings.extend(self._additional_conflicts(additional, common + profile_rules))
         review_reasons = [finding["message"] for finding in findings if finding["requires_review"]]
         used_sources = {rule["origin"] for rule in common + profile_rules + file_specific_rules}
@@ -103,7 +113,43 @@ class TabularRuleService:
         if file_specific_rules:
             metadata["file_specific_rules"] = file_specific_rules
             prompt_rules["file_specific_rules"] = deepcopy(file_specific_rules)
-        return RuleComposition(metadata, prompt_rules, review_reasons, findings, identity_clarifications)
+        return RuleComposition(
+            metadata, prompt_rules, review_reasons, findings, identity_clarifications, preparation_policies,
+        )
+
+    def _preparation_policies(
+        self, evidence: dict[str, JsonValue], profile_rules: list[dict[str, JsonValue]],
+        file_specific_rules: list[dict[str, JsonValue]],
+    ) -> PreparationPolicies | None:
+        """Sólo el catálogo corroborado autoriza tratamientos del sistema, nunca texto adicional."""
+        if not evidence.get("file_name_matches") or evidence.get("missing_expected_sheets"):
+            return None
+        kinds = {
+            "date_columns": DateColumnPolicy, "number_columns": NumberColumnPolicy,
+            "confirmed_cells": ConfirmedCellPolicy, "observation_rows": ObservationRowPolicy,
+            "associations": AssociationPolicy,
+        }
+        collected: dict[str, list] = {name: [] for name in kinds}
+        for rules, file_specific in ((profile_rules, False), (file_specific_rules, True)):
+            for rule in rules:
+                for name, definitions in rule.get("preparation_policies", {}).items():
+                    if name not in kinds:
+                        raise TabularInputError(f"Política de preparación desconocida en el catálogo: {name}.")
+                    for definition in definitions:
+                        values = {
+                            **deepcopy(definition), "rule_id": rule["id"],
+                            "version": rule["version"], "origin": rule["origin"],
+                        }
+                        if name == "confirmed_cells":
+                            origin = self._catalog["sources"].get(rule["origin"], {})
+                            if not file_specific or origin.get("verification") != "user_confirmation":
+                                raise TabularInputError(
+                                    "Una corrección confirmada requiere una regla de archivo con hash y origen humano."
+                                )
+                            values["source_sha256"] = rule["sha256"]
+                        collected[name].append(kinds[name].model_validate(values))
+        policies = PreparationPolicies.model_validate(collected)
+        return policies if policies.enabled else None
 
     def _file_specific_rules(
         self, summary: StructuralSummary, selected: str | None, source_sha256: str | None,
@@ -131,6 +177,8 @@ class TabularRuleService:
             source = sources.get(block.sheet_name)
             if source is None:
                 continue
+            findings.extend(self._validate_configured_sheet_role(source, block, composition))
+            findings.extend(self._validate_preparation_policy_block(source, block, composition))
             if profile == "cyanobacterial_alerts":
                 findings.extend(self._validate_alert_block(source, block))
             elif profile == "biological_counts":
@@ -148,6 +196,77 @@ class TabularRuleService:
                             source,
                             block,
                         ))
+        return findings
+
+    def _validate_preparation_policy_block(self, source, block, composition):
+        policies = composition.preparation_policies
+        if policies is None:
+            return []
+        findings = []
+        protected_number_names = {
+            policy.expected_headers[column] for policy in policies.number_columns
+            if policy.sheet_name == source.name for column in policy.column_indices
+        }
+        for transformation in block.transformations:
+            if isinstance(transformation, RenameColumns):
+                protected_number_names = {
+                    transformation.mapping.get(name, name) for name in protected_number_names
+                }
+            elif isinstance(transformation, ConvertType) and transformation.target_type == "datetime":
+                incompatible = protected_number_names.intersection(transformation.columns)
+                if incompatible:
+                    findings.append(self._block_finding(
+                        "rule_policy_type_conflict",
+                        "La política numérica no permite interpretar como fechas las columnas de abundancia: "
+                        + ", ".join(sorted(incompatible)) + ". Conservar sus valores y revisar la receta.",
+                        source, block,
+                    ))
+        for policy in policies.observation_rows:
+            if policy.sheet_name != source.name or block.role != "observations":
+                continue
+            represented = set(range(block.data_start_column, block.data_end_column + 1))
+            identity = set(policy.auxiliary_column_indices)
+            if represented - identity and not identity.issubset(represented):
+                findings.append(self._block_finding(
+                    "rule_policy_identifier_separation",
+                    f"La regla {policy.rule_id} conserva los identificadores calculados junto a sus registros; "
+                    "el bloque observacional deja fuera columnas de identificación documentadas.",
+                    source, block,
+                ))
+        return findings
+
+    def _validate_configured_sheet_role(
+        self, source: SheetSummary, block: SheetRecipe, composition: RuleComposition,
+    ) -> list[dict[str, JsonValue]]:
+        """Contrasta roles documentados del perfil corroborado sin interpretar nombres en código."""
+        evidence = composition.metadata["evidence"]
+        if not evidence.get("file_name_matches") or evidence.get("missing_expected_sheets"):
+            return []
+        content = source.content_evidence
+        if (
+            content is not None and content.sheet_name == source.name and content.is_empty
+            and content.verification == "full_sheet_values_and_formulas"
+            and content.inspected_cells == source.rows * source.columns
+            and source.formula_count == 0 and source.missing_formula_cache_count == 0
+            and source.error_cell_count == 0
+        ):
+            return []
+        findings: list[dict[str, JsonValue]] = []
+        for rule in composition.metadata["profile_rules"]:
+            for requirement in rule.get("sheet_role_requirements", []):
+                if _normalized(requirement["sheet_name"]) != _normalized(source.name):
+                    continue
+                allowed_roles = requirement["allowed_roles"]
+                if block.role not in allowed_roles:
+                    findings.append(self._block_finding(
+                        "rule_profile_role_conflict",
+                        f"La regla {rule['id']} del perfil {composition.metadata['profile']} "
+                        f"documenta los roles {', '.join(allowed_roles)} para la hoja '{source.name}'; "
+                        f"el bloque declara '{block.role}'. Conservar sus celdas y procedencia, "
+                        "y revisar la función del bloque sin convertirlo automáticamente en observaciones.",
+                        source,
+                        block,
+                    ))
         return findings
 
     def _validate_alert_block(
@@ -216,7 +335,7 @@ class TabularRuleService:
     def _versioned_rules(
         rules: list[dict[str, JsonValue]], version: str, scope: str
     ) -> list[dict[str, JsonValue]]:
-        return [{**deepcopy(rule), "version": version, "scope": scope} for rule in rules]
+        return [{**deepcopy(rule), "version": rule.get("version", version), "scope": scope} for rule in rules]
 
     def _profile_evidence(
         self, summary: StructuralSummary, selected: str | None

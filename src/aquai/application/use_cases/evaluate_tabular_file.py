@@ -111,18 +111,23 @@ class EvaluateTabularFile:
                 )
             if result.recipe.status != "failed":
                 stage_started = perf_counter()
+                execution_options = {}
+                if rule_composition is not None and rule_composition.preparation_policies is not None:
+                    execution_options["policies"] = rule_composition.preparation_policies
                 result.execution = await asyncio.to_thread(
-                    self._processor.execute, file_name, content, result.recipe, summary
+                    self._processor.execute, file_name, content, result.recipe, summary, **execution_options,
                 )
                 metrics.execution_duration_ms = self._elapsed_ms(stage_started)
             stage_started = perf_counter()
-            if rule_composition is not None and rule_composition.identity_clarifications:
-                result.validation = self._validator.validate(
-                    summary, result.recipe, result.execution,
-                    identity_clarifications=rule_composition.identity_clarifications,
-                )
-            else:
-                result.validation = self._validator.validate(summary, result.recipe, result.execution)
+            validation_options = {}
+            if rule_composition is not None:
+                if rule_composition.identity_clarifications:
+                    validation_options["identity_clarifications"] = rule_composition.identity_clarifications
+                if rule_composition.preparation_policies is not None:
+                    validation_options["preparation_policies"] = rule_composition.preparation_policies
+            result.validation = self._validator.validate(
+                summary, result.recipe, result.execution, **validation_options,
+            )
             metrics.validation_duration_ms = self._elapsed_ms(stage_started)
             result.response_format.recipe_executable = self._is_executable(result)
 

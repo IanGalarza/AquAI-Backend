@@ -4,6 +4,7 @@ import csv
 import io
 import posixpath
 from dataclasses import dataclass, field
+from datetime import date, datetime
 from pathlib import PurePath
 from xml.etree import ElementTree
 from zipfile import BadZipFile, ZipFile
@@ -21,6 +22,14 @@ class FormulaData:
     cached_value: object
 
 
+@dataclass(frozen=True)
+class CellMetadata:
+    source_kind: str
+    number_format: str = "General"
+    raw_value: str | None = None
+    excel_epoch: str | None = None
+
+
 @dataclass
 class SheetData:
     name: str
@@ -36,6 +45,7 @@ class SheetData:
     error_cell_count: int = 0
     error_cells: list[str] = field(default_factory=list)
     error_positions: set[tuple[int, int]] = field(default_factory=set)
+    cell_metadata: dict[tuple[int, int], CellMetadata] = field(default_factory=dict)
 
 
 @dataclass
@@ -245,9 +255,29 @@ class TableReader:
                 data.error_cell_count = error_cell_count
                 data.error_cells = error_cells
                 data.error_positions = error_positions
-                formula_cells = [
-                    cell for row in worksheet.iter_rows() for cell in row if cell.data_type == "f"
-                ]
+                source_cells = [cell for row in worksheet.iter_rows() for cell in row if cell.value is not None]
+                date_positions = {cell.coordinate for cell in source_cells if isinstance(cell.value, (date, datetime))}
+                raw_dates = self._raw_date_values(content, worksheet.title, date_positions) if date_positions else {}
+                for cell in source_cells:
+                    if cell.data_type == "f":
+                        kind = "formula"
+                    elif cell.data_type == "e":
+                        kind = "excel_error"
+                    elif isinstance(cell.value, (date, datetime)):
+                        kind = "native_datetime"
+                    elif isinstance(cell.value, bool):
+                        kind = "native_boolean"
+                    elif isinstance(cell.value, str):
+                        kind = "text"
+                    else:
+                        kind = "native_number"
+                    data.cell_metadata[(cell.row, cell.column)] = CellMetadata(
+                        source_kind=kind,
+                        number_format=cell.number_format,
+                        raw_value=raw_dates.get(cell.coordinate),
+                        excel_epoch=workbook.epoch.isoformat() if kind == "native_datetime" else None,
+                    )
+                formula_cells = [cell for cell in source_cells if cell.data_type == "f"]
                 data.formula_count = len(formula_cells)
                 sample_count = min(self.sample_rows, data.formula_count)
                 head_count = min(3, sample_count)
@@ -283,3 +313,39 @@ class TableReader:
             workbook.close()
             if cached_workbook is not None:
                 cached_workbook.close()
+
+    def _raw_date_values(self, content: bytes, sheet_name: str, positions: set[str]) -> dict[str, str]:
+        """Conserva el serial o valor XML original de fechas sin reconstruirlo."""
+        with ZipFile(io.BytesIO(content)) as archive:
+            package_relations = ElementTree.fromstring(archive.read("_rels/.rels"))
+            workbook_part = next(
+                relation.attrib["Target"].lstrip("/") for relation in package_relations
+                if relation.attrib.get("Type", "").endswith("/officeDocument")
+            )
+            base = posixpath.dirname(workbook_part)
+            relation_part = posixpath.join(base, "_rels", posixpath.basename(workbook_part) + ".rels")
+            workbook_relations = ElementTree.fromstring(archive.read(relation_part))
+            targets = {}
+            for relation in workbook_relations:
+                target = relation.attrib.get("Target", "")
+                targets[relation.attrib.get("Id")] = (target.lstrip("/") if target.startswith("/")
+                                                       else posixpath.normpath(posixpath.join(base, target)))
+            workbook_xml = ElementTree.fromstring(archive.read(workbook_part))
+            relation_id = next(
+                value for element in workbook_xml.iter()
+                if element.tag.rsplit("}", 1)[-1] == "sheet" and element.attrib.get("name") == sheet_name
+                for key, value in element.attrib.items() if key.rsplit("}", 1)[-1] == "id"
+            )
+            values = {}
+            with archive.open(targets[relation_id]) as stream:
+                for _, element in ElementTree.iterparse(stream, events=("end",)):
+                    if element.tag.rsplit("}", 1)[-1] != "c":
+                        continue
+                    coordinate = element.attrib.get("r")
+                    if coordinate in positions:
+                        raw_value = next((child.text for child in element
+                                          if child.tag.rsplit("}", 1)[-1] == "v"), None)
+                        if raw_value is not None:
+                            values[coordinate] = raw_value
+                    element.clear()
+            return values

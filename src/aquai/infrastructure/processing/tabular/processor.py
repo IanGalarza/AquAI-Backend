@@ -5,11 +5,13 @@ import re
 from collections import Counter, defaultdict, deque
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
+from hashlib import sha256
 from numbers import Number
 
 import pandas as pd
 import numpy as np
-from openpyxl.utils.cell import get_column_letter
+from openpyxl.formula.tokenizer import Tokenizer, TokenizerError
+from openpyxl.utils.cell import column_index_from_string, get_column_letter
 from openpyxl.worksheet.cell_range import CellRange
 
 from aquai.application.dtos.tabular import (
@@ -35,6 +37,11 @@ from aquai.application.dtos.tabular import (
     SourceRowMatch,
 )
 from aquai.infrastructure.processing.tabular.reader import SheetData, TableReader
+from aquai.application.dtos.tabular_policies import PreparationPolicies, SourceHeaderEvidence
+from aquai.infrastructure.processing.tabular.date_consistency import date_consistency_findings
+from aquai.infrastructure.processing.tabular.temporal_priority import select_temporal_dates
+from aquai.infrastructure.processing.tabular.normalization import trace_value
+from aquai.infrastructure.processing.tabular.preparation import association_diagnostics, headers_match, prepare_frame, strict_missing
 
 
 def is_empty(value: object) -> bool:
@@ -102,6 +109,8 @@ class PandasTabularProcessor:
         content: bytes,
         recipe: PreparationRecipe,
         summary: StructuralSummary,
+        *,
+        policies: PreparationPolicies | None = None,
     ) -> ExecutionResult:
         table = self.reader.read(file_name, content)
         sheets = {sheet.name: sheet for sheet in table.sheets}
@@ -120,6 +129,9 @@ class PandasTabularProcessor:
             for sheet in table.sheets if content_evidence[sheet.name].is_empty
         ]
         executions = []
+        normalizations, auxiliary_rows, temporal_dates = [], [], []
+        enabled_policies = policies if policies is not None and policies.enabled else None
+        source_sha256 = sha256(content).hexdigest() if enabled_policies is not None else None
         for sheet_recipe in recipe.sheets:
             sheet = sheets.get(sheet_recipe.sheet_name)
             if sheet is None:
@@ -140,19 +152,66 @@ class PandasTabularProcessor:
                     errors=["La hoja indicada por la receta no existe en el archivo."],
                 ))
             elif not content_evidence[sheet.name].is_empty:
-                executions.append(self._execute_sheet(sheet, sheet_recipe))
+                if enabled_policies is None:
+                    executions.append(self._execute_sheet(sheet, sheet_recipe))
+                else:
+                    executions.append(self._execute_sheet(
+                        sheet, sheet_recipe, policies=enabled_policies, source_sha256=source_sha256,
+                        normalizations=normalizations, auxiliary_rows=auxiliary_rows,
+                        temporal_dates=temporal_dates,
+                    ))
+        associations, association_findings = (association_diagnostics(table.sheets, enabled_policies)
+                                               if enabled_policies is not None else ([], []))
+        consistency_findings = (date_consistency_findings(table.sheets, enabled_policies, associations, temporal_dates=temporal_dates)
+                                if enabled_policies is not None else [])
+        identity_findings = (self._record_identity_findings(table.sheets, enabled_policies, executions)
+                             if enabled_policies is not None else [])
         return ExecutionResult(
             sheets=executions,
             skipped_sheets=[name for name in sheets if name not in selected],
             coverage=[self._coverage(sheet, recipe) for sheet in table.sheets],
-            findings=[finding for execution in executions for finding in execution.findings],
+            findings=([finding for execution in executions for finding in execution.findings]
+                      + association_findings + consistency_findings + identity_findings),
             record_overlaps=self._record_overlaps(table.sheets, [
                 item for item in summary.sheets
                 if item.name in content_evidence and not content_evidence[item.name].is_empty
             ]),
             sheet_content_evidence=list(content_evidence.values()),
             empty_sheets=empty_sheets,
+            normalizations=normalizations,
+            auxiliary_rows=auxiliary_rows,
+            temporal_dates=temporal_dates,
+            associations=associations,
+            source_headers=(self._source_headers(table.sheets, enabled_policies)
+                            if enabled_policies is not None else []),
         )
+
+    def _source_headers(
+        self, sheets: list[SheetData], policies: PreparationPolicies,
+    ) -> list[SourceHeaderEvidence]:
+        """Prueba filas completas con posiciones originales, sin compactar encabezados."""
+        sources = {sheet.name: sheet for sheet in sheets}
+        selected = {(policy.sheet_name, policy.header_row) for policy in (
+            *policies.date_columns, *policies.number_columns, *policies.confirmed_cells,
+            *policies.observation_rows,
+        )}
+        for policy in policies.associations:
+            selected.update(((policy.source_sheet, policy.header_row),
+                             (policy.target_sheet, policy.header_row)))
+        evidence = []
+        for name, row in sorted(selected):
+            sheet = sources.get(name)
+            if sheet is None or not 1 <= row <= len(sheet.frame) or not len(sheet.frame.columns):
+                continue
+            evidence.append(SourceHeaderEvidence(
+                sheet_name=name, row_number=row, inspected_columns=len(sheet.frame.columns),
+                values={column: (None if strict_missing(sheet.frame.iat[row - 1, column - 1])
+                                 else trace_value(sheet.frame.iat[row - 1, column - 1]))
+                        for column in range(1, len(sheet.frame.columns) + 1)},
+                formula_columns=tuple(column for column in range(1, len(sheet.frame.columns) + 1)
+                                      if (row, column) in sheet.formula_cells),
+            ))
+        return evidence
 
     def _value_key(self, value: object) -> tuple:
         """Compara valores completos y tipos sin recortar textos, códigos ni espacios."""
@@ -558,11 +617,138 @@ class PandasTabularProcessor:
                   or (str(initial.iloc[column]).strip() == "%" and any(
                       abs(column - presence) == 1 for presence in presence_columns))):
                 kinds.append("summary")
+            elif self._is_record_identifier_column(sheet, column, initial.iloc[column]):
+                kinds.append("observations")
             elif formula_counts[column] >= count * 0.6:
                 kinds.append("derived")
             else:
                 kinds.append("observations")
         return kinds
+
+    def _is_identifier_header(self, header: object) -> bool:
+        return isinstance(header, str) and bool(re.fullmatch(
+            r"(?:id|identifier|identificador|(?:sample|record|muestra|registro)[ _-]*id|id[ _-]*(?:sample|record|muestra|registro))",
+            header.strip(), re.IGNORECASE,
+        ))
+
+    def _identifier_expression(self, expression: str) -> tuple[bool, set[int], bool, bool]:
+        without_literals = re.sub(r'"(?:[^\"]|\"\")*"', "", expression)
+        aggregate = bool(re.search(
+            r"\b(?:SUM(?:IF|IFS|PRODUCT)?|COUNT(?:IF|IFS|A)?|AVERAGE(?:IF|IFS)?|MIN|MAX|SUBTOTAL|AGGREGATE|SUMA|PROMEDIO|CONTAR|SUBTOTALES)\s*\(",
+            without_literals, re.IGNORECASE,
+        ))
+        construction = not aggregate and bool("&" in without_literals or re.search(
+            r"\b(?:CONCAT(?:ENATE|ENAR)?|TEXTJOIN|UNIRCADENAS)\s*\(", without_literals, re.IGNORECASE,
+        ))
+        referenced_rows = {int(value) for token in self._identifier_reference_tokens(expression)
+                           for value in re.findall(r"\$?[A-Za-z]{1,3}\$?([0-9]+)", token)}
+        return construction, referenced_rows, "!" in without_literals, aggregate
+
+    def _identifier_reference_tokens(self, expression: str) -> list[str]:
+        try:
+            return [token.value for token in Tokenizer(expression).items
+                    if token.type == "OPERAND" and token.subtype == "RANGE"]
+        except TokenizerError:
+            return []
+
+    def _identifier_operand(self, sheet: SheetData, row: int, column: int) -> tuple[object, bool]:
+        if not (1 <= row <= len(sheet.frame) and 1 <= column <= len(sheet.frame.columns)):
+            return None, False
+        formula = sheet.formula_cells.get((row, column))
+        value = formula.cached_value if formula is not None else sheet.frame.iat[row - 1, column - 1]
+        known = ((formula is None or not strict_missing(formula.cached_value))
+                 and (row, column) not in sheet.error_positions)
+        return value, known
+
+    def _identifier_operand_values_match(self, left: object, right: object) -> bool:
+        if (isinstance(left, Number) and isinstance(right, Number)
+                and not isinstance(left, bool) and not isinstance(right, bool)
+                and not strict_missing(left) and not strict_missing(right)):
+            return bool(left == right)
+        return self._value_key(left) == self._value_key(right)
+
+    def _record_has_other_data(self, sheet: SheetData, row: int, column: int) -> bool:
+        return (any(not is_empty(value) for index, value in enumerate(sheet.frame.iloc[row - 1]) if index != column)
+                or any(formula_row == row and formula_column != column + 1
+                       for formula_row, formula_column in sheet.formula_cells))
+
+    def _is_record_identifier_column(self, sheet: SheetData, column: int, header: object) -> bool:
+        if not self._is_identifier_header(header):
+            return False
+        formulas = [(row, formula.expression) for (row, original_column), formula in sheet.formula_cells.items()
+                    if original_column == column + 1]
+        if not formulas:
+            return False
+        matching_records = 0
+        for row, expression in formulas:
+            construction, referenced_rows, external, aggregate = self._identifier_expression(expression)
+            if aggregate:
+                return False
+            matching_records += (construction and referenced_rows == {row} and not external
+                                 and self._record_has_other_data(sheet, row, column))
+        return matching_records >= len(formulas) * 0.6
+
+    def _record_identity_findings(
+        self, sheets: list[SheetData], policies: PreparationPolicies, executions: list[SheetExecution],
+    ) -> list[TabularFinding]:
+        """Separa anomalías de identificadores del rol de su columna, sin reconstruirlos."""
+        sources = {sheet.name: sheet for sheet in sheets}
+        findings, seen = [], set()
+        for policy in policies.observation_rows:
+            sheet = sources.get(policy.sheet_name)
+            if sheet is None or not headers_match(sheet, policy.header_row, policy.expected_headers):
+                continue
+            for column in policy.auxiliary_column_indices:
+                if not self._is_record_identifier_column(sheet, column - 1, policy.expected_headers[column]):
+                    continue
+                for (row, formula_column), formula in sheet.formula_cells.items():
+                    if formula_column != column or row <= policy.header_row:
+                        continue
+                    construction, referenced_rows, external, _ = self._identifier_expression(formula.expression)
+                    if (not construction or (not external and (not referenced_rows or referenced_rows == {row}))
+                            or not self._record_has_other_data(sheet, row, column - 1)
+                            or (sheet.name, row, column) in seen):
+                        continue
+                    seen.add((sheet.name, row, column))
+                    cell = f"{get_column_letter(column)}{row}"
+                    comparisons, requires_review = [], external
+                    for token in self._identifier_reference_tokens(formula.expression):
+                        reference = re.fullmatch(r"\$?([A-Za-z]{1,3})\$?([0-9]+)", token)
+                        if reference is None:
+                            requires_review = True
+                            comparisons.append(f"referencia {token!r} sin comparación inequívoca")
+                            continue
+                        operand_column = column_index_from_string(reference.group(1))
+                        operand_row = int(reference.group(2))
+                        if operand_row == row:
+                            continue
+                        referenced, referenced_known = self._identifier_operand(sheet, operand_row, operand_column)
+                        own, own_known = self._identifier_operand(sheet, row, operand_column)
+                        equivalent = (referenced_known and own_known
+                                      and self._identifier_operand_values_match(referenced, own))
+                        requires_review |= not equivalent
+                        own_cell = f"{get_column_letter(operand_column)}{row}"
+                        comparisons.append(
+                            f"{token}={trace_value(referenced)!r} frente a {own_cell}={trace_value(own)!r} "
+                            f"({'igualdad comprobada' if equivalent else 'valores distintos' if referenced_known and own_known else 'evidencia o caché insuficiente'})"
+                        )
+                    findings.append(TabularFinding(
+                        code="record_identifier_cross_row_reference", sheet_name=sheet.name, cell=cell,
+                        message=(f"El identificador corroborado contiene referencias externas a su fila: {'; '.join(comparisons)}; "
+                                 f"se conservan la fórmula original {formula.expression!r} y su valor almacenado "
+                                 f"{trace_value(formula.cached_value)!r}. Control {policy.rule_id}, versión {policy.version}."),
+                        requires_review=requires_review,
+                    ))
+                    for execution in executions:
+                        if (execution.sheet_name == sheet.name
+                                and execution.data_start_row <= row <= execution.data_end_row
+                                and execution.data_start_column <= column <= execution.data_end_column
+                                and cell not in {item.cell for item in execution.formula_sample}):
+                            execution.formula_sample.append(FormulaSample(
+                                cell=cell, formula=formula.expression, cached_value=trace_value(formula.cached_value),
+                                cache_available=not strict_missing(formula.cached_value),
+                            ))
+        return findings
 
     def _region(
         self, sheet: SheetData, occupied: np.ndarray,
@@ -708,7 +894,12 @@ class PandasTabularProcessor:
             errors.append("Los encabezados deben preceder al rango de datos del bloque.")
         return errors
 
-    def _execute_sheet(self, sheet: SheetData, recipe: SheetRecipe) -> SheetExecution:
+    def _execute_sheet(
+        self, sheet: SheetData, recipe: SheetRecipe, *,
+        policies: PreparationPolicies | None = None, source_sha256: str | None = None,
+        normalizations: list | None = None, auxiliary_rows: list | None = None,
+        temporal_dates: list | None = None,
+    ) -> SheetExecution:
         rows, columns = sheet.frame.shape
         end_row = recipe.data_end_row
         end_column = recipe.data_end_column
@@ -779,7 +970,7 @@ class PandasTabularProcessor:
         ]
         result.error_cell_count = len(error_positions)
         result.error_cells = [f"{get_column_letter(column)}{row}" for row, column in error_positions[:100]]
-        if missing_formulas:
+        if missing_formulas and policies is None:
             result.warnings.append(
                 f"Hay {len(missing_formulas)} fórmulas sin valor almacenado en el bloque; "
                 "se conserva su expresión original sin recalcularla."
@@ -819,15 +1010,64 @@ class PandasTabularProcessor:
                        f"{get_column_letter(end_column)}{end_row}"),
                 message="El bloque se conserva sin transformaciones y requiere resolver su rol.",
             ))
+        if policies is not None:
+            frame, applied, omitted, preparation_findings = prepare_frame(
+                sheet, recipe, frame, policies, source_sha256 or "",
+            )
+            if normalizations is not None:
+                normalizations.extend(applied)
+            if auxiliary_rows is not None:
+                auxiliary_rows.extend(omitted)
+            result.auxiliary_rows_removed = sum(item.removed_from_observations for item in omitted)
+            result.findings.extend(preparation_findings)
+            auxiliary_row_numbers = {item.row_number for item in omitted}
+            missing_formulas = [
+                f"{get_column_letter(column)}{row}" for (row, column), formula in selected_formulas.items()
+                if row - 1 in frame.index and row not in auxiliary_row_numbers and formula.cached_value is None
+            ]
+            result.unresolved_formula_count = len(missing_formulas)
+            result.unresolved_formula_cells = missing_formulas[:100]
+            if missing_formulas:
+                result.warnings.append(
+                    f"Hay {len(missing_formulas)} fórmulas sin valor almacenado en el bloque; "
+                    "se conserva su expresión original sin recalcularla."
+                )
         for transformation in recipe.transformations:
             try:
+                effective_transformation = transformation
+                if policies is not None and isinstance(transformation, ConvertType) and transformation.target_type == "datetime":
+                    protected = {
+                        column for policy in policies.number_columns
+                        if policy.sheet_name == sheet.name
+                        and headers_match(sheet, policy.header_row, policy.expected_headers)
+                        for column in policy.column_indices
+                    }
+                    denied = [name for name in transformation.columns if column_positions.get(name) in protected]
+                    for name in denied:
+                        letter = get_column_letter(column_positions[name])
+                        result.findings.append(TabularFinding(
+                            code="rule_policy_type_conflict", sheet_name=sheet.name, block_id=recipe.block_id,
+                            range=f"{letter}{recipe.data_start_row}:{letter}{recipe.data_end_row}",
+                            message=f"No se aplica la conversión a fecha de {name}: la política corroborada define esta columna como abundancia numérica.",
+                        ))
+                    allowed = [name for name in transformation.columns if name not in denied]
+                    if not allowed:
+                        continue
+                    effective_transformation = transformation.model_copy(update={"columns": allowed})
                 frame = self._transform(
-                    frame, transformation, result, formula_positions, column_positions,
+                    frame, effective_transformation, result, formula_positions, column_positions,
                 )
             except (ValueError, TypeError, OverflowError) as error:
                 result.errors.append(str(error))
                 break
         result.rows_after = len(frame)
+        if policies is not None:
+            selected_dates, temporal_findings = select_temporal_dates(
+                sheet, recipe, policies, [int(index) + 1 for index in frame.index],
+            )
+            if temporal_dates is not None:
+                temporal_dates.extend(selected_dates)
+            result.findings.extend(temporal_findings)
         result.columns_after = list(frame.columns)
         result.empty_columns = [
             name for name in frame.columns

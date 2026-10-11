@@ -8,7 +8,10 @@
     },
     "researcher_notes": {
       "document": "Respuestas Consultas Agua Anotaciones-1.pdf",
-      "pages": [1, 2],
+      "pages": [
+        1,
+        2
+      ],
       "verification": "verified_document",
       "sha256": "793085ddabc8f49aa6a27bee65883f0edf40d4f00b8bc54254db06ce48b73bc0"
     },
@@ -18,6 +21,32 @@
       "date": "2026-10-11",
       "source_reference": "Aclaración del usuario en la conversación de AquAI del 2026-10-11",
       "statement": "El usuario confirmó que las muestras cuestionadas en la anotación son distintas. La anotación original se conserva como antecedente histórico."
+    },
+    "belen_user_criteria_20261011": {
+      "verification": "user_request",
+      "date": "2026-10-11",
+      "source_reference": "Criterios del usuario para preparar la base bibliográfica de Belén en la conversación de AquAI del 2026-10-11"
+    },
+    "belen_user_confirmation_20261011": {
+      "verification": "user_confirmation",
+      "confirmed_by": "usuario",
+      "date": "2026-10-11",
+      "source_reference": "Aclaraciones del usuario para continuar Belén: fechas textuales argentinas, decimales, enlaces opcionales y filas auxiliares; solicitud del 2026-10-11",
+      "statement": "Los textos de fecha se interpretan como día/mes/año. El valor mostrado como 2.5 es decimal 2,5; los enlaces ausentes son opcionales y las filas sólo con identificación auxiliar sin resultados no son observaciones. No invertir fechas nativas ni reconstruir otras fechas como decimales."
+    },
+    "belen_workbook_structure_20261011": {
+      "verification": "full_sheet_values_and_formulas",
+      "date": "2026-10-11",
+      "document": "BaseCiano_PARA BELEN_5MAR2024 (2).XLSX",
+      "sha256": "5bbf70623f4cbc0e2e8d82c22ab097c0144f1a3d39e1182c64b622829ee0bd2f",
+      "source_reference": "Inspección completa del Excel original; evidencia separada conservada en la evaluación controlada"
+    },
+    "belen_temporal_priority_user_20261011": {
+      "verification": "user_confirmation",
+      "confirmed_by": "usuario",
+      "date": "2026-10-11",
+      "source_reference": "Política de prioridad temporal definida por el usuario en la conversación de AquAI del 2026-10-11",
+      "statement": "Código Fecha DDMMAAAA completo y válido como referencia principal; Fecha explícita como respaldo; Mes y Año sólo contrastan. Se conserva toda la evidencia original. Las discrepancias cubiertas se resuelven operativamente por esta política, sin certificar la verdad científica del código ni modificar identificadores o enlaces."
     }
   },
   "file_specific_rules": [
@@ -36,6 +65,120 @@
           "statement": "El usuario confirmó que los registros de muestreo cuestionados en esta anotación corresponden a muestras distintas: conservarlos como observaciones independientes; los números de campaña corresponden a períodos diferentes según las leyendas y el PDF de anotaciones. Esta independencia se refiere sólo a los registros cuestionados y no a copias coincidentes entre hojas. Conservar períodos, anotación y localidades; la anotación y la coincidencia de localidad no requieren revisión por sí solas ni autorizan deduplicar.",
           "confirmed_by": "usuario",
           "source_reference": "Aclaración del usuario en la conversación de AquAI del 2026-10-11"
+        }
+      ]
+    },
+    {
+      "id": "belen_confirmed_abundance_decimal",
+      "version": "1.0.0",
+      "profile": "belen_cyanobacteria",
+      "file_name": "BaseCiano_PARA BELEN_5MAR2024 (2).XLSX",
+      "sha256": "5bbf70623f4cbc0e2e8d82c22ab097c0144f1a3d39e1182c64b622829ee0bd2f",
+      "origin": "belen_user_confirmation_20261011",
+      "text": "El usuario confirmó que el valor mostrado como 2.5 es decimal 2,5. La revisión identifica inequívocamente BASE CIANO!AA591: fecha nativa 2023-05-02, serial Excel 45048 y formato d\\.m que muestra 2.5, en individuos/mL. Preparar exclusivamente esa celda como 2.5, conservando fecha, serial, formato, coordenada y aclaración originales; no inferir decimales a partir de otras fechas. Esta confirmación no resuelve contradicciones de fechas de muestreo.",
+      "preparation_policies": {
+        "confirmed_cells": [
+          {
+            "sheet_name": "BASE CIANO",
+            "cell": "AA591",
+            "source_sha256": "5bbf70623f4cbc0e2e8d82c22ab097c0144f1a3d39e1182c64b622829ee0bd2f",
+            "expected_source_value": "2023-05-02T00:00:00",
+            "expected_number_format": "d\\.m",
+            "expected_source_kind": "native_datetime",
+            "expected_raw_value": "45048",
+            "expected_header": "Abundancia absoluta (ind/ml)",
+            "header_row": 1,
+            "prepared_value": 2.5
+          }
+        ]
+      }
+    },
+    {
+      "id": "belen_verified_structural_limits",
+      "version": "1.0.0",
+      "profile": "belen_cyanobacteria",
+      "file_name": "BaseCiano_PARA BELEN_5MAR2024 (2).XLSX",
+      "sha256": "5bbf70623f4cbc0e2e8d82c22ab097c0144f1a3d39e1182c64b622829ee0bd2f",
+      "origin": "belen_workbook_structure_20261011",
+      "text": "La inspección completa del archivo revisado documenta límites y funciones, corroborados por sus valores y fórmulas. Usar esta evidencia específica para contrastar las regiones candidatas; no copiar dimensiones de otra hoja ni tomar el formato vacío como datos. En BASE CIANO las columnas A:AD pertenecen a cada registro, incluido id A; AE y AG son entradas auxiliares para fórmulas de enlace AB, no nuevas observaciones. Conservar esas entradas por separado como legend con header_rows vacío, sin heredar encabezados de A:AD. REFERENCIAS contiene tres contenidos documentales distintos con sus títulos propios, todos dentro de A:H. Separarlos en rectángulos disjuntos y utilizar exclusivamente sus encabezados propios; A1 no encabeza Usos del agua ni la guía OMS. No convertir sus umbrales históricos en abundancias medidas. Esta regla aporta evidencia a la propuesta: no repara ni reemplaza automáticamente la receta original, y no cambia los controles de cobertura, límites o duplicación.",
+      "documented_structure": [
+        {
+          "sheet_name": "BASE CIANO",
+          "physical_columns": 34,
+          "record_columns": [
+            1,
+            30
+          ],
+          "record_rows": [
+            2,
+            2228
+          ],
+          "record_header_rows": [
+            1
+          ],
+          "identity_column": 1,
+          "auxiliary_input_columns": {
+            "31": "código de sitio para enlace",
+            "33": "código de fecha para enlace"
+          },
+          "auxiliary_occupied_row_intervals": [
+            [
+              83,
+              83
+            ],
+            [
+              203,
+              206
+            ]
+          ],
+          "auxiliary_role": "legend"
+        },
+        {
+          "sheet_name": "BASE FQ",
+          "physical_columns": 46,
+          "record_rows": [
+            2,
+            95
+          ],
+          "record_header_rows": [
+            1
+          ],
+          "auxiliary_id_only_rows": [
+            96,
+            99
+          ],
+          "auxiliary_role": "legend",
+          "note": "Las cuatro fórmulas sin caché se conservan como evidencia auxiliar; el sistema aplica el tratamiento comprobado."
+        },
+        {
+          "sheet_name": "REFERENCIAS",
+          "physical_columns": 26,
+          "documentary_contents": [
+            {
+              "meaning": "categorías de abundancia relativa",
+              "content_range": "A3:B8",
+              "header_rows": [
+                1
+              ],
+              "role": "legend"
+            },
+            {
+              "meaning": "guía histórica de niveles OMS",
+              "content_range": "D2:H7",
+              "header_rows": [
+                1
+              ],
+              "role": "legend"
+            },
+            {
+              "meaning": "usos del agua",
+              "content_range": "A12:A14",
+              "header_rows": [
+                10
+              ],
+              "role": "legend"
+            }
+          ]
         }
       ]
     }
@@ -75,8 +218,15 @@
   "profiles": {
     "biological_counts": {
       "name": "Recuentos biológicos",
-      "file_names": ["datos biologicos tesis.xlsx"],
-      "required_sheets": ["Recuentos", "Cianobacterias", "Hoja3", "Hoja1"],
+      "file_names": [
+        "datos biologicos tesis.xlsx"
+      ],
+      "required_sheets": [
+        "Recuentos",
+        "Cianobacterias",
+        "Hoja3",
+        "Hoja1"
+      ],
       "rules": [
         {
           "id": "biological_sheet_roles",
@@ -102,7 +252,9 @@
     },
     "self_sampling": {
       "name": "Muestreos propios y Río de la Plata",
-      "file_names": ["Tabla completa ciano RdlP.xlsx"],
+      "file_names": [
+        "Tabla completa ciano RdlP.xlsx"
+      ],
       "required_sheets": [],
       "rules": [
         {
@@ -124,8 +276,13 @@
     },
     "belen_cyanobacteria": {
       "name": "Base bibliográfica de Belén",
-      "file_names": ["BaseCiano_PARA BELEN_5MAR2024 (2).xlsx"],
-      "required_sheets": ["BASE CIANO", "BASE FQ"],
+      "file_names": [
+        "BaseCiano_PARA BELEN_5MAR2024 (2).xlsx"
+      ],
+      "required_sheets": [
+        "BASE CIANO",
+        "BASE FQ"
+      ],
       "rules": [
         {
           "id": "belen_abundance_modalities",
@@ -141,12 +298,199 @@
           "id": "belen_subset_totals",
           "origin": "researcher_notes",
           "text": "BASE CIANO puede contener un subconjunto taxonómico de BASE FQ. Sus cantidades no tienen por qué coincidir; verificar cobertura y magnitud antes de interpretar diferencias como errores."
+        },
+        {
+          "id": "belen_documentary_sheets",
+          "version": "1.1.0",
+          "origin": "belen_user_criteria_20261011",
+          "text": "REFERENCIAS contiene documentación y diccionarios, no observaciones. Conservar todas sus regiones, encabezados, categorías y notas en bloques legend (header sólo si son únicamente encabezados). Los bloques deben ser disjuntos: no incluir dos veces una columna dentro de un rectángulo ya representado. Usar los límites de contenido comprobados por la inspección, no las dimensiones de formato.",
+          "sheet_role_requirements": [
+            {
+              "sheet_name": "REFERENCIAS",
+              "allowed_roles": [
+                "legend",
+                "header"
+              ]
+            }
+          ]
+        },
+        {
+          "id": "belen_taxonomic_fields",
+          "version": "1.1.0",
+          "origin": "belen_user_criteria_20261011",
+          "text": "Conservar el taxón citado en el informe y el nombre del taxón según AlgaeBase como campos distintos. No corregir, fusionar ni sustituir automáticamente sus nombres. Conservar también los campos bibliográficos y auxiliares presentes, incluidas las entradas utilizadas por fórmulas de identificadores, con sus encabezados y procedencia; no eliminarlos por carecer de abundancia absoluta. Los identificadores calculados pertenecen al mismo registro: incluir id con sus datos observacionales; una fórmula de construcción de id no convierte esa columna en un bloque de resultados derived independiente. Las entradas auxiliares de esas fórmulas se conservan con su procedencia."
+        },
+        {
+          "id": "belen_argentine_textual_dates",
+          "version": "1.1.0",
+          "origin": "belen_temporal_priority_user_20261011",
+          "text": "Prioridad temporal definida por el usuario: elegir Código fecha/Fecha sólo si es una fecha completa y válida DDMMAAAA, conservando su representación y ceros iniciales. Un código MMYYYY es parcial y no puede elegir una fecha completa ni aportar un día. Si el código falta o es inválido, utilizar Fecha con formatos DMY explícitos o respetando sus valores nativos e ISO, sin inversiones. Mes y Año son contrastes: nunca sustituyen la fecha elegida. El sistema produce una fecha normalizada separada con su campo/celda de origen, valores originales, regla y discrepancias. Las diferencias cubiertas se mantienen como advertencias resueltas por política del usuario; no certifican que el código sea científicamente verdadero. Si ningún candidato proporciona una fecha válida o siguen incompatibilidades entre fechas elegidas de registros asociados, se mantiene revisión. No reconstruir ni modificar IDs, fórmulas o enlaces derivados de fechas. El sistema ejecuta esta política; la LLM no aplica correcciones ni conversiones, transformations vacío.",
+          "preparation_policies": {
+            "date_columns": [
+              {
+                "sheet_name": "BASE CIANO",
+                "column_indices": [
+                  18
+                ],
+                "expected_headers": {
+                  "18": "Fecha",
+                  "19": "Mes",
+                  "20": "Año",
+                  "21": "Código fecha"
+                },
+                "header_row": 1,
+                "text_formats": [
+                  "%d-%m-%Y",
+                  "%d/%m/%Y",
+                  "%d.%m.%Y",
+                  "%Y-%m-%d"
+                ],
+                "related_date_columns": {
+                  "month": 19,
+                  "year": 20,
+                  "date_code": 21
+                },
+                "related_date_code_formats": [
+                  "%d%m%Y",
+                  "%m%Y"
+                ],
+                "temporal_priority": "date_code_then_date"
+              },
+              {
+                "sheet_name": "BASE FQ",
+                "column_indices": [
+                  7
+                ],
+                "expected_headers": {
+                  "7": "Fecha",
+                  "8": "Mes",
+                  "9": "Año",
+                  "10": "Código Fecha"
+                },
+                "header_row": 1,
+                "text_formats": [
+                  "%d-%m-%Y",
+                  "%d/%m/%Y",
+                  "%d.%m.%Y",
+                  "%Y-%m-%d"
+                ],
+                "related_date_columns": {
+                  "month": 8,
+                  "year": 9,
+                  "date_code": 10
+                },
+                "related_date_code_formats": [
+                  "%d%m%Y",
+                  "%m%Y"
+                ],
+                "temporal_priority": "date_code_then_date"
+              }
+            ]
+          }
+        },
+        {
+          "id": "belen_abundance_decimals",
+          "version": "1.0.0",
+          "origin": "belen_user_confirmation_20261011",
+          "text": "En las columnas de abundancia absoluta documentadas, 2.5 y 2,5 son el mismo decimal. El sistema normaliza sólo textos numéricos inequívocos y registra valor original, preparado y regla. Conservar números nativos, ceros, categorías, nd/n.d y límites. Distinguir miles y decimales; no reemplazar signos globalmente ni convertir taxones, códigos o abundancia relativa. Una fecha nativa en abundancia sólo puede corregirse mediante una aclaración humana de celda concreta; conservar y localizar otros casos. No enviar abundancias al parser de fechas; transformations vacío.",
+          "preparation_policies": {
+            "number_columns": [
+              {
+                "sheet_name": "BASE CIANO",
+                "column_indices": [
+                  25,
+                  26,
+                  27
+                ],
+                "expected_headers": {
+                  "25": "Abundancia absoluta (colonias/ml)",
+                  "26": "Abundancia absoluta (cél/ml)",
+                  "27": "Abundancia absoluta (ind/ml)"
+                },
+                "header_row": 1,
+                "decimal_separators": [
+                  ",",
+                  "."
+                ]
+              },
+              {
+                "sheet_name": "BASE FQ",
+                "column_indices": [
+                  12
+                ],
+                "expected_headers": {
+                  "12": "Recuento total de cianobacterias potencialmente tóxicas (cél/mL)"
+                },
+                "header_row": 1,
+                "decimal_separators": [
+                  ",",
+                  "."
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "belen_optional_measurement_associations",
+          "version": "1.0.0",
+          "origin": "belen_user_confirmation_20261011",
+          "text": "El enlace ID Datos Físicoquimicos/Recuento spp toxicas de BASE CIANO apunta a id de BASE FQ. Las asociaciones son opcionales: registrar sin revisión automática las que no tengan destino y omitir sólo la asociación, conservando el registro y su identificador. No usar ambos id, inner join, deduplicación por id ni asociaciones que multipliquen registros. Destinos ambiguos se omiten y localizan. Las tablas se conservan separadas; el sistema produce diagnósticos de correspondencia.",
+          "preparation_policies": {
+            "associations": [
+              {
+                "source_sheet": "BASE CIANO",
+                "source_column": 28,
+                "expected_source_header": "ID Datos Físicoquimicos/Recuento spp toxicas",
+                "target_sheet": "BASE FQ",
+                "target_column": 1,
+                "expected_target_header": "id",
+                "source_start_row": 2,
+                "target_start_row": 2,
+                "header_row": 1,
+                "optional": true
+              }
+            ]
+          }
+        },
+        {
+          "id": "belen_auxiliary_rows_without_results",
+          "version": "1.0.0",
+          "origin": "belen_user_confirmation_20261011",
+          "text": "Omitir de tablas observacionales sólo filas comprobadas sin resultados ni datos de observación cuyo único contenido sea una fórmula auxiliar id sin caché; conservar su fórmula y ubicación como evidencia auxiliar separada. No crear un muestreo por esa fórmula ni declarar vacía la hoja. Ceros, categorías, nd/n.d, límites y otra modalidad de abundancia son datos, y la ausencia de células/mL no autoriza eliminar el registro. Conservar además documentación, referencias y notas. Representar el contenido auxiliar con rol derived/legend coherente, separado de observaciones; la cobertura debe conservar su evidencia. El sistema determina las filas, no la LLM.",
+          "preparation_policies": {
+            "observation_rows": [
+              {
+                "sheet_name": "BASE CIANO",
+                "auxiliary_column_indices": [
+                  1
+                ],
+                "expected_headers": {
+                  "1": "id"
+                },
+                "header_row": 1,
+                "require_all_other_cells_empty": true
+              },
+              {
+                "sheet_name": "BASE FQ",
+                "auxiliary_column_indices": [
+                  1
+                ],
+                "expected_headers": {
+                  "1": "id"
+                },
+                "header_row": 1,
+                "require_all_other_cells_empty": true
+              }
+            ]
+          }
         }
       ]
     },
     "cyanobacterial_alerts": {
       "name": "CSV de niveles de alerta",
-      "file_names": ["Cyanobacterial_Alert_Levels.csv"],
+      "file_names": [
+        "Cyanobacterial_Alert_Levels.csv"
+      ],
       "required_sheets": [],
       "rules": [
         {
