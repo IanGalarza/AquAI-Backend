@@ -1,0 +1,138 @@
+{
+  "version": "1.0.0",
+  "sources": {
+    "corrected_guidance": {
+      "document": "AquAI_Reglas_y_Ajustes_Tabulares_Corregido.md",
+      "section": "2. Incorporación de reglas",
+      "verification": "provided_document"
+    },
+    "researcher_notes": {
+      "document": "Respuestas Consultas Agua Anotaciones-1.pdf",
+      "pages": [1, 2],
+      "verification": "verified_document",
+      "sha256": "793085ddabc8f49aa6a27bee65883f0edf40d4f00b8bc54254db06ce48b73bc0"
+    }
+  },
+  "common": [
+    {
+      "id": "preserve_original_values",
+      "origin": "corrected_guidance",
+      "text": "Conservar ceros, valores originales y precisión. No convertir nd, n.d, guiones, categorías ni límites como <0,001 a cero o a nulo ni atribuirles un significado no documentado. Una conversión fallida conserva su valor original y requiere revisión."
+    },
+    {
+      "id": "separate_structural_roles",
+      "origin": "corrected_guidance",
+      "text": "Separar observaciones, totales, encabezados repetidos, leyendas, resúmenes y cálculos derivados en bloques con coordenadas y rol. Todos los bloques con información deben quedar representados; separarlos no autoriza su eliminación."
+    },
+    {
+      "id": "preserve_identifiers_and_periods",
+      "origin": "corrected_guidance",
+      "text": "Conservar nombres taxonómicos, códigos y procedencia. No expandir abreviaturas, corregir taxones, deduplicar por parecido, convertir unidades ni interpretar fechas ambiguas. Conservar períodos sin inventar días exactos."
+    },
+    {
+      "id": "preserve_formula_provenance",
+      "origin": "corrected_guidance",
+      "text": "No recalcular fórmulas mediante la LLM. Conservar coordenada, fórmula y valor almacenado disponible; informar valores almacenados ausentes y errores."
+    },
+    {
+      "id": "analysis_filters_are_not_ingestion_rules",
+      "origin": "researcher_notes",
+      "text": "Los filtros Microcystis o Microcystaceae corresponden a análisis concretos. No eliminar otros taxones durante la carga ni aplicar automáticamente esos filtros a todos los archivos."
+    },
+    {
+      "id": "verify_taxonomic_coverage",
+      "origin": "corrected_guidance",
+      "text": "No forzar igualdad entre totales y subconjuntos taxonómicos. Comprobar cobertura y magnitud antes de compararlos; marcar las contradicciones o decisiones necesarias sin resolver como review_required."
+    }
+  ],
+  "profiles": {
+    "biological_counts": {
+      "name": "Recuentos biológicos",
+      "file_names": ["datos biologicos tesis.xlsx"],
+      "required_sheets": ["Recuentos", "Cianobacterias", "Hoja3", "Hoja1"],
+      "rules": [
+        {
+          "id": "biological_sheet_roles",
+          "origin": "corrected_guidance",
+          "text": "Si el archivo y las hojas coinciden con la inspección, distinguir en Recuentos los taxones por muestras de totales y leyendas. Hoja1 es candidata a resumen de presencias: verificar sus encabezados y valores antes de clasificarla. No mezclar presencia, porcentaje y abundancia."
+        },
+        {
+          "id": "biological_subset_overlap",
+          "origin": "corrected_guidance",
+          "text": "Cianobacterias puede repetir un subconjunto de Recuentos. Conservar ambas procedencias y comprobar coordenadas y valores antes de anexar, deduplicar o sumar; no contar dos veces observaciones coincidentes."
+        },
+        {
+          "id": "biological_shared_and_derived_regions",
+          "origin": "corrected_guidance",
+          "text": "Hoja3 puede combinar muestras compartidas, adicionales y derivados. Separar las regiones que confirme la inspección y conservarlas; no descartar la hoja completa ni tratar todas sus columnas como una sola magnitud."
+        },
+        {
+          "id": "biological_merged_cells_evidence",
+          "origin": "corrected_guidance",
+          "text": "Usar exclusivamente los rangos combinados observados en la inspección actual. La mención previa de celdas combinadas en Hoja3 no autoriza asumir que existen ni rellenar celdas sin coordenadas verificadas."
+        }
+      ]
+    },
+    "self_sampling": {
+      "name": "Muestreos propios y Río de la Plata",
+      "file_names": ["Tabla completa ciano RdlP.xlsx"],
+      "required_sheets": [],
+      "rules": [
+        {
+          "id": "sampling_campaign_periods",
+          "origin": "researcher_notes",
+          "text": "Los números iniciales pueden identificar campañas o períodos: usar la leyenda del libro recibido. Para Tabla completa ciano RdlP, las notas documentan 1 = noviembre de 2005 y 2 = marzo-abril de 2006; aplicar esa relación sólo si la inspección confirma familia y leyenda, conservando el período sin inventar una fecha exacta. No usar un diccionario universal."
+        },
+        {
+          "id": "sampling_count_units",
+          "origin": "researcher_notes",
+          "text": "Las notas indican células/mL para los recuentos de cianobacterias tomados por los investigadores. Verificar que corresponda al archivo y al bloque actual; no extender esa unidad a datos físicoquímicos ni a otras magnitudes."
+        },
+        {
+          "id": "sampling_workbook_overlap",
+          "origin": "corrected_guidance",
+          "text": "En Tabla completa ciano RdlP comprobar el solapamiento entre tabla datos y Datos ordenados por fecha antes de anexar registros. Conservar procedencia y diferencias; no deduplicar por semejanza de nombres."
+        }
+      ]
+    },
+    "belen_cyanobacteria": {
+      "name": "Base bibliográfica de Belén",
+      "file_names": ["BaseCiano_PARA BELEN_5MAR2024 (2).xlsx"],
+      "required_sheets": ["BASE CIANO", "BASE FQ"],
+      "rules": [
+        {
+          "id": "belen_abundance_modalities",
+          "origin": "researcher_notes",
+          "text": "Conservar bibliografía y procedencia. Mantener separadas abundancia relativa, células/mL, colonias/mL e individuos/mL. Para el análisis de abundancia absoluta indicado por las notas usar sólo células/mL; conservar las otras modalidades sin convertirlas ni tratarlas como equivalentes. Las categorías relativas no definen conversiones numéricas."
+        },
+        {
+          "id": "belen_physicochemical_link",
+          "origin": "corrected_guidance",
+          "text": "La revisión propone enlazar ID Datos Físicoquimicos/Recuento spp toxicas de BASE CIANO con id de BASE FQ, no ambos campos id. Verificar que existan esas columnas, sus correspondencias y claves repetidas antes de cualquier enlace; no realizar joins automáticos durante esta preparación."
+        },
+        {
+          "id": "belen_subset_totals",
+          "origin": "researcher_notes",
+          "text": "BASE CIANO puede contener un subconjunto taxonómico de BASE FQ. Sus cantidades no tienen por qué coincidir; verificar cobertura y magnitud antes de interpretar diferencias como errores."
+        }
+      ]
+    },
+    "cyanobacterial_alerts": {
+      "name": "CSV de niveles de alerta",
+      "file_names": ["Cyanobacterial_Alert_Levels.csv"],
+      "required_sheets": [],
+      "rules": [
+        {
+          "id": "alert_values_and_labels",
+          "origin": "corrected_guidance",
+          "text": "Conservar columnas y valores originales del CSV. No interpretar alert_class como seguro o peligroso sin documentación del significado de sus categorías."
+        },
+        {
+          "id": "alert_sample_identity",
+          "origin": "corrected_guidance",
+          "text": "No vincular sample_id automáticamente con los Excel ni asumir un sistema de identificación compartido. Un enlace requiere evidencia documental y correspondencias verificadas."
+        }
+      ]
+    }
+  }
+}

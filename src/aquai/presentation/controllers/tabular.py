@@ -19,13 +19,17 @@ async def evaluate_tabular_file(
     settings: Annotated[TabularSettings, Depends(get_tabular_settings)],
     model: Annotated[str | None, Query(min_length=1, max_length=200)] = None,
     known_rules: Annotated[str | None, Form(max_length=4000)] = None,
+    rule_profile: Annotated[str | None, Form(max_length=80, description=(
+        "Perfil opcional: biological_counts, self_sampling, belen_cyanobacteria "
+        "o cyanobacterial_alerts. Las reglas comunes siempre se aplican."
+    ))] = None,
 ) -> TabularEvaluationResponse:
     try:
         content = await file.read(settings.max_upload_bytes + 1)
         if len(content) > settings.max_upload_bytes:
             raise FileTooLargeError("El archivo supera el tamaño máximo permitido.")
         result = await evaluator.execute(
-            file.filename, content, model=model, known_rules=known_rules
+            file.filename, content, model=model, known_rules=known_rules, rule_profile=rule_profile
         )
         return TabularEvaluationResponse.model_validate(result.model_dump())
     except FileTooLargeError as exc:

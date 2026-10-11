@@ -26,7 +26,8 @@ class EvaluateTabularFileTests(unittest.IsolatedAsyncioTestCase):
             )],
         )
         self.execution = ExecutionResult(sheets=[SheetExecution(
-            sheet_name="data", source_rows=2, source_columns=1,
+            sheet_name="data", block_id="observations", source_rows=2, source_columns=1,
+            data_start_row=2, data_end_row=2, data_start_column=1, data_end_column=1,
             rows_before=1, rows_after=1, columns_before=["a"], columns_after=["a"],
         )])
         self.processor = Mock()
@@ -63,8 +64,10 @@ class EvaluateTabularFileTests(unittest.IsolatedAsyncioTestCase):
         self.processor.execute.assert_not_called()
 
     async def test_schema_failure_and_contract_failure_keep_distinct_metrics(self) -> None:
+        duplicate_blocks = recipe_document()
+        duplicate_blocks["sheets"] *= 2
         for document, expected_schema in (({"status": "ready"}, False),
-                                          ({**recipe_document(), "sheets": []}, True)):
+                                          (duplicate_blocks, True)):
             with self.subTest(document=document):
                 self.provider.generate_recipe.return_value = LLMResponse(
                     model="test-model", content=json.dumps(document),
@@ -84,6 +87,10 @@ class EvaluateTabularFileTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(status=status):
                 document = recipe_document()
                 document.update(status=status, sheets=[], requires_human_review=status == "review_required")
+                if status == "review_required":
+                    document["warnings"] = ["No se pudieron justificar los límites del archivo."]
+                else:
+                    document["warnings"] = ["No se encontró evidencia suficiente para una propuesta utilizable."]
                 self.provider.generate_recipe.return_value = LLMResponse(
                     model="test-model", content=json.dumps(document),
                 )
@@ -112,6 +119,16 @@ class EvaluateTabularFileTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(result.response_format.recipe_valid)
                 self.assertFalse(result.response_format.recipe_executable)
                 self.assertEqual(result.validation.status, EvaluationStatus.FAILED)
+
+    async def test_execution_must_match_block_ids_even_when_sheet_names_match(self) -> None:
+        document = recipe_document()
+        document["sheets"][0]["block_id"] = "observations"
+        self.provider.generate_recipe.return_value = LLMResponse(
+            model="test-model", content=json.dumps(document),
+        )
+        self.execution.sheets[0].block_id = "another-block"
+        result = await self.evaluate()
+        self.assertFalse(result.response_format.recipe_executable)
 
 
 if __name__ == "__main__":

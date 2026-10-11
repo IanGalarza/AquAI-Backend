@@ -13,7 +13,7 @@ class TabularSettings(BaseSettings):
 
     ollama_base_url: str = "http://localhost:11434"
     default_model: str = Field(default="qwen3.5:9b", min_length=1, max_length=200)
-    llm_timeout_seconds: float = Field(default=180, gt=0, allow_inf_nan=False)
+    llm_timeout_seconds: float = Field(default=600, gt=0, allow_inf_nan=False)
     llm_num_ctx: int = Field(default=16384, ge=1024)
     llm_think: bool = False
     max_upload_bytes: int = Field(default=10 * 1024 * 1024, gt=0)

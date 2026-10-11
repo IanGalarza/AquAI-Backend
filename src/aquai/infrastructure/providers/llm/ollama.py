@@ -41,7 +41,7 @@ class OllamaProvider:
                 {
                     "role": "user",
                     "content": json.dumps(
-                        {"structural_summary": summary.model_dump(mode="json"), "known_rules": known_rules},
+                        {"structural_summary": self._compact_summary(summary), "known_rules": known_rules},
                         ensure_ascii=False,
                         separators=(",", ":"),
                     ),
@@ -88,3 +88,18 @@ class OllamaProvider:
         metadata = {key: value for key, value in body.items() if key != "message"}
         metadata["message"] = {key: value for key, value in message.items() if key != "content"}
         return LLMResponse(model=returned_model, content=message["content"], metadata=metadata)
+
+    @staticmethod
+    def _compact_summary(summary: StructuralSummary) -> dict:
+        document = summary.model_dump(mode="json")
+        document["sheets"] = [
+            sheet.model_dump(mode="json", exclude_defaults=True) for sheet in summary.sheets
+        ]
+        for sheet in document["sheets"]:
+            for formula in sheet.get("formula_sample", []):
+                expression = formula["formula"]
+                if len(expression) > 200:
+                    formula["formula"] = expression[:200]
+                    formula["formula_characters"] = len(expression)
+                    formula["formula_is_preview"] = True
+        return document

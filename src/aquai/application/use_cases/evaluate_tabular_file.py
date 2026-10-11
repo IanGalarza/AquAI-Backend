@@ -1,9 +1,12 @@
 import asyncio
+import json
+from collections import Counter
 from time import perf_counter
 
 from aquai.application.dtos.tabular import (
     EvaluationMetrics,
     TabularEvaluation,
+    TabularFinding,
     ValidationResult,
 )
 from aquai.application.errors import FileTooLargeError, LLMProviderError, TabularInputError
@@ -13,6 +16,7 @@ from aquai.application.services.tabular_recipe import (
     parse_preparation_recipe_with_metrics,
 )
 from aquai.application.services.tabular_validation import TabularValidationService
+from aquai.application.services.tabular_rules import TabularRuleService
 from aquai.domain.enums.tabular import EvaluationStatus
 
 
@@ -25,12 +29,14 @@ class EvaluateTabularFile:
         default_model: str,
         max_upload_bytes: int,
         validator: TabularValidationService | None = None,
+        rule_service: TabularRuleService | None = None,
     ) -> None:
         self._processor = processor
         self._llm_provider = llm_provider
         self._default_model = default_model
         self._max_upload_bytes = max_upload_bytes
         self._validator = validator or TabularValidationService()
+        self._rule_service = rule_service
 
     async def execute(
         self,
@@ -39,6 +45,7 @@ class EvaluateTabularFile:
         *,
         model: str | None = None,
         known_rules: str | None = None,
+        rule_profile: str | None = None,
     ) -> TabularEvaluation:
         started = perf_counter()
         file_name = self._validate_file(file_name, content)
@@ -47,6 +54,10 @@ class EvaluateTabularFile:
             raise TabularInputError("El modelo debe tener entre 1 y 200 caracteres.")
         if known_rules is not None and len(known_rules) > 4000:
             raise TabularInputError("Las reglas conocidas no pueden superar 4000 caracteres.")
+        if self._rule_service is not None:
+            self._rule_service.validate_profile(rule_profile)
+        elif rule_profile is not None:
+            raise TabularInputError("No se configuró un catálogo para seleccionar perfiles de reglas.")
 
         metrics = EvaluationMetrics()
         stage_started = perf_counter()
@@ -59,10 +70,19 @@ class EvaluateTabularFile:
             metrics=metrics,
         )
 
+        rule_composition = None
+        prompt_rules = known_rules
+        if self._rule_service is not None:
+            rule_composition = self._rule_service.compose(summary, rule_profile, known_rules)
+            result.applied_rules = rule_composition.metadata
+            prompt_rules = json.dumps(
+                rule_composition.prompt_rules, ensure_ascii=False, separators=(",", ":")
+            )
+
         stage_started = perf_counter()
         try:
             result.llm_response = await self._llm_provider.generate_recipe(
-                summary, selected_model, known_rules
+                summary, selected_model, prompt_rules
             )
         except LLMProviderError as exc:
             result.validation.errors.append(str(exc))
@@ -80,6 +100,12 @@ class EvaluateTabularFile:
                 result.validation.errors.append(str(exc))
 
         if result.recipe is not None:
+            if self._rule_service is not None and rule_composition is not None:
+                recipe_findings = self._rule_service.validate_recipe(summary, result.recipe, rule_composition)
+                rule_composition.findings.extend(recipe_findings)
+                rule_composition.review_reasons.extend(
+                    finding["message"] for finding in recipe_findings if finding["requires_review"]
+                )
             if result.recipe.status != "failed":
                 stage_started = perf_counter()
                 result.execution = await asyncio.to_thread(
@@ -90,6 +116,19 @@ class EvaluateTabularFile:
             result.validation = self._validator.validate(summary, result.recipe, result.execution)
             metrics.validation_duration_ms = self._elapsed_ms(stage_started)
             result.response_format.recipe_executable = self._is_executable(result)
+
+        if rule_composition is not None:
+            result.validation.findings.extend(
+                TabularFinding.model_validate(finding) for finding in rule_composition.findings
+            )
+            result.validation.warnings = list(dict.fromkeys(
+                result.validation.warnings + rule_composition.review_reasons
+            ))
+            if (
+                rule_composition.review_reasons
+                and result.validation.status != EvaluationStatus.FAILED
+            ):
+                result.validation.status = EvaluationStatus.REVIEW_REQUIRED
 
         metrics.total_duration_ms = self._elapsed_ms(started)
         return result
@@ -113,11 +152,10 @@ class EvaluateTabularFile:
         recipe = result.recipe
         if recipe is None or recipe.status == "failed" or not recipe.sheets or result.validation.errors:
             return False
-        planned_names = {sheet.sheet_name for sheet in recipe.sheets}
-        executed_names = {sheet.sheet_name for sheet in result.execution.sheets}
+        planned_blocks = Counter((sheet.sheet_name, sheet.block_id) for sheet in recipe.sheets)
+        executed_blocks = Counter((sheet.sheet_name, sheet.block_id) for sheet in result.execution.sheets)
         return (
-            planned_names == executed_names
-            and len(recipe.sheets) == len(result.execution.sheets)
+            planned_blocks == executed_blocks
             and all(
                 sheet.rows_after > 0 and bool(sheet.columns_after) and not sheet.errors
                 for sheet in result.execution.sheets

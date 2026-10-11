@@ -217,6 +217,9 @@ La URL del proveedor y el modelo predeterminado se configuran con
 El modelo predeterminado es `qwen3.5:9b`, con contexto de 16384 tokens y
 `think=false`. El contexto y el pensamiento se configuran con
 `TABULAR_LLM_NUM_CTX` y `TABULAR_LLM_THINK`.
+El tiempo máximo de respuesta es 600 segundos, configurable mediante
+`TABULAR_LLM_TIMEOUT_SECONDS`; no hay reintentos ni cambios automáticos de modelo,
+contexto o pensamiento.
 El proyecto no descarga modelos automáticamente.
 
 ```powershell
@@ -227,6 +230,10 @@ La documentación interactiva está disponible en `http://localhost:8000/docs`.
 El campo multipart `file` es obligatorio. El parámetro de consulta `model`
 reemplaza el modelo configurado para esa evaluación. El campo multipart opcional
 `known_rules` permite agregar reglas de preparación (hasta 4000 caracteres).
+El campo multipart `rule_profile` selecciona explícitamente un perfil:
+`biological_counts`, `self_sampling`, `belen_cyanobacteria` o `cyanobacterial_alerts`.
+Sin perfil se usan únicamente las reglas comunes y las adicionales.
+Un perfil desconocido devuelve HTTP 400 antes de llamar al modelo.
 
 ```powershell
 curl.exe -X POST "http://localhost:8000/experimental/tabular/evaluate" -F "file=@D:/datos/recuentos.xlsx"
@@ -240,7 +247,9 @@ solicitud y conservá las respuestas del endpoint.
 
 1. Application valida nombre, extensión, contenido y tamaño del archivo.
 2. Infrastructure inspecciona el archivo con Pandas y OpenPyXL, sin una LLM.
-3. Ollama recibe un resumen estructural con muestras acotadas y el esquema JSON
+3. Application compone las reglas comunes, el perfil seleccionado y las reglas
+   adicionales. Su versión y procedencia se conservan en `applied_rules`.
+   Ollama recibe un resumen estructural con muestras acotadas y el esquema JSON
    de la receta. Se utiliza la API de chat con salida estructurada y temperatura 0.
 4. Application valida la receta con Pydantic. Tolera texto o bloques Markdown
    alrededor del objeto JSON y conserva la respuesta original sin modificarla.
@@ -252,7 +261,24 @@ Un valor entrecomillado con saltos de línea pertenece al mismo registro.
 Un CSV se representa como una hoja llamada `data`. Los encabezados no se eliminan
 durante la inspección. `header_rows` puede tener varias filas; sus valores se
 combinan con espacios. Sin encabezados se generan nombres `column_1`, `column_2`,
-etc. `data_start_row` y `data_end_row` (opcional, inclusivo) definen el rango de datos.
+etc. `data_start_row` y `data_end_row` definen el rango de datos original e inclusivo.
+Cada entrada de `sheets` representa un bloque. Una hoja puede aparecer varias
+veces con `block_id` distintos. `data_start_column` y `data_end_column` delimitan
+columnas originales, también desde 1 e inclusivas. `role` distingue
+`observations`, `total`, `legend`, `derived`, `summary`, `header` y `unknown`.
+Los nueve campos de cada bloque son obligatorios; los cuatro límites deben ser
+enteros positivos explícitos. `block_id` debe ser no vacío y único en toda la
+receta; `role` no tiene un valor predeterminado. Las respuestas antiguas con
+campos omitidos se rechazan antes de ejecutar, sin completar decisiones.
+Los bloques conservan los datos de los totales y las leyendas en tablas separadas;
+no implican descartarlos. Los rangos de datos no pueden solaparse, aunque varios
+bloques pueden compartir sus filas de encabezado.
+`ready` requiere bloques definidos, sin `unknown`, advertencias ni solicitud de
+revisión. `review_required` exige `requires_human_review=true` y una explicación.
+Puede conservar bloques `unknown` sin transformaciones o una propuesta parcial
+o vacía si no se pueden justificar los límites. Esa revisión no acredita una
+preparación completa. La cobertura y el formato válido tampoco acreditan por sí
+solos que los roles y las relaciones de los datos sean correctos.
 
 ```json
 {
@@ -260,8 +286,13 @@ etc. `data_start_row` y `data_end_row` (opcional, inclusivo) definen el rango de
   "sheets": [
     {
       "sheet_name": "data",
+      "block_id": "sample_counts",
+      "role": "observations",
       "header_rows": [1],
       "data_start_row": 2,
+      "data_end_row": 20,
+      "data_start_column": 1,
+      "data_end_column": 2,
       "transformations": [
         {"operation": "strip_strings"},
         {"operation": "convert_type", "columns": ["count"], "target_type": "integer"}
@@ -279,17 +310,29 @@ etc. `data_start_row` y `data_end_row` (opcional, inclusivo) definen el rango de
 | `drop_empty_columns` | Ninguno | Elimina columnas completamente vacías. |
 | `strip_strings` | `columns` opcional | Quita espacios al principio y al final de cadenas. |
 | `rename_columns` | `mapping` | Renombra columnas existentes. |
-| `convert_type` | `columns`, `target_type` | Convierte a `number`, `integer`, `datetime` o `boolean` y contabiliza fallos. |
+| `convert_type` | `columns`, `target_type` | Convierte a `number`, `integer`, `datetime` o `boolean`; conserva el original cuando falla y registra sus coordenadas. |
 
 Las columnas de cada operación se referencian por su nombre vigente después de
 las operaciones anteriores. Campos extra, operaciones desconocidas o instrucciones
 de ejecución de código se rechazan. Las fórmulas de Excel no se recalculan: se usan
 los valores guardados en el archivo; las fórmulas sin valor guardado requieren revisión.
+Se conservan las expresiones completas durante el procesamiento y se devuelven
+muestras con coordenada, expresión, valor cacheado y disponibilidad. Las conversiones
+que perderían precisión o ceros iniciales de códigos, y las fechas ambiguas o
+períodos, requieren revisión y conservan el valor original.
+
+Las reglas editables viven en `src/aquai/infrastructure/config/tabular_rules.json`.
+Application las compone mediante un catálogo inyectado; sólo recibe las reglas
+del perfil elegido. Las observaciones específicas son condicionales y se contrastan
+con el archivo recibido. Los conflictos explícitos de reglas adicionales requieren
+revisión; el modelo también debe declarar cualquier contradicción que identifique.
+El prompt general está en `src/aquai/application/agents/prompts/tabular.py` y
+el mensaje enviado a Ollama se construye en `src/aquai/infrastructure/providers/llm/ollama.py`.
 
 ### Resultado y Validación
 
 La respuesta incluye `model`, `structural_summary`, `recipe`, `llm_response`,
-`execution`, `validation` y `metrics`. `llm_response.content` conserva el texto
+`execution`, `validation`, `metrics` y `applied_rules`. `llm_response.content` conserva el texto
 original del modelo y `metadata` incluye las métricas devueltas por Ollama, como
 duraciones, conteos de tokens y razonamiento cuando el proveedor lo devuelve.
 Las duraciones del pipeline se expresan en milisegundos; las duraciones originales
@@ -299,8 +342,15 @@ El resumen incluye dimensiones físicas, muestras con números de fila, nombres
 iniciales, nulos, tipos inferidos, hojas, celdas combinadas, fórmulas y candidatos
 de encabezado. `column_indices` relaciona los metadatos y las muestras con las
 posiciones originales de las columnas, que empiezan en 1. En tablas anchas se
-incluyen las primeras 12 columnas y hasta 4 de las últimas columnas con contenido
-o fórmulas. Las dimensiones y los conteos totales se calculan sobre toda la hoja.
+seleccionan columnas representativas y se incluyen regiones con muestras de sus
+límites, centro y final. Las dimensiones y los conteos totales se calculan sobre
+toda la hoja. Los cambios de estructura, encabezados repetidos, totales y bandas
+derivadas se detectan con heurísticas genéricas; no establecen por sí solos una
+interpretación científica. Se omiten del mensaje metadatos con valores predeterminados
+redundantes, conservando coordenadas, regiones y conteos.
+Las fórmulas extensas se muestran al modelo como vistas previas explícitas
+(`formula_is_preview` y longitud original); la inspección y la ejecución conservan
+su expresión completa. Los textos acotados se informan con sus conteos y posiciones.
 
 La ejecución devuelve dimensiones antes/después, columnas finales, tipos,
 muestras procesadas, filas excluidas, filas vacías eliminadas, columnas vacías,
@@ -309,6 +359,11 @@ las filas del rango de datos elegido, después de separar los encabezados.
 `excluded_nonempty_rows` cuenta registros no vacíos excluidos por ese rango.
 Las celdas de error de Excel también se informan y requieren revisión. Las
 conversiones numéricas que perderían precisión se contabilizan como fallidas.
+`execution.coverage` comprueba la unión de bloques y encabezados contra las
+celdas originales no vacías, incluyendo fórmulas. La separación declarada no se
+confunde con pérdida. Las celdas sin tratamiento y los roles estructurales mezclados
+requieren revisión; los solapamientos invalidan la ejecución. `validation.findings`
+identifica el código del hallazgo, hoja, bloque, región, celda o rango disponible.
 
 La integración sigue el contrato oficial de [chat de Ollama](https://docs.ollama.com/api/chat)
 y de [salida estructurada](https://docs.ollama.com/capabilities/structured-outputs).

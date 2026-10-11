@@ -13,6 +13,24 @@ class SampleRow(BaseModel):
 class FormulaSample(BaseModel):
     cell: str
     formula: str
+    cached_value: JsonValue = None
+    cache_available: bool = False
+
+
+BlockRole = Literal["observations", "total", "legend", "derived", "summary", "header", "unknown"]
+
+
+class StructuralRegion(BaseModel):
+    region_id: str
+    start_row: int = Field(ge=1)
+    end_row: int = Field(ge=1)
+    start_column: int = Field(ge=1)
+    end_column: int = Field(ge=1)
+    kind: Literal["observations", "total", "legend", "derived", "summary", "header", "repeated_header", "unknown"]
+    reason: str
+    nonempty_cells: int = Field(default=0, ge=0)
+    sample: list[SampleRow] = Field(default_factory=list)
+    column_indices: list[int] = Field(default_factory=list)
 
 
 class SheetSummary(BaseModel):
@@ -26,6 +44,7 @@ class SheetSummary(BaseModel):
     column_indices: list[int] = Field(default_factory=list)
     merged_cells: list[str] = Field(default_factory=list)
     formula_count: int = 0
+    missing_formula_cache_count: int = Field(default=0, ge=0)
     formula_sample: list[FormulaSample] = Field(default_factory=list)
     error_cell_count: int = 0
     error_cells: list[str] = Field(default_factory=list)
@@ -34,6 +53,7 @@ class SheetSummary(BaseModel):
     empty_row_count: int = 0
     empty_column_count: int = 0
     possible_header_rows: list[int] = Field(default_factory=list)
+    regions: list[StructuralRegion] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
 
 
@@ -81,11 +101,91 @@ Transformation = Annotated[
 ]
 
 
+def _sheet_recipe_schema(schema: dict) -> None:
+    """Proyecta los roles en ramas explícitas para la gramática de generación."""
+    properties = schema["properties"]
+    roles = properties["role"]["enum"]
+    common = {key: schema[key] for key in ("type", "required", "additionalProperties")}
+    descriptions = [
+        f"{name}: {definition['description']}"
+        for name, definition in properties.items() if "description" in definition
+    ]
+    branches = []
+    for role in ("header", "unknown", None):
+        branch_properties = {name: dict(definition) for name, definition in properties.items()}
+        for definition in branch_properties.values():
+            definition.pop("description", None)
+        if role is None:
+            branch_properties["role"]["enum"] = [value for value in roles if value not in {"header", "unknown"}]
+        else:
+            branch_properties["role"].pop("enum")
+            branch_properties["role"]["const"] = role
+            empty_field = "header_rows" if role == "header" else "transformations"
+            branch_properties[empty_field]["maxItems"] = 0
+        branches.append({**common, "properties": branch_properties})
+    for key in ("type", "properties", "required", "additionalProperties"):
+        schema.pop(key)
+    schema["description"] = " ".join(descriptions)
+    schema["oneOf"] = branches
+
+
+def _preparation_recipe_schema(schema: dict, ref_template: str) -> dict:
+    """Comparte las ramas generadas y expresa estados sin condicionales omitidos por Ollama."""
+    definitions = schema["$defs"]
+    block_schema = definitions["SheetRecipe"]
+    block_references = []
+    for name, branch in zip(
+        ("SheetRecipeHeader", "SheetRecipeUnknown", "SheetRecipeContent"),
+        block_schema.pop("oneOf"), strict=True,
+    ):
+        definitions[name] = branch
+        block_references.append({"$ref": ref_template.format(model=name)})
+    block_schema["oneOf"] = block_references
+    definitions["ResolvedSheetRecipe"] = {"oneOf": [block_references[0], block_references[2]]}
+    properties = schema["properties"]
+    common = {key: schema[key] for key in ("type", "required", "additionalProperties")}
+    branches = []
+    for status in properties["status"]["enum"]:
+        branch_properties = {name: dict(definition) for name, definition in properties.items()}
+        branch_properties["status"].pop("enum")
+        branch_properties["status"]["const"] = status
+        if status == "ready":
+            branch_properties["sheets"]["minItems"] = 1
+            branch_properties["warnings"]["maxItems"] = 0
+            branch_properties["requires_human_review"]["const"] = False
+        else:
+            branch_properties["warnings"]["minItems"] = 1
+        if status == "review_required":
+            branch_properties["requires_human_review"]["const"] = True
+        else:
+            branch_properties["sheets"]["items"] = {"$ref": ref_template.format(model="ResolvedSheetRecipe")}
+        branches.append({**common, "properties": branch_properties})
+    for key in ("type", "properties", "required", "additionalProperties"):
+        schema.pop(key)
+    schema["oneOf"] = branches
+    return schema
+
+
 class SheetRecipe(RecipeContract):
-    sheet_name: str = Field(min_length=1, max_length=255)
-    header_rows: list[Annotated[int, Field(ge=1)]]
-    data_start_row: int = Field(ge=1)
-    data_end_row: int | None = Field(default=None, ge=1)
+    model_config = ConfigDict(json_schema_extra=_sheet_recipe_schema)
+
+    sheet_name: str = Field(min_length=1, max_length=255, pattern=r"\S")
+    block_id: str = Field(
+        min_length=1, max_length=100, pattern=r"\S",
+        description="Identificador explícito, no vacío y único en toda la receta.",
+    )
+    role: BlockRole = Field(description=(
+        "Función de las celdas dentro del rango de datos. header conserva únicamente "
+        "celdas de encabezado como contenido; no representa una copia de los registros."
+    ))
+    header_rows: list[Annotated[int, Field(ge=1)]] = Field(description=(
+        "Filas originales usadas para nombrar columnas del bloque, antes de data_start_row. "
+        "No requieren otro bloque header. Para role=header esta lista debe estar vacía."
+    ))
+    data_start_row: int = Field(ge=1, description="Primera fila de contenido del bloque, original e inclusiva.")
+    data_end_row: int = Field(ge=1, description="Última fila de contenido del bloque, original e inclusiva.")
+    data_start_column: int = Field(ge=1, description="Primera columna de contenido del bloque, original e inclusiva.")
+    data_end_column: int = Field(ge=1, description="Última columna de contenido del bloque, original e inclusiva.")
     transformations: list[Transformation] = Field(max_length=50)
 
     @model_validator(mode="after")
@@ -94,31 +194,107 @@ class SheetRecipe(RecipeContract):
             raise ValueError("header_rows debe contener filas únicas en orden ascendente.")
         if self.header_rows and self.header_rows[-1] >= self.data_start_row:
             raise ValueError("Los encabezados deben estar antes de data_start_row.")
-        if self.data_end_row is not None and self.data_end_row < self.data_start_row:
+        if self.data_end_row < self.data_start_row:
             raise ValueError("data_end_row debe ser mayor o igual a data_start_row.")
+        if self.data_end_column < self.data_start_column:
+            raise ValueError("data_end_column debe ser mayor o igual a data_start_column.")
+        if self.role == "unknown" and self.transformations:
+            raise ValueError("Un bloque unknown debe conservarse sin transformaciones.")
+        if self.role == "header" and self.header_rows:
+            raise ValueError("Un bloque de rol header conserva los encabezados en su rango y debe tener header_rows vacío.")
         return self
 
 
 class PreparationRecipe(RecipeContract):
     status: Literal["ready", "review_required", "failed"]
-    sheets: list[SheetRecipe] = Field(max_length=30)
-    warnings: list[Annotated[str, Field(max_length=512)]] = Field(max_length=20)
+    sheets: list[SheetRecipe] = Field(max_length=120)
+    warnings: list[Annotated[str, Field(min_length=1, max_length=512, pattern=r"\S")]] = Field(max_length=20)
     requires_human_review: bool
+
+    @classmethod
+    def model_json_schema(cls, *args, **kwargs) -> dict:
+        schema = super().model_json_schema(*args, **kwargs)
+        ref_template = args[1] if len(args) > 1 else kwargs.get("ref_template", "#/$defs/{model}")
+        return _preparation_recipe_schema(schema, ref_template)
 
     @model_validator(mode="after")
     def validate_sheets(self) -> "PreparationRecipe":
-        names = [sheet.sheet_name for sheet in self.sheets]
-        if len(names) != len(set(names)):
-            raise ValueError("La receta no puede repetir una hoja.")
+        block_ids = [block.block_id for block in self.sheets]
+        if len(set(block_ids)) != len(block_ids):
+            raise ValueError("Los block_id deben ser únicos en toda la receta.")
+        by_sheet: dict[str, list[SheetRecipe]] = {}
+        for block in self.sheets:
+            by_sheet.setdefault(block.sheet_name, []).append(block)
+        for blocks in by_sheet.values():
+            for index, block in enumerate(blocks):
+                for other in blocks[index + 1:]:
+                    rows_overlap = max(block.data_start_row, other.data_start_row) <= min(
+                        block.data_end_row, other.data_end_row,
+                    )
+                    columns_overlap = max(block.data_start_column, other.data_start_column) <= min(
+                        block.data_end_column, other.data_end_column,
+                    )
+                    if rows_overlap and columns_overlap:
+                        raise ValueError(
+                            f"Hoja '{block.sheet_name}': Los rangos de datos de los bloques "
+                            f"'{block.block_id}' y '{other.block_id}' no pueden solaparse."
+                        )
+                    if columns_overlap:
+                        for referencing, content in ((block, other), (other, block)):
+                            conflicting_rows = [
+                                row for row in referencing.header_rows
+                                if content.data_start_row <= row <= content.data_end_row
+                            ]
+                            if conflicting_rows and content.role != "header":
+                                raise ValueError(
+                                    f"Hoja '{block.sheet_name}': El bloque '{referencing.block_id}' "
+                                    f"usa como encabezados las filas {conflicting_rows} del rango de "
+                                    f"datos no header del bloque '{content.block_id}'."
+                                )
         if self.status == "ready" and not self.sheets:
             raise ValueError("Una receta ready debe incluir al menos una hoja.")
+        if self.status == "ready" and (self.requires_human_review or self.warnings):
+            raise ValueError("Una receta ready debe indicar requires_human_review=false y warnings vacío.")
+        if any(block.role == "unknown" for block in self.sheets) and self.status != "review_required":
+            raise ValueError("Los bloques unknown requieren status=review_required.")
         if self.status == "review_required" and not self.requires_human_review:
             raise ValueError("Una receta review_required debe indicar requires_human_review=true.")
+        if self.status == "review_required" and not self.warnings:
+            raise ValueError("Una receta review_required debe explicar su incertidumbre en warnings.")
+        if self.status == "failed" and not self.warnings:
+            raise ValueError("Una receta failed debe explicar el impedimento identificado en warnings.")
         return self
+
+
+class TabularFinding(BaseModel):
+    code: str
+    message: str
+    sheet_name: str | None = None
+    block_id: str | None = None
+    cell: str | None = None
+    region_id: str | None = None
+    range: str | None = None
+    requires_review: bool = True
+    severity: Literal["warning", "error"] = "warning"
+
+
+class SheetCoverage(BaseModel):
+    sheet_name: str
+    nonempty_cells: int = Field(ge=0)
+    covered_nonempty_cells: int = Field(ge=0)
+    uncovered_nonempty_cells: int = Field(ge=0)
+    overlapping_nonempty_cells: int = Field(ge=0)
+    uncovered_sample: list[str] = Field(default_factory=list)
 
 
 class SheetExecution(BaseModel):
     sheet_name: str
+    block_id: str | None = None
+    role: BlockRole = "observations"
+    data_start_row: int | None = None
+    data_end_row: int | None = None
+    data_start_column: int | None = None
+    data_end_column: int | None = None
     source_rows: int
     source_columns: int
     rows_before: int
@@ -132,22 +308,32 @@ class SheetExecution(BaseModel):
     conversion_failures: dict[str, int] = Field(default_factory=dict)
     empty_columns: list[str] = Field(default_factory=list)
     unresolved_formula_cells: list[str] = Field(default_factory=list)
+    unresolved_formula_count: int = 0
+    formula_count: int = 0
+    formula_sample: list[FormulaSample] = Field(default_factory=list)
+    error_cell_count: int = 0
     error_cells: list[str] = Field(default_factory=list)
+    source_nonempty_cells: int | None = None
+    preserved_nonempty_cells: int | None = None
     inferred_types: dict[str, str] = Field(default_factory=dict)
     sample: list[SampleRow] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
     errors: list[str] = Field(default_factory=list)
+    findings: list[TabularFinding] = Field(default_factory=list)
 
 
 class ExecutionResult(BaseModel):
     sheets: list[SheetExecution] = Field(default_factory=list)
     skipped_sheets: list[str] = Field(default_factory=list)
+    coverage: list[SheetCoverage] = Field(default_factory=list)
+    findings: list[TabularFinding] = Field(default_factory=list)
 
 
 class ValidationResult(BaseModel):
     status: EvaluationStatus
     warnings: list[str] = Field(default_factory=list)
     errors: list[str] = Field(default_factory=list)
+    findings: list[TabularFinding] = Field(default_factory=list)
 
 
 class LLMResponse(BaseModel):
@@ -183,3 +369,4 @@ class TabularEvaluation(BaseModel):
     validation: ValidationResult
     metrics: EvaluationMetrics
     response_format: ResponseFormatMetrics = Field(default_factory=ResponseFormatMetrics)
+    applied_rules: dict[str, JsonValue] = Field(default_factory=dict)

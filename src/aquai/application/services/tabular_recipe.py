@@ -86,7 +86,7 @@ def _schema_error_detail(error: SchemaValidationError) -> str:
         "minItems": f"debe contener al menos {error.validator_value} elementos",
         "maxItems": f"no puede superar {error.validator_value} elementos",
         "minProperties": f"debe contener al menos {error.validator_value} propiedades",
-        "oneOf": "no coincide con una única operación permitida",
+        "oneOf": "no coincide con una única variante permitida",
         "anyOf": "no coincide con ninguna estructura permitida",
     }
     description = descriptions.get(error.validator, "no cumple una restricción del contrato")
@@ -94,6 +94,37 @@ def _schema_error_detail(error: SchemaValidationError) -> str:
         missing = [field for field in error.validator_value if field not in error.instance]
         description += f": {', '.join(missing)}"
     return f"{location}: {description}"
+
+
+def _schema_error_details(error: SchemaValidationError) -> list[str]:
+    """Explica la variante declarada sin alterar el documento ni el rechazo del esquema."""
+    if error.validator in {"oneOf", "anyOf"} and error.context:
+        branches: dict[object, list[SchemaValidationError]] = {}
+        for child in error.context:
+            branch = next(iter(child.schema_path), None)
+            branches.setdefault(branch, []).append(child)
+        candidates = []
+        for children in branches.values():
+            wrong_discriminator = any(
+                child.validator in {"const", "enum"}
+                and list(child.absolute_path) in [
+                    [*error.absolute_path, "status"], [*error.absolute_path, "role"],
+                ]
+                for child in children
+            )
+            if not wrong_discriminator:
+                candidates.append(children)
+        if len(candidates) == 1:
+            return [detail for child in candidates[0] for detail in _schema_error_details(child)]
+        if candidates:
+            required_details = [
+                {_schema_error_detail(child) for child in children if child.validator == "required"}
+                for children in candidates
+            ]
+            shared = set.intersection(*required_details)
+            if shared:
+                return sorted(shared)
+    return [_schema_error_detail(error)]
 
 
 def parse_preparation_recipe_with_metrics(content: str) -> RecipeParseResult:
@@ -105,7 +136,9 @@ def parse_preparation_recipe_with_metrics(content: str) -> RecipeParseResult:
     schema_errors = sorted(validator.iter_errors(document), key=lambda error: str(error.absolute_path))
     metrics.schema_valid = not schema_errors
     if schema_errors:
-        details = "; ".join(_schema_error_detail(error) for error in schema_errors)
+        details = "; ".join(dict.fromkeys(
+            detail for error in schema_errors for detail in _schema_error_details(error)
+        ))
         raise RecipeParseError(f"La receta no cumple el JSON Schema: {details}", metrics)
 
     try:

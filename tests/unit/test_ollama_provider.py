@@ -7,7 +7,10 @@ from unittest.mock import patch
 import httpx
 from pydantic import ValidationError
 
-from aquai.application.dtos.tabular import PreparationRecipe, StructuralSummary
+from aquai.application.agents.prompts.tabular import TABULAR_RECIPE_PROMPT
+from aquai.application.dtos.tabular import (
+    FormulaSample, PreparationRecipe, SampleRow, SheetSummary, StructuralRegion, StructuralSummary,
+)
 from aquai.application.errors import LLMProviderError
 from aquai.infrastructure.config.tabular import TabularSettings
 from aquai.infrastructure.providers.llm.ollama import OllamaProvider
@@ -46,7 +49,7 @@ class TabularSettingsTests(unittest.TestCase):
             settings = TabularSettings(_env_file=None)
         self.assertEqual(settings.ollama_base_url, "http://localhost:11434")
         self.assertEqual(settings.default_model, "qwen3.5:9b")
-        self.assertEqual(settings.llm_timeout_seconds, 180)
+        self.assertEqual(settings.llm_timeout_seconds, 600)
         self.assertEqual(settings.llm_num_ctx, 16384)
         self.assertIs(settings.llm_think, False)
         self.assertEqual(settings.max_upload_bytes, 10 * 1024 * 1024)
@@ -130,6 +133,24 @@ class OllamaProviderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["model"], "another-model:9b")
         self.assertIs(payload["stream"], False)
         self.assertEqual(payload["format"], PreparationRecipe.model_json_schema())
+        system_message = payload["messages"][0]["content"]
+        self.assertTrue(system_message.startswith(TABULAR_RECIPE_PROMPT))
+        self.assertEqual(json.loads(system_message[len(TABULAR_RECIPE_PROMPT):]), payload["format"])
+        block_schema = payload["format"]["$defs"]["SheetRecipeContent"]
+        self.assertEqual(set(block_schema["required"]), {
+            "sheet_name", "block_id", "role", "header_rows", "data_start_row", "data_end_row",
+            "data_start_column", "data_end_column", "transformations",
+        })
+        for field in ("data_start_row", "data_end_row", "data_start_column", "data_end_column"):
+            self.assertEqual(block_schema["properties"][field]["type"], "integer")
+            self.assertEqual(block_schema["properties"][field]["minimum"], 1)
+            self.assertNotIn("default", block_schema["properties"][field])
+        self.assertIn("oneOf", payload["format"])
+        self.assertNotIn("properties", payload["format"])
+        self.assertNotIn("allOf", payload["format"])
+        self.assertFalse(block_schema["additionalProperties"])
+        self.assertIn("block_id único en la receta", system_message)
+        self.assertIn("warnings debe ser una lista vacía", system_message)
         self.assertEqual(payload["options"], {"temperature": 0, "num_ctx": 16384})
         self.assertIs(payload["think"], False)
         self.assertEqual([message["role"] for message in payload["messages"]], ["system", "user"])
@@ -154,6 +175,58 @@ class OllamaProviderTests(unittest.IsolatedAsyncioTestCase):
         payload = json.loads(requests[0].content)
         self.assertIs(payload["think"], True)
         self.assertNotIn("think", payload["options"])
+
+    async def test_summary_compaction_preserves_regions_coordinates_and_zero_values(self) -> None:
+        requests = []
+
+        def handle(request: httpx.Request) -> httpx.Response:
+            requests.append(json.loads(request.content))
+            return httpx.Response(200, json=response_body())
+
+        source = summary()
+        source.sheets = [SheetSummary(
+            name="data", rows=8, columns=40, initial_columns=["code", "count"],
+            inferred_types=["string", "number"], null_counts=[0, 0], column_indices=[1, 40],
+            sample=[SampleRow(row_number=8, values=["001", 0])],
+            regions=[StructuralRegion(
+                region_id="total", start_row=8, end_row=8, start_column=1, end_column=40,
+                kind="total", reason="Etiqueta total al final de la tabla.", nonempty_cells=2,
+            )],
+        )]
+        provider = OllamaProvider(self.settings, transport=httpx.MockTransport(handle))
+        await provider.generate_recipe(source, "local-model")
+        sent = json.loads(requests[0]["messages"][1]["content"])["structural_summary"]["sheets"][0]
+        self.assertEqual(sent["columns"], 40)
+        self.assertEqual(sent["column_indices"], [1, 40])
+        self.assertEqual(sent["sample"], [{"row_number": 8, "values": ["001", 0]}])
+        self.assertEqual(sent["regions"][0]["start_row"], 8)
+        self.assertNotIn("merged_cells", sent)
+        self.assertNotIn("empty_rows", sent)
+
+    async def test_long_formula_preview_is_explicit_and_does_not_modify_original_summary(self) -> None:
+        requests = []
+
+        def handle(request: httpx.Request) -> httpx.Response:
+            requests.append(json.loads(request.content))
+            return httpx.Response(200, json=response_body())
+
+        expression = "=" + "+".join(["A1"] * 100)
+        source = summary()
+        source.sheets = [SheetSummary(
+            name="data", rows=1, columns=1, initial_columns=["column_1"],
+            inferred_types=["integer"], null_counts=[0], sample=[], formula_count=1,
+            formula_sample=[FormulaSample(
+                cell="A1", formula=expression, cached_value=0, cache_available=True,
+            )],
+        )]
+        provider = OllamaProvider(self.settings, transport=httpx.MockTransport(handle))
+        await provider.generate_recipe(source, "local-model")
+        sent = json.loads(requests[0]["messages"][1]["content"])["structural_summary"]["sheets"][0]
+        formula = sent["formula_sample"][0]
+        self.assertTrue(formula["formula_is_preview"])
+        self.assertEqual(formula["formula_characters"], len(expression))
+        self.assertEqual(formula["cached_value"], 0)
+        self.assertEqual(source.sheets[0].formula_sample[0].formula, expression)
 
     async def test_original_content_and_provider_metadata_are_preserved_without_parsing_recipe(self) -> None:
         content = " \n```json\n{invalid recipe}\n```\n "

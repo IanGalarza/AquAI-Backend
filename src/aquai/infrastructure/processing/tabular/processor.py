@@ -1,11 +1,14 @@
 """Inspección y ejecución determinística de recetas tabulares."""
 
 import math
+import re
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 from numbers import Number
 
 import pandas as pd
+import numpy as np
+from openpyxl.utils.cell import get_column_letter
 from openpyxl.worksheet.cell_range import CellRange
 
 from aquai.application.dtos.tabular import (
@@ -20,6 +23,9 @@ from aquai.application.dtos.tabular import (
     SheetExecution,
     SheetRecipe,
     SheetSummary,
+    SheetCoverage,
+    StructuralRegion,
+    TabularFinding,
     StripStrings,
     StructuralSummary,
 )
@@ -99,6 +105,12 @@ class PandasTabularProcessor:
             if sheet is None:
                 executions.append(SheetExecution(
                     sheet_name=sheet_recipe.sheet_name,
+                    block_id=sheet_recipe.block_id,
+                    role=sheet_recipe.role,
+                    data_start_row=sheet_recipe.data_start_row,
+                    data_end_row=sheet_recipe.data_end_row,
+                    data_start_column=sheet_recipe.data_start_column,
+                    data_end_column=sheet_recipe.data_end_column,
                     source_rows=0,
                     source_columns=0,
                     rows_before=0,
@@ -112,6 +124,42 @@ class PandasTabularProcessor:
         return ExecutionResult(
             sheets=executions,
             skipped_sheets=[name for name in sheets if name not in selected],
+            coverage=[self._coverage(sheet, recipe) for sheet in table.sheets],
+            findings=[finding for execution in executions for finding in execution.findings],
+        )
+
+    def _occupied_cells(self, sheet: SheetData) -> np.ndarray:
+        occupied = ~sheet.frame.map(is_empty).to_numpy(dtype=bool)
+        for row, column in sheet.formula_cells:
+            occupied[row - 1, column - 1] = True
+        return occupied
+
+    def _coverage(self, sheet: SheetData, recipe: PreparationRecipe) -> SheetCoverage:
+        occupied = self._occupied_cells(sheet)
+        covered = np.zeros(occupied.shape, dtype=bool)
+        selected = np.zeros(occupied.shape, dtype=np.uint16)
+        for block in recipe.sheets:
+            if block.sheet_name != sheet.name:
+                continue
+            if self._range_errors(sheet, block):
+                continue
+            row_slice = slice(block.data_start_row - 1, block.data_end_row)
+            column_slice = slice(block.data_start_column - 1, block.data_end_column)
+            covered[row_slice, column_slice] = True
+            selected[row_slice, column_slice] += 1
+            for header_row in block.header_rows:
+                covered[header_row - 1, column_slice] = True
+        uncovered = occupied & ~covered
+        return SheetCoverage(
+            sheet_name=sheet.name,
+            nonempty_cells=int(occupied.sum()),
+            covered_nonempty_cells=int((occupied & covered).sum()),
+            uncovered_nonempty_cells=int(uncovered.sum()),
+            overlapping_nonempty_cells=int((occupied & (selected > 1)).sum()),
+            uncovered_sample=[
+                f"{get_column_letter(int(column) + 1)}{int(row) + 1}"
+                for row, column in np.argwhere(uncovered)[:20]
+            ],
         )
 
     def _sample(
@@ -178,12 +226,23 @@ class PandasTabularProcessor:
         if sheet.missing_formula_cache_count:
             warnings.append(
                 f"Hay {sheet.missing_formula_cache_count} fórmulas sin valor almacenado; "
-                "se leerán como nulos."
+                "se conserva la expresión original sin recalcularla."
             )
         if sheet.error_cell_count:
             warnings.append(
                 f"Hay {sheet.error_cell_count} celdas con errores de Excel; "
                 "sus valores se conservaron."
+            )
+        long_texts = frame.map(lambda value: isinstance(value, str) and len(value) > 200)
+        long_text_count = int(long_texts.to_numpy(dtype=bool).sum())
+        if long_text_count:
+            coordinates = ", ".join(
+                f"{get_column_letter(int(column) + 1)}{int(row) + 1}"
+                for row, column in np.argwhere(long_texts.to_numpy(dtype=bool))[:6]
+            )
+            warnings.append(
+                f"Las muestras muestran como máximo 200 caracteres de {long_text_count} textos "
+                f"largos ({coordinates}); los valores originales se conservan íntegros en memoria."
             )
         header_candidates = []
         for index in range(min(25, len(frame))):
@@ -207,8 +266,13 @@ class PandasTabularProcessor:
             sample=self._sample(frame, column_positions),
             merged_cells=sheet.merged_cells[:100],
             formula_count=sheet.formula_count,
+            missing_formula_cache_count=sheet.missing_formula_cache_count,
             formula_sample=[
-                FormulaSample(cell=str(item["cell"]), formula=str(item["formula"]))
+                FormulaSample(
+                    cell=str(item["cell"]), formula=str(item["formula"]),
+                    cached_value=json_value(item["cached_value"]),
+                    cache_available=item["cached_value"] is not None,
+                )
                 for item in sheet.formulas
             ],
             error_cell_count=sheet.error_cell_count,
@@ -218,12 +282,197 @@ class PandasTabularProcessor:
             empty_row_count=len(empty_rows),
             empty_column_count=len(empty_columns),
             possible_header_rows=header_candidates,
+            regions=self._regions(sheet, warnings),
             warnings=warnings,
         )
 
-    def _column_names(self, sheet: SheetData, header_rows: list[int], warnings: list[str]) -> list[str]:
+    def _regions(self, sheet: SheetData, warnings: list[str]) -> list[StructuralRegion]:
+        occupied = self._occupied_cells(sheet)
+        if not occupied.any():
+            return []
+        frame = sheet.frame
+        counts = occupied.sum(axis=1)
+        first_row = int(np.flatnonzero(counts)[0])
+        initial = frame.iloc[first_row]
+        header_columns = [index for index, value in enumerate(initial) if not is_empty(value)]
+        baseline = max(1, int(np.median(counts[counts > 0])))
+        formula_mask = np.zeros(occupied.shape, dtype=bool)
+        for row, column in sheet.formula_cells:
+            formula_mask[row - 1, column - 1] = True
+        kinds: list[str | None] = []
+        for index, count in enumerate(counts):
+            if not count:
+                kinds.append(None)
+                continue
+            values = frame.iloc[index]
+            labels = [str(value).strip().casefold() for value in values if isinstance(value, str)]
+            if index == first_row:
+                header_text_count = sum(
+                    isinstance(value, str) and not self._is_numeric(value)
+                    for value in values if not is_empty(value)
+                )
+                kind = "header" if header_text_count >= count / 2 else "observations"
+            elif labels and re.fullmatch(r"(?:grand )?totals?|totales|total general|suma", labels[0]):
+                kind = "total"
+            elif kinds[first_row] == "header" and len(header_columns) >= 2 and sum(
+                self._same_value(values.iloc[column], initial.iloc[column])
+                for column in header_columns
+            ) >= max(2, sum(not is_empty(values.iloc[column]) for column in header_columns) * 0.8):
+                kind = "repeated_header"
+            elif index > first_row + 1 and count < baseline * 0.3 and any(
+                previous is None or previous == "repeated_header"
+                for previous in kinds[max(first_row + 1, index - 3):]
+            ):
+                kind = "legend"
+            elif kinds and kinds[-1] == "legend" and count < baseline * 0.3:
+                kind = "legend"
+            else:
+                kind = "observations"
+            kinds.append(kind)
+        regions = []
+        start = 0
+        while start < len(kinds):
+            kind = kinds[start]
+            end = start + 1
+            while end < len(kinds) and kinds[end] == kind:
+                end += 1
+            if kind is not None:
+                column_kinds = self._column_kinds(
+                    sheet, occupied[start:end], formula_mask[start:end], initial, kind,
+                )
+                column = 0
+                while column < len(column_kinds):
+                    column_kind = column_kinds[column]
+                    last_column = column + 1
+                    while last_column < len(column_kinds) and column_kinds[last_column] == column_kind:
+                        last_column += 1
+                    if column_kind is not None:
+                        regions.append(self._region(
+                            sheet, occupied, start, end, column, last_column, column_kind, warnings,
+                        ))
+                    column = last_column
+            start = end
+        return regions
+
+    def _same_value(self, left: object, right: object) -> bool:
+        if is_empty(left) or is_empty(right):
+            return is_empty(left) and is_empty(right)
+        return str(left).strip() == str(right).strip()
+
+    def _column_kinds(
+        self, sheet: SheetData, occupied: np.ndarray, formulas: np.ndarray,
+        initial: pd.Series, row_kind: str,
+    ) -> list[str | None]:
+        counts = occupied.sum(axis=0)
+        formula_counts = formulas.sum(axis=0)
+        populated = np.flatnonzero(counts)
+        if row_kind != "observations":
+            first, last = int(populated[0]), int(populated[-1])
+            return [row_kind if first <= column <= last else None for column in range(len(counts))]
+        percentage_columns = {
+            column - 1 for (_, column), formula in sheet.formula_cells.items()
+            if re.search(r"\*\s*100\s*/|/\s*[^+*-]+\*\s*100", formula.expression)
+        }
+        narrow_summary = len(sheet.frame.columns) <= 5 and any(
+            re.search(r"presencias?|porcentajes?|percentage|%", str(value), re.IGNORECASE)
+            for value in initial if isinstance(value, str)
+        )
+        kinds = []
+        for column, count in enumerate(counts):
+            if not count:
+                kinds.append(None)
+            elif narrow_summary or column in percentage_columns or re.search(
+                r"presencias?|porcentajes?|percentage|%", str(initial.iloc[column]), re.IGNORECASE,
+            ):
+                kinds.append("summary")
+            elif formula_counts[column] >= count * 0.6:
+                kinds.append("derived")
+            else:
+                kinds.append("observations")
+        return kinds
+
+    def _region(
+        self, sheet: SheetData, occupied: np.ndarray,
+        start: int, end: int, first_column: int, last_column: int, kind: str,
+        warnings: list[str],
+    ) -> StructuralRegion:
+        header_anchors = set()
+        if kind in {"header", "repeated_header"}:
+            for reference in sheet.merged_cells:
+                merged = CellRange(reference)
+                if (start < merged.min_row <= end and first_column < merged.min_col <= last_column):
+                    last_column = max(last_column, merged.max_col)
+                    if occupied[merged.min_row - 1, merged.min_col - 1]:
+                        header_anchors.add(merged.min_col - 1)
+        reasons = {
+            "header": "Primera fila con valores; posible encabezado.",
+            "repeated_header": "Los valores de la fila coinciden con el encabezado inicial en al menos un 80% de las posiciones compartidas.",
+            "total": "La primera etiqueta textual identifica explícitamente un total.",
+            "legend": "Sección después de un separador con una densidad distinta a la tabla principal.",
+            "derived": "Al menos el 60% de las celdas con información de estas columnas son fórmulas.",
+            "summary": "El encabezado indica presencia o la fórmula calcula un porcentaje; se separa de las abundancias.",
+            "observations": "Rango continuo con valores y estructura compatible con registros.",
+        }
+        positions = list(range(first_column, last_column))
+        if len(positions) > 6:
+            positions = positions[:3] + positions[-3:]
+        if header_anchors:
+            populated = [int(column) + first_column for column in np.flatnonzero(
+                occupied[start:end, first_column:last_column].any(axis=0),
+            )]
+            edges = populated if len(populated) <= 6 else populated[:3] + populated[-3:]
+            anchors = sorted(header_anchors)
+            if len(anchors) > 16:
+                positions = [anchors[index] for index in self._sample_positions(len(anchors), 16)]
+                warnings.append(
+                    f"El encabezado {get_column_letter(first_column + 1)}{start + 1}:"
+                    f"{get_column_letter(last_column)}{end} contiene {len(anchors)} textos de "
+                    "celdas combinadas; la muestra incluye 16 anclas distribuidas en el rango "
+                    "y conserva sus índices originales."
+                )
+            else:
+                additional = [column for column in edges if column not in header_anchors]
+                remaining = 16 - len(anchors)
+                sampled = [additional[index] for index in self._sample_positions(len(additional), remaining)]
+                positions = sorted(anchors + sampled)
+                if len(sampled) < len(additional):
+                    warnings.append(
+                        f"La muestra del encabezado {get_column_letter(first_column + 1)}{start + 1}:"
+                        f"{get_column_letter(last_column)}{end} está limitada a 16 columnas; "
+                        f"se priorizaron sus {len(anchors)} anclas combinadas y se omitieron "
+                        f"{len(additional) - len(sampled)} etiquetas de los extremos."
+                    )
+        row_positions = sorted({start, (start + end - 1) // 2, end - 1})
+        longest_text_row = max(
+            range(start, end),
+            key=lambda row: max(
+                (len(value) for value in sheet.frame.iloc[row, first_column:last_column]
+                 if isinstance(value, str)), default=0,
+            ),
+        )
+        row_positions = sorted(set(row_positions) | {longest_text_row})
+        return StructuralRegion(
+            region_id=f"r{start + 1}_{end}_c{first_column + 1}_{last_column}",
+            start_row=start + 1, end_row=end,
+            start_column=first_column + 1, end_column=last_column,
+            kind=kind, reason=reasons[kind],
+            nonempty_cells=int(occupied[start:end, first_column:last_column].sum()),
+            column_indices=[column + 1 for column in positions],
+            sample=[
+                SampleRow(
+                    row_number=row + 1,
+                    values=[json_value(sheet.frame.iat[row, column]) for column in positions],
+                )
+                for row in row_positions
+            ],
+        )
+
+    def _column_names(
+        self, sheet: SheetData, header_rows: list[int], warnings: list[str],
+        start_column: int, end_column: int,
+    ) -> list[str]:
         if not header_rows:
-            return [f"column_{index + 1}" for index in range(len(sheet.frame.columns))]
+            return [f"column_{index}" for index in range(start_column, end_column + 1)]
         headers = sheet.frame.iloc[[row - 1 for row in header_rows]].copy()
         for merged_reference in sheet.merged_cells:
             merged = CellRange(merged_reference)
@@ -231,15 +480,17 @@ class PandasTabularProcessor:
             for row in header_rows:
                 if merged.min_row <= row <= merged.max_row:
                     headers.loc[row - 1, merged.min_col - 1:merged.max_col - 1] = value
+        headers = headers.iloc[:, start_column - 1:end_column]
         names = []
         used = set()
-        for index, column in enumerate(headers.columns):
+        missing_headers = []
+        for column in headers.columns:
             parts = list(dict.fromkeys(
                 str(value).strip() for value in headers[column] if not is_empty(value)
             ))
-            base = " ".join(parts) or f"column_{index + 1}"
+            base = " ".join(parts) or f"column_{column + 1}"
             if not parts:
-                warnings.append(f"La columna {index + 1} no tiene encabezado; se asignó {base}.")
+                missing_headers.append(column + 1)
             name = base
             suffix = 2
             while name in used:
@@ -249,43 +500,125 @@ class PandasTabularProcessor:
                 warnings.append(f"El encabezado {base} está repetido; se asignó {name}.")
             names.append(name)
             used.add(name)
+        if len(missing_headers) == 1:
+            column = missing_headers[0]
+            warnings.append(f"La columna {column} no tiene encabezado; se asignó column_{column}.")
+        elif missing_headers:
+            sample = ", ".join(get_column_letter(column) for column in missing_headers[:12])
+            warnings.append(
+                f"Hay {len(missing_headers)} columnas sin encabezado; se asignaron nombres column_N "
+                f"respetando la posición original. Muestra de columnas: {sample}."
+            )
         return names
+
+    def _range_errors(self, sheet: SheetData, recipe: SheetRecipe) -> list[str]:
+        """Rechaza coordenadas inválidas antes de seleccionar celdas o contar cobertura."""
+        bounds = (
+            recipe.data_start_row, recipe.data_end_row,
+            recipe.data_start_column, recipe.data_end_column,
+        )
+        if any(type(value) is not int or value < 1 for value in bounds):
+            return ["Todos los límites del bloque deben ser enteros positivos explícitos."]
+        if (recipe.data_start_row > recipe.data_end_row
+                or recipe.data_start_column > recipe.data_end_column):
+            return ["El inicio del rango debe ser menor o igual a su final."]
+        rows, columns = sheet.frame.shape
+        errors = []
+        if recipe.data_end_row > rows:
+            errors.append("La receta selecciona filas que exceden las dimensiones de la hoja.")
+        if recipe.data_end_column > columns:
+            errors.append("La receta selecciona columnas que exceden las dimensiones de la hoja.")
+        if (any(type(row) is not int or not 1 <= row <= rows for row in recipe.header_rows)
+                or recipe.header_rows != sorted(set(recipe.header_rows))):
+            errors.append("Los encabezados deben ser filas válidas, únicas y ordenadas de la hoja.")
+        elif recipe.header_rows and recipe.header_rows[-1] >= recipe.data_start_row:
+            errors.append("Los encabezados deben preceder al rango de datos del bloque.")
+        return errors
 
     def _execute_sheet(self, sheet: SheetData, recipe: SheetRecipe) -> SheetExecution:
         rows, columns = sheet.frame.shape
+        end_row = recipe.data_end_row
+        end_column = recipe.data_end_column
         result = SheetExecution(
             sheet_name=sheet.name,
+            block_id=recipe.block_id,
+            role=recipe.role,
+            data_start_row=recipe.data_start_row,
+            data_end_row=end_row,
+            data_start_column=recipe.data_start_column,
+            data_end_column=end_column,
             source_rows=rows,
             source_columns=columns,
             rows_before=0,
             rows_after=0,
             columns_before=[],
             columns_after=[],
-            unresolved_formula_cells=sheet.missing_formula_cells,
-            error_cells=sheet.error_cells,
         )
-        if sheet.missing_formula_cache_count:
-            result.warnings.append(
-                f"Hay {sheet.missing_formula_cache_count} fórmulas sin valor almacenado; "
-                "no se calculan automáticamente."
-            )
-        if sheet.error_cell_count:
-            result.warnings.append(
-                f"Hay {sheet.error_cell_count} celdas con errores de Excel; "
-                "sus valores se conservaron."
-            )
-        if any(row > rows for row in recipe.header_rows) or recipe.data_start_row > rows + 1:
-            result.errors.append("La receta selecciona filas que exceden las dimensiones de la hoja.")
+        result.errors.extend(self._range_errors(sheet, recipe))
+        if result.errors:
             return result
-        if recipe.data_end_row is not None and recipe.data_end_row > rows:
-            result.errors.append("data_end_row excede las dimensiones de la hoja.")
+        if recipe.role == "unknown" and recipe.transformations:
+            result.errors.append("Un bloque unknown debe conservarse sin transformaciones.")
             return result
-        end_row = recipe.data_end_row if recipe.data_end_row is not None else rows
-        names = self._column_names(sheet, recipe.header_rows, result.warnings)
-        frame = sheet.frame.iloc[recipe.data_start_row - 1:end_row].copy()
+        names = self._column_names(
+            sheet, recipe.header_rows, result.warnings, recipe.data_start_column, end_column,
+        )
+        frame = sheet.frame.iloc[
+            recipe.data_start_row - 1:end_row, recipe.data_start_column - 1:end_column,
+        ].copy()
         frame.columns = names
         result.rows_before = len(frame)
         result.columns_before = names
+        column_positions = {
+            name: column for column, name in enumerate(names, recipe.data_start_column)
+        }
+        selected_formulas = {
+            position: formula for position, formula in sheet.formula_cells.items()
+            if recipe.data_start_row <= position[0] <= end_row
+            and recipe.data_start_column <= position[1] <= end_column
+        }
+        formula_positions: dict[str, set[int]] = {}
+        for row, column in selected_formulas:
+            name = names[column - recipe.data_start_column]
+            formula_positions.setdefault(name, set()).add(row)
+        missing_formulas = [
+            f"{get_column_letter(column)}{row}"
+            for (row, column), formula in selected_formulas.items() if formula.cached_value is None
+        ]
+        result.unresolved_formula_count = len(missing_formulas)
+        result.unresolved_formula_cells = missing_formulas[:100]
+        result.formula_count = len(selected_formulas)
+        formula_items = list(selected_formulas.items())
+        formula_indices = self._sample_positions(len(formula_items), min(self.sample_rows, 12))
+        result.formula_sample = [
+            FormulaSample(
+                cell=f"{get_column_letter(column)}{row}", formula=formula.expression,
+                cached_value=json_value(formula.cached_value),
+                cache_available=formula.cached_value is not None,
+            )
+            for index in formula_indices
+            for (row, column), formula in [formula_items[index]]
+        ]
+        error_positions = [
+            (row, column) for row, column in sorted(sheet.error_positions)
+            if recipe.data_start_row <= row <= end_row
+            and recipe.data_start_column <= column <= end_column
+        ]
+        result.error_cell_count = len(error_positions)
+        result.error_cells = [f"{get_column_letter(column)}{row}" for row, column in error_positions[:100]]
+        if missing_formulas:
+            result.warnings.append(
+                f"Hay {len(missing_formulas)} fórmulas sin valor almacenado en el bloque; "
+                "se conserva su expresión original sin recalcularla."
+            )
+        if error_positions:
+            result.warnings.append(
+                f"Hay {len(error_positions)} errores de Excel en el bloque; se conservaron sus valores."
+            )
+        occupied = self._occupied_cells(sheet)
+        result.source_nonempty_cells = int(occupied[
+            recipe.data_start_row - 1:end_row, recipe.data_start_column - 1:end_column,
+        ].sum())
         row_numbers = sheet.frame.index + 1
         outside = ~row_numbers.isin(recipe.header_rows) & (
             (row_numbers < recipe.data_start_row) | (row_numbers > end_row)
@@ -295,7 +628,10 @@ class PandasTabularProcessor:
         nonempty |= (excluded.index + 1).isin(sheet.formula_rows)
         result.excluded_nonempty_rows = int(nonempty.sum())
         for row in recipe.header_rows:
-            values = [value for value in sheet.frame.iloc[row - 1] if not is_empty(value)]
+            values = [
+                value for value in sheet.frame.iloc[row - 1, recipe.data_start_column - 1:end_column]
+                if not is_empty(value)
+            ]
             if any(self._is_numeric(value) for value in values):
                 result.suspicious_header_rows.append(row)
         if result.suspicious_header_rows:
@@ -303,11 +639,17 @@ class PandasTabularProcessor:
                 "Los encabezados seleccionados contienen valores numéricos; "
                 "podrían ser registros."
             )
-        formula_columns = {names[column - 1] for column in sheet.formula_columns}
+        if recipe.role == "unknown":
+            result.findings.append(TabularFinding(
+                code="unresolved_block_role", sheet_name=sheet.name, block_id=recipe.block_id,
+                range=(f"{get_column_letter(recipe.data_start_column)}{recipe.data_start_row}:"
+                       f"{get_column_letter(end_column)}{end_row}"),
+                message="El bloque se conserva sin transformaciones y requiere resolver su rol.",
+            ))
         for transformation in recipe.transformations:
             try:
                 frame = self._transform(
-                    frame, transformation, result, sheet.formula_rows, formula_columns,
+                    frame, transformation, result, formula_positions, column_positions,
                 )
             except (ValueError, TypeError, OverflowError) as error:
                 result.errors.append(str(error))
@@ -316,11 +658,24 @@ class PandasTabularProcessor:
         result.columns_after = list(frame.columns)
         result.empty_columns = [
             name for name in frame.columns
-            if name not in formula_columns and frame[name].map(is_empty).all()
+            if name not in formula_positions and frame[name].map(is_empty).all()
         ]
+        retained = ~frame.map(is_empty)
+        for name, formula_rows in formula_positions.items():
+            if name in retained.columns:
+                retained.loc[(retained.index + 1).isin(formula_rows), name] = True
+        result.preserved_nonempty_cells = int(retained.to_numpy(dtype=bool).sum())
         result.inferred_types = {name: infer_type(frame[name]) for name in frame.columns}
         result.sample = self._sample(frame)
         return result
+
+    def _sample_positions(self, size: int, count: int) -> list[int]:
+        if not size:
+            return []
+        count = min(count, size)
+        if count <= 1:
+            return [0] if count else []
+        return sorted({index * (size - 1) // (count - 1) for index in range(count)})
 
     def _is_numeric(self, value: object) -> bool:
         if isinstance(value, bool):
@@ -339,18 +694,19 @@ class PandasTabularProcessor:
         frame: pd.DataFrame,
         transformation: object,
         result: SheetExecution,
-        formula_rows: set[int],
-        formula_columns: set[str],
+        formula_positions: dict[str, set[int]],
+        column_positions: dict[str, int],
     ) -> pd.DataFrame:
         if isinstance(transformation, DropEmptyRows):
             empty = frame.map(is_empty).all(axis=1)
+            formula_rows = set().union(*formula_positions.values()) if formula_positions else set()
             empty &= ~(frame.index + 1).isin(formula_rows)
             result.dropped_empty_rows += int(empty.sum())
             return frame.loc[~empty].copy()
         if isinstance(transformation, DropEmptyColumns):
             empty_columns = [
                 name for name in frame.columns
-                if name not in formula_columns and frame[name].map(is_empty).all()
+                if name not in formula_positions and frame[name].map(is_empty).all()
             ]
             result.dropped_empty_columns.extend(empty_columns)
             return frame.drop(columns=empty_columns)
@@ -359,9 +715,10 @@ class PandasTabularProcessor:
             names = [transformation.mapping.get(name, name) for name in frame.columns]
             if any(not name.strip() for name in names) or len(names) != len(set(names)):
                 raise ValueError("El renombrado produce nombres vacíos o columnas duplicadas.")
-            renamed_formulas = {transformation.mapping.get(name, name) for name in formula_columns}
-            formula_columns.clear()
-            formula_columns.update(renamed_formulas)
+            for mapping in (formula_positions, column_positions):
+                renamed = {transformation.mapping.get(name, name): value for name, value in mapping.items()}
+                mapping.clear()
+                mapping.update(renamed)
             return frame.rename(columns=transformation.mapping)
         if isinstance(transformation, StripStrings):
             selected = transformation.columns if transformation.columns is not None else list(frame.columns)
@@ -374,11 +731,23 @@ class PandasTabularProcessor:
         if isinstance(transformation, ConvertType):
             self._require_columns(frame, transformation.columns)
             for name in transformation.columns:
-                original = frame[name].map(lambda value: None if is_empty(value) else value)
+                original = frame[name].copy()
                 converted = self._convert(original, transformation.target_type)
-                failures = int((original.notna() & converted.isna()).sum())
+                invalid = ~original.map(is_empty) & converted.isna()
+                failures = int(invalid.sum())
                 if failures:
                     result.conversion_failures[name] = result.conversion_failures.get(name, 0) + failures
+                    for row in original.index[invalid]:
+                        coordinate = f"{get_column_letter(column_positions[name])}{int(row) + 1}"
+                        result.findings.append(TabularFinding(
+                            code="conversion_preserved", sheet_name=result.sheet_name,
+                            block_id=result.block_id, cell=coordinate,
+                            message=(f"No se convirtió {coordinate} a {transformation.target_type}; "
+                                     "se conservó el valor original."),
+                        ))
+                converted = converted.astype(object)
+                unchanged = converted.isna()
+                converted.loc[unchanged] = original.loc[unchanged]
                 frame[name] = converted
             return frame
         raise ValueError("La receta contiene una operación no permitida.")
@@ -393,12 +762,12 @@ class PandasTabularProcessor:
             converted = pd.to_numeric(series.dropna(), errors="coerce").astype(object).reindex(series.index)
             values = []
             for original, value in zip(series, converted, strict=True):
-                if is_empty(value) or not math.isfinite(value):
+                if (is_empty(value) or not math.isfinite(value)
+                        or isinstance(original, (bool, np.bool_)) or self._is_padded_code(original)):
                     values.append(None)
                     continue
                 try:
-                    source_text = str(int(original)) if isinstance(original, bool) else str(original).strip()
-                    source = Decimal(source_text)
+                    source = Decimal(str(original).strip())
                     precise = source == Decimal(str(value))
                 except InvalidOperation:
                     precise = False
@@ -407,6 +776,8 @@ class PandasTabularProcessor:
         if target_type == "integer":
             def to_integer(value: object) -> int | None:
                 if is_empty(value):
+                    return None
+                if isinstance(value, (bool, np.bool_)) or self._is_padded_code(value):
                     return None
                 try:
                     number = Decimal(str(value).strip())
@@ -421,22 +792,31 @@ class PandasTabularProcessor:
                 return None
             return pd.Series([to_integer(value) for value in series], index=series.index, dtype="Int64")
         if target_type == "datetime":
-            unambiguous = series.map(lambda value: None if isinstance(value, Number) else value)
+            def unambiguous_date(value: object) -> object:
+                if isinstance(value, (datetime, date, pd.Timestamp)):
+                    return value
+                if isinstance(value, str) and re.fullmatch(
+                    r"\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d{1,9})?)?(?:Z|[+-]\d{2}:\d{2})?)?",
+                    value.strip(),
+                ):
+                    return value.strip()
+                return None
+            unambiguous = series.map(unambiguous_date)
             return pd.to_datetime(unambiguous, errors="coerce", format="mixed", utc=True)
         if target_type == "boolean":
             values = {
                 "true": True, "false": False,
-                "1": True, "0": False,
-                "yes": True, "no": False,
-                "si": True, "sí": True,
             }
             def to_boolean(value: object) -> bool | None:
                 if is_empty(value):
                     return None
                 if isinstance(value, bool):
                     return value
-                if isinstance(value, Number) and value in (0, 1):
-                    return bool(value)
                 return values.get(str(value).strip().casefold())
             return pd.Series([to_boolean(value) for value in series], index=series.index, dtype="boolean")
         raise ValueError("El tipo de conversión no está permitido.")
+
+    def _is_padded_code(self, value: object) -> bool:
+        return isinstance(value, str) and bool(re.fullmatch(
+            r"[+-]?0\d+(?:\.\d+)?(?:[eE][+-]?\d+)?", value.strip(),
+        ))

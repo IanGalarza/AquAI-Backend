@@ -16,6 +16,12 @@ from aquai.application.errors import FileTooLargeError, TabularInputError
 
 
 @dataclass
+class FormulaData:
+    expression: str
+    cached_value: object
+
+
+@dataclass
 class SheetData:
     name: str
     frame: pd.DataFrame
@@ -24,10 +30,12 @@ class SheetData:
     formula_count: int = 0
     formula_rows: set[int] = field(default_factory=set)
     formula_columns: set[int] = field(default_factory=set)
+    formula_cells: dict[tuple[int, int], FormulaData] = field(default_factory=dict)
     missing_formula_cache_count: int = 0
     missing_formula_cells: list[str] = field(default_factory=list)
     error_cell_count: int = 0
     error_cells: list[str] = field(default_factory=list)
+    error_positions: set[tuple[int, int]] = field(default_factory=set)
 
 
 @dataclass
@@ -217,20 +225,26 @@ class TableReader:
                 rows = []
                 error_cells = []
                 error_cell_count = 0
+                error_positions = set()
                 for cached_row in cached_rows:
                     rows.append([cell.value for cell in cached_row])
                     for cell in cached_row:
                         if cell.data_type == "e":
                             error_cell_count += 1
+                            error_positions.add((cell.row, cell.column))
                             if len(error_cells) < 100:
                                 error_cells.append(cell.coordinate)
                 data = SheetData(
                     worksheet.title,
                     pd.DataFrame(rows, dtype=object),
-                    [str(merged) for merged in worksheet.merged_cells.ranges],
+                    [str(merged) for merged in sorted(
+                        worksheet.merged_cells.ranges,
+                        key=lambda merged: (merged.min_row, merged.min_col, merged.max_row, merged.max_col),
+                    )],
                 )
                 data.error_cell_count = error_cell_count
                 data.error_cells = error_cells
+                data.error_positions = error_positions
                 formula_cells = [
                     cell for row in worksheet.iter_rows() for cell in row if cell.data_type == "f"
                 ]
@@ -248,6 +262,9 @@ class TableReader:
                     data.formula_rows.add(cell.row)
                     data.formula_columns.add(cell.column)
                     cached_value = data.frame.iat[cell.row - 1, cell.column - 1]
+                    data.formula_cells[(cell.row, cell.column)] = FormulaData(
+                        expression=str(cell.value), cached_value=cached_value,
+                    )
                     if cached_value is None:
                         data.missing_formula_cache_count += 1
                         if len(data.missing_formula_cells) < 100:
@@ -255,7 +272,7 @@ class TableReader:
                     if index in sample_positions:
                         data.formulas.append({
                             "cell": cell.coordinate,
-                            "formula": str(cell.value)[:200],
+                            "formula": str(cell.value),
                             "cached_value": cached_value,
                         })
                 sheets.append(data)

@@ -17,6 +17,7 @@ dependencies = [
     "qdrant-client",
     "langgraph",
     "pandas",
+    "numpy",
     "openpyxl",
     "plotly",
     "pymupdf",
@@ -29,3 +30,6 @@ dependencies = [
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+"aquai.infrastructure.config" = ["tabular_rules.json"]

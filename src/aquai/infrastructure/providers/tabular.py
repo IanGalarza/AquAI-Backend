@@ -1,9 +1,11 @@
 from functools import lru_cache
 
+from aquai.application.services.tabular_rules import TabularRuleService
 from aquai.application.use_cases.evaluate_tabular_file import EvaluateTabularFile
 from aquai.infrastructure.config.tabular import TabularSettings
 from aquai.infrastructure.processing.tabular.processor import PandasTabularProcessor
 from aquai.infrastructure.providers.llm.ollama import OllamaProvider
+from aquai.infrastructure.providers.tabular_rules import FileTabularRuleCatalog
 
 
 @lru_cache(maxsize=1)
@@ -24,4 +26,5 @@ def get_tabular_evaluator() -> EvaluateTabularFile:
         OllamaProvider(settings),
         default_model=settings.default_model,
         max_upload_bytes=settings.max_upload_bytes,
+        rule_service=TabularRuleService(FileTabularRuleCatalog()),
     )

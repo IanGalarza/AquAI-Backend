@@ -18,8 +18,13 @@ from aquai.main import create_app
 def recipe(sheet_name: str = "data", **sheet_overrides: object) -> dict:
     sheet = {
         "sheet_name": sheet_name,
+        "block_id": "observations",
+        "role": "observations",
         "header_rows": [1],
         "data_start_row": 2,
+        "data_end_row": 3,
+        "data_start_column": 1,
+        "data_end_column": 2,
         "transformations": [],
     }
     sheet.update(sheet_overrides)
@@ -105,6 +110,34 @@ class TabularEndpointTests(unittest.TestCase):
         self.assertEqual(user_message["known_rules"], "Conservar todos los registros.")
         self.assertEqual(self.requests[0]["model"], self.settings.default_model)
 
+    def test_multiple_blocks_keep_totals_and_legend_without_reporting_data_loss(self) -> None:
+        observations = recipe(
+            block_id="observations", role="observations", data_end_row=3,
+            data_end_column=2,
+            transformations=[{"operation": "convert_type", "columns": ["count"], "target_type": "integer"}],
+        )["sheets"][0]
+        total = recipe(
+            block_id="total", role="total", data_start_row=4, data_end_row=4,
+            data_end_column=2,
+        )["sheets"][0]
+        legend = recipe(
+            block_id="legend", role="legend", header_rows=[], data_start_row=6,
+            data_end_row=6, data_end_column=2,
+        )["sheets"][0]
+        self.raw_content = json.dumps({
+            "status": "ready", "sheets": [observations, total, legend],
+            "warnings": [], "requires_human_review": False,
+        })
+        response = self.upload(b"taxon,count\nA,0\nB,2\nTotal,2\n\nnote,nd\n")
+        self.assertEqual(response.status_code, 200, response.text)
+        result = response.json()
+        self.assertIn(result["validation"]["status"], {"ready", "ready_with_warnings"})
+        self.assertTrue(result["response_format"]["recipe_executable"])
+        self.assertEqual(result["execution"]["coverage"][0]["uncovered_nonempty_cells"], 0)
+        self.assertEqual(result["execution"]["sheets"][0]["sample"][0]["values"], ["A", 0])
+        self.assertEqual(result["execution"]["sheets"][2]["sample"][0]["values"], ["note", "nd"])
+        self.assertEqual(len(self.requests), 1)
+
     def test_text_around_recipe_is_tolerated_and_preserved(self) -> None:
         self.raw_content = "Propuesta:\n```json\n" + json.dumps(recipe()) + "\n```\nFin."
         response = self.upload()
@@ -167,7 +200,7 @@ class TabularEndpointTests(unittest.TestCase):
         content = BytesIO()
         workbook.save(content)
         workbook.close()
-        self.raw_content = json.dumps(recipe(sheet_name="Records"))
+        self.raw_content = json.dumps(recipe(sheet_name="Records", data_end_row=2))
         response = self.upload(content.getvalue(), file_name="records.xlsx")
         self.assertEqual(response.status_code, 200, response.text)
         body = response.json()
@@ -202,7 +235,9 @@ class TabularEndpointTests(unittest.TestCase):
         self.assertFalse(body["response_format"]["recipe_executable"])
 
     def test_failed_recipe_does_not_execute_even_if_it_includes_sheets(self) -> None:
-        self.raw_content = json.dumps({**recipe(), "status": "failed"})
+        self.raw_content = json.dumps({
+            **recipe(), "status": "failed", "warnings": ["No puede justificarse una propuesta utilizable."],
+        })
         response = self.upload()
         self.assertEqual(response.status_code, 200, response.text)
         body = response.json()
