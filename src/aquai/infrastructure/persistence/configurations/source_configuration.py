@@ -35,6 +35,9 @@ def configure(mapper_registry: registry) -> None:
             # El contenido binario se carga recién cuando se accede a esta propiedad.
             "file_content": deferred(table.c.file_content),
             "processing_status": relationship("ProcessingStatus", back_populates="sources"),
+            "source_recipe": relationship(
+                "SourceRecipe", back_populates="source", uselist=False, passive_deletes="all",
+            ),
             "datasets": relationship("Dataset", back_populates="source", passive_deletes="all"),
             "message_sources": relationship(
                 "MessageSource", back_populates="source", passive_deletes="all",

@@ -24,6 +24,11 @@ from aquai.infrastructure.persistence.configurations.status_seeds import (
 from aquai.infrastructure.persistence.mapping import configure_mappings, metadata
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+INITIAL_REVISION_TABLES = {
+    "Source", "ProcessingStatus", "Dataset", "Conversation", "Message",
+    "MessageStatus", "MessageSource",
+}
+PENDING_MIGRATION_TABLES = {"SourceRecipe", "ValidationStatus"}
 
 
 class MigrationTests(unittest.TestCase):
@@ -77,16 +82,18 @@ class MigrationTests(unittest.TestCase):
             cls.revision.module.downgrade()
         cls.downgrade_sql = buffer.getvalue()
 
-    def test_initial_revision_creates_only_the_current_model_tables(self) -> None:
+    def test_initial_revision_preserves_its_historical_tables(self) -> None:
         self.assertIsNone(self.revision.down_revision)
         self.assertEqual(self.revision.doc, "InitialCreate")
-        self.assertEqual(set(self.created_tables), set(metadata.tables))
+        self.assertEqual(set(self.created_tables), INITIAL_REVISION_TABLES)
+        self.assertEqual(set(metadata.tables), INITIAL_REVISION_TABLES | PENDING_MIGRATION_TABLES)
         self.assertEqual(len(self.created_tables), 7)
         self.assertNotIn("SERIAL", self.upgrade_sql)
 
     def test_generated_columns_preserve_names_types_nullability_and_keys(self) -> None:
         dialect = postgresql.dialect()
-        for name, expected in metadata.tables.items():
+        for name in sorted(INITIAL_REVISION_TABLES):
+            expected = metadata.tables[name]
             generated = self.created_tables[name]
             with self.subTest(table=name):
                 self.assertEqual(
@@ -125,7 +132,8 @@ class MigrationTests(unittest.TestCase):
             return {(index.name, tuple(column.name for column in index.columns), index.unique)
                     for index in table.indexes}
 
-        for name, expected in metadata.tables.items():
+        for name in sorted(INITIAL_REVISION_TABLES):
+            expected = metadata.tables[name]
             generated = self.created_tables[name]
             with self.subTest(table=name):
                 self.assertEqual(foreign_keys(generated), foreign_keys(expected))

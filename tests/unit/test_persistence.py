@@ -25,10 +25,13 @@ class PersistenceTests(unittest.TestCase):
 
     def test_mapping_registration_is_idempotent_and_schema_compiles_offline(self) -> None:
         configure_mappings()
-        self.assertEqual(len(list(mapper_registry.mappers)), 7)
+        self.assertEqual(len(list(mapper_registry.mappers)), 9)
         self.assertEqual(
             set(metadata.tables),
-            {"Source", "ProcessingStatus", "Dataset", "Conversation", "Message", "MessageStatus", "MessageSource"},
+            {
+                "Source", "ProcessingStatus", "Dataset", "Conversation", "Message",
+                "MessageStatus", "MessageSource", "SourceRecipe", "ValidationStatus",
+            },
         )
         ddl = "\n".join(
             str(CreateTable(table).compile(dialect=postgresql.dialect()))

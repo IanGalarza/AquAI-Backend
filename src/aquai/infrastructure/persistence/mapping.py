@@ -13,6 +13,8 @@ from aquai.infrastructure.persistence.configurations import (
     message_status_configuration,
     processing_status_configuration,
     source_configuration,
+    source_recipe_configuration,
+    validation_status_configuration,
 )
 
 metadata = MetaData(naming_convention={
@@ -37,7 +39,9 @@ def configure_mappings() -> None:
         for configuration in (
             processing_status_configuration,
             message_status_configuration,
+            validation_status_configuration,
             source_configuration,
+            source_recipe_configuration,
             dataset_configuration,
             conversation_configuration,
             message_configuration,

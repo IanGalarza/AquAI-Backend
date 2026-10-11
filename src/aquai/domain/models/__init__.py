@@ -8,6 +8,8 @@ from aquai.domain.models.message_source import MessageSource
 from aquai.domain.models.message_status import MessageStatus
 from aquai.domain.models.processing_status import ProcessingStatus
 from aquai.domain.models.source import Source
+from aquai.domain.models.source_recipe import SourceRecipe
+from aquai.domain.models.validation_status import ValidationStatus
 
 __all__ = [
     "Conversation",
@@ -19,4 +21,6 @@ __all__ = [
     "MessageStatus",
     "ProcessingStatus",
     "Source",
+    "SourceRecipe",
+    "ValidationStatus",
 ]

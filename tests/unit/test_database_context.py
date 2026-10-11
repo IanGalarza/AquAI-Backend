@@ -67,7 +67,7 @@ class DbContextTests(unittest.TestCase):
 
     def test_engine_is_lazy_and_metadata_never_connects(self) -> None:
         self.create_engine.assert_not_called()
-        self.assertEqual(len(self.context.metadata.tables), 7)
+        self.assertEqual(len(self.context.metadata.tables), 9)
         self.create_engine.assert_not_called()
         self.assertIs(self.context.engine, self.engine)
         self.assertIs(self.context.engine, self.engine)
@@ -96,8 +96,8 @@ with patch.dict('os.environ', {}, clear=True), patch(
     first_mapper = Conversation.__mapper__
     initialize_application()
     assert Conversation.__mapper__ is first_mapper
-    assert len(list(mapper_registry.mappers)) == 7
-    assert len(metadata.tables) == 7
+    assert len(list(mapper_registry.mappers)) == 9
+    assert len(metadata.tables) == 9
     conversation = Conversation(title='startup')
     with Session() as session:
         session.add(conversation)

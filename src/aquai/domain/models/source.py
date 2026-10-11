@@ -11,6 +11,7 @@ if TYPE_CHECKING:
     from aquai.domain.models.dataset import Dataset
     from aquai.domain.models.message_source import MessageSource
     from aquai.domain.models.processing_status import ProcessingStatus
+    from aquai.domain.models.source_recipe import SourceRecipe
 
 
 @dataclass(kw_only=True, eq=False)
@@ -29,6 +30,9 @@ class Source:
     updated_at: datetime | None = None
 
     processing_status: ProcessingStatus | None = field(
+        default=None, init=False, repr=False, compare=False
+    )
+    source_recipe: SourceRecipe | None = field(
         default=None, init=False, repr=False, compare=False
     )
     datasets: list[Dataset] = field(
