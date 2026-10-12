@@ -1,6 +1,6 @@
 """Catálogo de conjuntos de datos y clave candidata que asegura su correspondencia con la fuente."""
 
-from sqlalchemy import Boolean, Column, ForeignKey, Integer, String, Table, Text, UniqueConstraint
+from sqlalchemy import BigInteger, Boolean, CheckConstraint, Column, ForeignKey, Integer, JSON, String, Table, Text, UniqueConstraint
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import registry, relationship
 
@@ -19,12 +19,21 @@ def configure(mapper_registry: registry) -> None:
         ),
         Column("name", String, nullable=False),
         Column("description", Text, nullable=True),
-        Column("sourceLocator", JSONB(none_as_null=True), key="source_locator", nullable=False),
-        Column("physicalTableName", String, key="physical_table_name", nullable=True),
+        Column("sourceLocator", JSONB().with_variant(JSON(), "sqlite"), key="source_locator", nullable=False),
+        Column("physicalTableName", String(63), key="physical_table_name", nullable=False, unique=True),
         Column("version", Integer, nullable=False),
         Column("isActive", Boolean, key="is_active", nullable=False),
+        Column("rowCount", BigInteger, key="row_count", nullable=False),
+        Column("columnsMetadata", JSONB().with_variant(JSON(), "sqlite"), key="columns_metadata", nullable=False),
+        Column("queryable", Boolean, nullable=False),
+        Column("qualityWarnings", JSONB().with_variant(JSON(), "sqlite"), key="quality_warnings", nullable=False),
+        Column("semanticDescription", Text, key="semantic_description", nullable=True),
+        Column("semanticPointId", UUID(as_uuid=True), key="semantic_point_id", nullable=False, unique=True),
         *timestamp_columns(),
         UniqueConstraint("id", "source_id", name="uq_Dataset_id_sourceId"),
+        CheckConstraint('"rowCount" >= 0', name="row_count_nonnegative"),
+        CheckConstraint('version >= 1', name="version_positive"),
+        CheckConstraint('NOT queryable OR "rowCount" > 0', name="queryable_has_rows"),
     )
     mapper_registry.map_imperatively(
         Dataset,

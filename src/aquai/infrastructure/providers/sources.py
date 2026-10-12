@@ -1,69 +1,58 @@
-"""Composición de handlers y worker de fuentes."""
-
+"""Composición de handlers, adaptadores y worker de fuentes."""
 from dataclasses import dataclass
 
 from aquai.application.interfaces.sources import SourceCommands, SourceQueries
-from aquai.application.services.sourceReviews import SourceReviewService
-from aquai.application.services.tabularEvaluation import TabularEvaluationService
+from aquai.application.interfaces.tabular import SemanticIndex, SemanticProvider, TabularProcessor
 from aquai.application.useCases.sources import (
-    GetSourceHandler,
-    ListSourcesHandler,
-    ProcessSourceHandler,
-    ReviewSourceHandler,
-    UploadSourceHandler,
+    ActivateSourceHandler, GetSourceHandler, ListSourcesHandler,
+    ProcessSourceHandler, UploadSourceHandler,
 )
 from aquai.bootstrap import initialize_application
 from aquai.infrastructure.commands.sources import SqlAlchemySourceCommands
 from aquai.infrastructure.providers.database import get_db_context
-from aquai.infrastructure.providers.tabular import get_tabular_evaluator, get_tabular_settings
+from aquai.infrastructure.providers.tabular import get_tabular_settings
 from aquai.infrastructure.queries.sources import SqlAlchemySourceQueries
 from aquai.infrastructure.workers.sourceWorker import SourceWorker
 
 
 @dataclass(frozen=True)
 class SourceRuntime:
-    """Dependencias compartidas; cada operación se ejecuta en su propio handler."""
-
     upload: UploadSourceHandler
     list: ListSourcesHandler
     get: GetSourceHandler
-    review: ReviewSourceHandler
+    activate: ActivateSourceHandler
     worker: SourceWorker
 
 
-def build_source_runtime(
-    commands: SourceCommands,
-    queries: SourceQueries,
-    evaluator: TabularEvaluationService,
-    *,
-    max_upload_bytes: int,
-    reviews: SourceReviewService | None = None,
-    poll_seconds: float = 1.0,
-) -> SourceRuntime:
-    reviews = reviews or SourceReviewService()
-    processor = ProcessSourceHandler(commands, queries, evaluator, reviews=reviews)
-    worker = SourceWorker(commands, processor, poll_seconds=poll_seconds)
+def build_source_runtime(commands: SourceCommands, queries: SourceQueries,
+                         processor: TabularProcessor, semantics: SemanticProvider,
+                         index: SemanticIndex, *, max_upload_bytes: int,
+                         poll_seconds: float = 1.0) -> SourceRuntime:
+    handler = ProcessSourceHandler(commands, queries, processor, semantics, index)
+    worker = SourceWorker(commands, handler, poll_seconds=poll_seconds)
     return SourceRuntime(
         upload=UploadSourceHandler(
-            commands,
-            queries,
-            evaluator,
-            max_upload_bytes=max_upload_bytes,
-            notify=worker.wake,
+            commands, queries, processor, max_upload_bytes=max_upload_bytes, notify=worker.wake,
         ),
-        list=ListSourcesHandler(queries),
-        get=GetSourceHandler(queries, reviews=reviews),
-        review=ReviewSourceHandler(commands, reviews=reviews, notify=worker.wake),
+        list=ListSourcesHandler(queries), get=GetSourceHandler(queries),
+        activate=ActivateSourceHandler(commands, queries, notify=worker.wake),
         worker=worker,
     )
 
 
 def create_source_runtime() -> SourceRuntime:
+    from aquai.infrastructure.processing.tabular.processor import SimpleTabularProcessor
+    from aquai.infrastructure.providers.llm.ollama import (
+        OllamaEmbeddingProvider, OllamaSemanticProvider,
+    )
+    from aquai.infrastructure.providers.semanticIndex import QdrantSemanticIndex
+
     initialize_application()
     context = get_db_context()
+    settings = get_tabular_settings()
+    queries = SqlAlchemySourceQueries(context)
+    index = QdrantSemanticIndex(settings, embeddings=OllamaEmbeddingProvider(settings), queries=queries)
     return build_source_runtime(
-        SqlAlchemySourceCommands(context),
-        SqlAlchemySourceQueries(context),
-        get_tabular_evaluator(),
-        max_upload_bytes=get_tabular_settings().max_upload_bytes,
+        SqlAlchemySourceCommands(context), queries, SimpleTabularProcessor(settings),
+        OllamaSemanticProvider(settings), index, max_upload_bytes=settings.max_upload_bytes,
     )

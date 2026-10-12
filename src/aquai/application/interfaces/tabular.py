@@ -1,29 +1,17 @@
+"""Lectura determinística y descripción semántica sin planes ejecutables."""
 from typing import Protocol
-
-from aquai.application.contracts.tabular.results import ExecutionResult, LLMResponse
-from aquai.application.contracts.tabular.recipe import PreparationRecipe
-from aquai.application.contracts.tabular.structure import StructuralSummary
-from aquai.application.contracts.tabular.policies import PreparationPolicies
+from aquai.application.contracts.ingestion import PreparationResult, PreparedTable, SemanticDescription
 
 
 class TabularProcessor(Protocol):
-    def inspect(self, file_name: str, content: bytes) -> StructuralSummary: ...
-
-    def execute(
-        self,
-        file_name: str,
-        content: bytes,
-        recipe: PreparationRecipe,
-        summary: StructuralSummary,
-        *,
-        policies: PreparationPolicies | None = None,
-    ) -> ExecutionResult: ...
+    def validate_upload(self, filename: str | None, content: bytes) -> str: ...
+    def prepare(self, filename: str, content: bytes) -> PreparationResult: ...
 
 
-class LLMProvider(Protocol):
-    async def generate_recipe(
-        self,
-        summary: StructuralSummary,
-        model: str,
-        known_rules: str | None = None,
-    ) -> LLMResponse: ...
+class SemanticProvider(Protocol):
+    async def describe(self, table: PreparedTable) -> SemanticDescription: ...
+
+
+class SemanticIndex(Protocol):
+    async def index_source(self, source: dict) -> None: ...
+    async def set_source_active(self, source_id: str, active: bool) -> None: ...

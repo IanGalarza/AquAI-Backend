@@ -1,7 +1,5 @@
 """Listado paginado y filtrado de fuentes."""
-
 import asyncio
-
 from aquai.application.dtos.requests.listSources import ListSourcesRequest
 from aquai.application.dtos.responses.listSources import SourceListResponse
 from aquai.application.interfaces.sources import SourceQueries
@@ -13,11 +11,7 @@ class ListSourcesHandler:
 
     async def handle(self, request: ListSourcesRequest) -> SourceListResponse:
         result = await asyncio.to_thread(
-            self._queries.list,
-            page=request.page,
-            page_size=request.page_size,
-            search=request.name,
-            processing_status=request.processing_status,
-            validation_status=request.validation_status,
+            self._queries.list, page=request.page, page_size=request.page_size,
+            search=request.name, processing_status=request.processing_status,
         )
         return SourceListResponse.model_validate(result)

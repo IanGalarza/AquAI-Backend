@@ -4,6 +4,7 @@ from collections.abc import Awaitable, Callable
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
+from sqlalchemy.exc import SQLAlchemyError
 
 from aquai.application.errors import (
     FileTooLargeError,
@@ -15,9 +16,10 @@ from aquai.application.errors import (
 
 
 ERROR_RESPONSES = {
-    400: {"description": "Carga o decisión inválida."},
-    404: {"description": "Fuente o revisión inexistente."},
-    409: {"description": "La revisión ya no corresponde al estado actual."},
+    400: {"description": "Archivo o solicitud inválidos."},
+    404: {"description": "Fuente inexistente."},
+    409: {"description": "Estado incompatible con la operación."},
+    413: {"description": "El archivo supera el límite permitido."},
     503: {"description": "La persistencia o el procesamiento de fuentes no está disponible."},
 }
 
@@ -40,3 +42,7 @@ def _error_handler(status_code: int) -> Callable[[Request, Exception], Awaitable
 def register_exception_handlers(app: FastAPI) -> None:
     for error_type, status_code in _ERROR_STATUS_CODES.items():
         app.add_exception_handler(error_type, _error_handler(status_code))
+    async def database_unavailable(_request: Request, _error: Exception) -> JSONResponse:
+        return JSONResponse(status_code=503, content={"detail": "La persistencia no está disponible."})
+
+    app.add_exception_handler(SQLAlchemyError, database_unavailable)

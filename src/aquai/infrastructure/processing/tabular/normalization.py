@@ -1,94 +1,117 @@
-"""Parsers explícitos que conservan entradas no autorizadas o ambiguas."""
+"""Nombres SQL seguros y conversiones conservadoras sobre columnas completas."""
 
 import math
 import re
-from dataclasses import dataclass
+import unicodedata
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
-from numbers import Number
+
+from aquai.infrastructure.processing.tabular.reader import LiteralText, is_empty
 
 
-@dataclass(frozen=True)
-class ParsingResult:
-    value: object
-    changed: bool = False
-    conflict: str | None = None
+RESERVED_COLUMNS = {"_aquai_row", "_aquai_source_row"}
+INTEGER = re.compile(r"[+-]?(?:0|[1-9]\d*)\Z")
+NUMBER = re.compile(r"[+-]?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?\Z")
+ISO_DATE = re.compile(r"\d{4}-\d{2}-\d{2}\Z")
+ISO_TIMESTAMP = re.compile(r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?\Z")
 
 
-def trace_value(value: object) -> object:
-    """Serializa evidencias sin recortar textos ni alterar sus espacios."""
-    if isinstance(value, (datetime, date)):
+def column_names(originals: list[str]) -> list[str]:
+    used = set(RESERVED_COLUMNS)
+    names = []
+    for index, original in enumerate(originals, 1):
+        ascii_name = unicodedata.normalize("NFKD", original).encode("ascii", "ignore").decode()
+        base = re.sub(r"[^a-z0-9_]+", "_", ascii_name.lower()).rstrip("_") or f"column_{index}"
+        if base[0].isdigit() or base in RESERVED_COLUMNS:
+            base = "column_" + base.lstrip("_")
+        base = base[:63]
+        name, count = base, 2
+        while name in used:
+            suffix = f"_{count}"
+            name = base[:63 - len(suffix)] + suffix
+            count += 1
+        used.add(name)
+        names.append(name)
+    return names
+
+
+def header_unit(name: str) -> str | None:
+    match = re.search(r"(?:\[([^\[\]]+)\]|\(([^()]+)\))\s*$", name)
+    if not match:
+        return None
+    unit = (match.group(1) or match.group(2)).strip()
+    if "\ufffd" in unit:
+        return None
+    simple = re.fullmatch(r"(?:%|[munpkMGTµμ]?g|[munpkµμ]?m|[munpµμ]?[Ll]|°[CF]|[munpµμ]?mol|s|min|h|ppm|ppb)", unit)
+    inverse = re.fullmatch(r"[\wµμ°%^. ·-]+\s+[munpµμ]?[Llms](?:-\d+|\^-\d+)", unit)
+    return unit if len(unit) <= 40 and (simple or inverse or re.fullmatch(r"[\wµμ°%^. ·-]+/[\wµμ°%^. ·-]+", unit)) else None
+
+
+def text_value(value: object) -> str | None:
+    if is_empty(value):
+        return None
+    if isinstance(value, (date, datetime)):
         return value.isoformat()
-    if hasattr(value, "item"):
-        value = value.item()
-    if isinstance(value, float) and not math.isfinite(value):
-        return str(value)
-    return value
+    return str(value)
 
 
-def parse_explicit_date(value: object, formats: tuple[str, ...]) -> ParsingResult:
-    if value is None or isinstance(value, (date, datetime)):
-        return ParsingResult(value)
-    if isinstance(value, Number):
-        return ParsingResult(value, conflict="El número de la columna de fecha no tiene evidencia suficiente para interpretar un serial Excel.")
-    if not isinstance(value, str) or not value.strip():
-        return ParsingResult(value)
-    text = value.strip()
-    if re.fullmatch(r"\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:\d{2})?)?", text):
+def _number(value: object) -> Decimal | None:
+    if isinstance(value, (bool, LiteralText)):
+        return None
+    if isinstance(value, (int, Decimal)):
+        numeric = Decimal(value)
+    elif isinstance(value, float):
+        if not math.isfinite(value):
+            return None
+        numeric = Decimal(str(value))
+    elif isinstance(value, str) and NUMBER.fullmatch(value):
+        mantissa = re.split(r"[eE]", value)[0].lstrip("+-")
+        if "." in mantissa:
+            integral, fractional = mantissa.split(".")
+            if len(fractional) == 3 and 1 <= len(integral) <= 3 and integral != "0":
+                return None
         try:
-            datetime.fromisoformat(text.replace("Z", "+00:00"))
-        except ValueError:
-            return ParsingResult(value, conflict="El texto ISO contiene una fecha inválida; se conserva el original.")
-        return ParsingResult(text, changed=text != value)
-    for explicit_format in formats:
-        try:
-            parsed = datetime.strptime(text, explicit_format)
-        except ValueError:
-            continue
-        prepared = parsed.date().isoformat()
-        return ParsingResult(prepared, changed=prepared != value)
-    return ParsingResult(value, conflict="El texto de fecha no coincide con los formatos explícitos autorizados; se conserva el original.")
+            numeric = Decimal(value)
+        except InvalidOperation:
+            return None
+    else:
+        return None
+    return numeric if numeric.is_finite() and abs(numeric.adjusted()) <= 1000 else None
 
 
-def parse_mixed_decimal(value: object, separators: tuple[str, ...] = (",", ".")) -> ParsingResult:
-    if not isinstance(value, str) or not value.strip():
-        return ParsingResult(value)
-    text = value.strip()
-    if not re.fullmatch(r"[+-]?[\d.,]+(?:[eE][+-]?\d+)?", text):
-        return ParsingResult(value)
-    mantissa, *exponent = re.split(r"[eE]", text)
-    found = {separator for separator in (",", ".") if separator in mantissa}
-    if not found.issubset(separators):
-        return ParsingResult(value, conflict="El separador numérico no está autorizado en esta columna.")
-    normalized = mantissa
-    if len(found) == 2:
-        decimal_separator = "," if mantissa.rfind(",") > mantissa.rfind(".") else "."
-        grouping_separator = "." if decimal_separator == "," else ","
-        integral, fractional = mantissa.rsplit(decimal_separator, 1)
-        grouping = re.escape(grouping_separator)
-        if (not fractional.isdigit() or decimal_separator in integral
-                or not re.fullmatch(r"[+-]?\d{1,3}(?:" + grouping + r"\d{3})+", integral)):
-            return ParsingResult(value, conflict="Los separadores decimales y de miles no forman una representación inequívoca.")
-        normalized = integral.replace(grouping_separator, "") + "." + fractional
-    elif found:
-        separator = next(iter(found))
-        if mantissa.count(separator) != 1:
-            return ParsingResult(value, conflict="Los separadores repetidos requieren aclarar la representación de miles.")
-        integral, fractional = mantissa.split(separator)
-        unsigned_integral = integral.lstrip("+-")
-        if (fractional.isdigit() and len(fractional) == 3 and unsigned_integral.isdigit()
-                and 1 <= len(unsigned_integral) <= 3 and int(unsigned_integral) != 0):
-            return ParsingResult(value, conflict="Un separador seguido por tres dígitos puede ser decimal o de miles; se conserva el original.")
-        normalized = mantissa.replace(separator, ".")
-    if exponent:
-        normalized += "E" + exponent[0]
-    try:
-        numeric = Decimal(normalized)
-        if not numeric.is_finite():
-            raise InvalidOperation
-        prepared = int(numeric) if numeric == numeric.to_integral_value() else float(numeric)
-        if isinstance(prepared, float) and (not math.isfinite(prepared) or Decimal(str(prepared)) != numeric):
-            return ParsingResult(value, conflict="La conversión perdería precisión o magnitud; se conserva el texto original.")
-    except (InvalidOperation, ValueError, OverflowError):
-        return ParsingResult(value, conflict="El texto numérico no puede convertirse conservando su magnitud.")
-    return ParsingResult(prepared, changed=True)
+def infer_column(name: str, values: list[object]) -> tuple[str, list[object], str | None]:
+    present = [value for value in values if not is_empty(value)]
+    if not present:
+        return "TEXT", [None] * len(values), None
+    identifier = re.search(r"(?:^|[\s_-])(?:id|code|codigo|código|identificador)(?:$|[\s_-])", name, re.IGNORECASE)
+    if identifier:
+        return "TEXT", [text_value(value) for value in values], None
+    if all(isinstance(value, bool) for value in present):
+        return "BOOLEAN", [None if is_empty(value) else value for value in values], None
+    if all(isinstance(value, str) and value.lower() in {"true", "false"} for value in present):
+        return "BOOLEAN", [None if is_empty(value) else value.lower() == "true" for value in values], None
+    if all(isinstance(value, datetime) for value in present) and all(value.tzinfo is None for value in present):
+        return "TIMESTAMP", [None if is_empty(value) else value for value in values], None
+    if all(isinstance(value, date) and not isinstance(value, datetime) for value in present):
+        return "DATE", [None if is_empty(value) else value for value in values], None
+    for pattern, parser, sql_type in ((ISO_DATE, date.fromisoformat, "DATE"),
+                                      (ISO_TIMESTAMP, datetime.fromisoformat, "TIMESTAMP")):
+        if all(isinstance(value, str) and pattern.fullmatch(value) for value in present):
+            try:
+                return sql_type, [None if is_empty(value) else parser(value) for value in values], None
+            except ValueError:
+                break
+    numbers = [_number(value) for value in present]
+    if all(value is not None for value in numbers):
+        integers = all(value == value.to_integral_value() for value in numbers)
+        # Una fracción escrita conserva su escala incluso cuando representa un entero.
+        integers = integers and all(not isinstance(value, str) or INTEGER.fullmatch(value) for value in present)
+        integers = integers and all(not isinstance(value, Decimal) or value.as_tuple().exponent >= 0 for value in present)
+        integers = integers and all(not isinstance(value, float) for value in present)
+        if integers and all(-(2 ** 63) <= value < 2 ** 63 for value in numbers):
+            return "BIGINT", [None if is_empty(value) else int(_number(value)) for value in values], None
+        return "NUMERIC", [None if is_empty(value) else _number(value) for value in values], None
+    uncertain = any(isinstance(value, (int, float, Decimal, date))
+                    or (isinstance(value, str) and re.match(r"^[+-]?\d", value)) for value in present)
+    warning = f"La columna '{name}' permanece TEXT porque contiene valores mixtos o ambiguos." if uncertain else None
+    return "TEXT", [text_value(value) for value in values], warning

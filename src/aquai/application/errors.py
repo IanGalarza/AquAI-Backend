@@ -10,15 +10,15 @@ class LLMProviderError(RuntimeError):
     pass
 
 
+class SemanticIndexError(RuntimeError):
+    """Error público del índice sin URLs, credenciales ni contenido original."""
+
+
 class SourceNotFoundError(LookupError):
     pass
 
 
 class SourceConflictError(RuntimeError):
-    pass
-
-
-class SourceDecisionError(TabularInputError):
     pass
 
 

@@ -1,45 +1,38 @@
-"""Detalle de una fuente con revisiones y vistas previas tipadas."""
-
+"""Detalle sin originales binarios ni registros completos."""
 from datetime import datetime
-
-from pydantic import BaseModel, Field, JsonValue, field_serializer
-
-from aquai.application.dtos.responses.listSources import SourceListItem
-from aquai.application.dtos.responses.sourceDetails import (
-    SourceBlock,
-    SourceDatasetStorage,
-    SourceDecision,
-    SourceFinding,
-    SourcePreview,
-    SourceReview,
-    SourceTechnicalError,
-)
+from typing import Any
+from uuid import UUID
+from pydantic import BaseModel, ConfigDict, Field
+from aquai.application.dtos.responses.uploadSource import SourceAcceptedResponse
 
 
-class SourceDetailResponse(SourceListItem):
-    original_filename: str | None = None
-    mime_type: str | None = None
-    updated_at: datetime | None = None
-    stage: str
-    revision: int = Field(ge=0)
-    blocks: list[SourceBlock] = Field(default_factory=list, description="Bloques detectados y sus rangos de origen.")
-    preview: list[SourcePreview] = Field(default_factory=list, description="Vista previa acotada; no contiene el archivo completo.")
-    findings: list[SourceFinding] = Field(default_factory=list, description="Hallazgos de la última validación.")
-    reviews: list[SourceReview] = Field(default_factory=list, description="Revisiones vigentes: identificador estable, explicación, hoja/rango y acciones admitidas.")
-    decisions: list[SourceDecision] = Field(default_factory=list, description="Decisiones registradas con alcance exclusivo de esta fuente.")
-    technical_errors: list[SourceTechnicalError] = Field(default_factory=list, description="Fallos técnicos que no constituyen preguntas para el usuario.")
-    dataset_storage: SourceDatasetStorage = Field(default_factory=SourceDatasetStorage, description="Estado real del almacenamiento de datos preparados.")
-    queryable: bool = Field(description="Sólo puede ser verdadero si se publicaron datos aceptados y persistidos.")
-    original_proposal: dict[str, JsonValue] | None = None
-    effective_recipe: dict[str, JsonValue] | None = None
-    rules: dict[str, JsonValue] = Field(default_factory=dict)
+class DatasetDetail(BaseModel):
+    id: UUID
+    name: str
+    description: str | None
+    semantic_description: str | None
+    source_locator: dict[str, Any]
+    physical_table_name: str | None
+    version: int
+    row_count: int = Field(ge=0)
+    columns_metadata: list[dict[str, Any]]
+    quality_warnings: list[str]
+    is_active: bool
+    queryable: bool
+    semantic_point_id: UUID
 
-    @field_serializer(
-        "blocks", "preview", "findings", "reviews", "decisions", "technical_errors", "dataset_storage",
-        when_used="json",
-    )
-    def serialize_details(self, value: list[BaseModel] | BaseModel):
-        # Los documentos existentes distinguen campos ausentes de valores null.
-        if isinstance(value, list):
-            return [item.model_dump(mode="json", exclude_unset=True) for item in value]
-        return value.model_dump(mode="json", exclude_unset=True)
+
+class SourceDetailResponse(SourceAcceptedResponse):
+    model_config = ConfigDict(populate_by_name=True)
+    name: str
+    original_filename: str
+    file_type: str
+    mime_type: str
+    file_size_bytes: int
+    description: str | None
+    is_active: bool = Field(serialization_alias="isActive")
+    created_at: datetime
+    updated_at: datetime | None
+    processing_report: dict[str, Any]
+    datasets: list[DatasetDetail]
+    queryable: bool

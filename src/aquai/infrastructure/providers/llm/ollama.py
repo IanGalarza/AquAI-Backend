@@ -1,119 +1,190 @@
+"""Descripciones y embeddings locales; la salida del modelo nunca es código."""
+
+import asyncio
 import json
+import math
+from copy import deepcopy
+from datetime import date, datetime
+from decimal import Decimal
+from typing import Any
+from weakref import WeakKeyDictionary
 
 import httpx
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from aquai.application.agents.prompts.tabular import TABULAR_RECIPE_PROMPT
-from aquai.application.contracts.tabular.results import LLMResponse
-from aquai.application.contracts.tabular.structure import StructuralSummary
+from aquai.application.prompts.tabular import TABULAR_SEMANTIC_PROMPT
+from aquai.application.contracts.ingestion import PreparedTable, SemanticDescription
 from aquai.application.errors import LLMProviderError
 from aquai.infrastructure.config.tabular import TabularSettings
-from aquai.infrastructure.providers.llm.recipeSchema import build_recipe_schema
 
 
-class OllamaProvider:
-    def __init__(
-        self,
-        settings: TabularSettings,
-        *,
-        transport: httpx.AsyncBaseTransport | None = None,
-    ) -> None:
+_inference_locks: WeakKeyDictionary = WeakKeyDictionary()
+
+
+def _inference_lock() -> asyncio.Lock:
+    """Las instancias comparten una cola por loop para no saturar Ollama."""
+    loop = asyncio.get_running_loop()
+    if loop not in _inference_locks:
+        _inference_locks[loop] = asyncio.Lock()
+    return _inference_locks[loop]
+
+
+def model_identity(model: str) -> str:
+    return model if ":" in model.rsplit("/", 1)[-1] else f"{model}:latest"
+
+
+class _ColumnMeaning(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    original_name: str
+    meaning: str = Field(max_length=800)
+
+
+class _Description(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    description: str = Field(min_length=1, max_length=4000)
+    columns: list[_ColumnMeaning]
+
+
+class _OllamaClient:
+    def __init__(self, settings: TabularSettings, transport: httpx.AsyncBaseTransport | None) -> None:
         self._settings = settings
         self._transport = transport
 
-    async def generate_recipe(
-        self,
-        summary: StructuralSummary,
-        model: str,
-        known_rules: str | None = None,
-    ) -> LLMResponse:
-        schema = build_recipe_schema()
-        payload = {
-            "model": model,
-            "stream": False,
-            "think": self._settings.llm_think,
-            "format": schema,
-            "options": {"temperature": 0, "num_ctx": self._settings.llm_num_ctx},
-            "messages": [
-                {
-                    "role": "system",
-                    "content": TABULAR_RECIPE_PROMPT + json.dumps(
-                        schema, ensure_ascii=False, separators=(",", ":")
-                    ),
-                },
-                {
-                    "role": "user",
-                    "content": json.dumps(
-                        {"structural_summary": self._compact_summary(summary), "known_rules": known_rules},
-                        ensure_ascii=False,
-                        separators=(",", ":"),
-                    ),
-                },
-            ],
-        }
-
+    async def post(self, path: str, payload: dict, timeout: float) -> dict:
         try:
-            async with httpx.AsyncClient(
-                timeout=self._settings.llm_timeout_seconds,
-                transport=self._transport,
-            ) as client:
-                response = await client.post(
-                    f"{self._settings.ollama_base_url}/api/chat", json=payload
-                )
-                response.raise_for_status()
+            async with _inference_lock():
+                async with httpx.AsyncClient(timeout=timeout, transport=self._transport) as client:
+                    response = await client.post(f"{self._settings.ollama_base_url}{path}", json=payload)
+                    response.raise_for_status()
         except httpx.TimeoutException as exc:
             raise LLMProviderError("Ollama superó el tiempo máximo de respuesta.") from exc
         except httpx.HTTPStatusError as exc:
-            raise LLMProviderError(
-                f"Ollama respondió con un error HTTP {exc.response.status_code}."
-            ) from exc
+            raise LLMProviderError(f"Ollama respondió con un error HTTP {exc.response.status_code}.") from exc
         except httpx.RequestError as exc:
             raise LLMProviderError("No se pudo completar la conexión con Ollama.") from exc
-
         try:
             body = response.json()
         except ValueError as exc:
             raise LLMProviderError("Ollama devolvió una respuesta HTTP que no es JSON.") from exc
-
         if not isinstance(body, dict) or body.get("error"):
             raise LLMProviderError("Ollama devolvió una respuesta de protocolo inválida.")
-        message = body.get("message")
         returned_model = body.get("model")
-        if (
-            not isinstance(message, dict)
-            or not isinstance(message.get("content"), str)
-            or not isinstance(returned_model, str)
-            or not returned_model.strip()
-            or body.get("done") is not True
-        ):
-            raise LLMProviderError("Ollama devolvió una respuesta incompleta o inválida.")
+        if not isinstance(returned_model, str) or model_identity(returned_model) != model_identity(payload["model"]):
+            raise LLMProviderError("Ollama respondió con un modelo distinto del solicitado.")
+        return body
 
-        metadata = {key: value for key, value in body.items() if key != "message"}
-        metadata["message"] = {key: value for key, value in message.items() if key != "content"}
-        return LLMResponse(model=returned_model, content=message["content"], metadata=metadata)
+
+class OllamaSemanticProvider:
+    def __init__(self, settings: TabularSettings, *, transport: httpx.AsyncBaseTransport | None = None) -> None:
+        self._settings = settings
+        self._client = _OllamaClient(settings, transport)
+
+    async def describe(self, table: PreparedTable) -> SemanticDescription:
+        names = [column["original_name"] for column in table.columns]
+        if not names or len(names) > self._settings.max_columns:
+            raise LLMProviderError("La cantidad de columnas excede el límite de descripción.")
+        schema = _Description.model_json_schema()
+        schema["$defs"]["_ColumnMeaning"]["properties"]["original_name"]["enum"] = list(dict.fromkeys(names))
+        sample = self._sample(table)
+        evidence = {
+            "name": table.name,
+            "description": table.description,
+            "source_locator": self._bounded_locator(table.source_locator),
+            "warnings": [str(warning)[:500] for warning in table.warnings[:30]],
+            "warnings_are_partial": len(table.warnings) > 30,
+            "columns": [{key: column[key] for key in ("original_name", "sql_type", "unit") if key in column}
+                        for column in table.columns],
+            "row_count": len(table.rows),
+            "sample": sample,
+            "sample_is_partial": len(table.rows) > len(sample),
+        }
+        content = json.dumps(evidence, ensure_ascii=False, separators=(",", ":"))
+        if len(content) > 96_000:
+            raise LLMProviderError("Los metadatos exceden el límite de contexto de descripción.")
+        body = await self._client.post("/api/chat", {
+            "model": self._settings.default_model,
+            "stream": False,
+            "think": self._settings.llm_think,
+            "format": schema,
+            "options": {"temperature": 0, "num_ctx": self._settings.llm_num_ctx},
+            "messages": [{"role": "system", "content": TABULAR_SEMANTIC_PROMPT},
+                         {"role": "user", "content": content}],
+        }, self._settings.llm_timeout_seconds)
+        message = body.get("message")
+        if body.get("done") is not True or not isinstance(message, dict) or not isinstance(message.get("content"), str):
+            raise LLMProviderError("Ollama devolvió una descripción incompleta.")
+        try:
+            result = _Description.model_validate_json(message["content"])
+        except ValidationError as exc:
+            raise LLMProviderError("Ollama devolvió una descripción que no cumple el contrato JSON.") from exc
+        if [column.original_name for column in result.columns] != names:
+            raise LLMProviderError("Ollama alteró, omitió o reordenó columnas de la tabla.")
+        columns = deepcopy(table.columns)
+        for column, semantic in zip(columns, result.columns, strict=True):
+            column["meaning"] = semantic.meaning.strip()
+        if not result.description.strip():
+            raise LLMProviderError("Ollama devolvió una descripción vacía.")
+        return SemanticDescription(description=result.description.strip(), columns=columns)
 
     @staticmethod
-    def _compact_summary(summary: StructuralSummary) -> dict:
-        document = summary.model_dump(mode="json", exclude={"record_overlaps"})
-        document["sheets"] = [
-            sheet.model_dump(mode="json", exclude_defaults=True) for sheet in summary.sheets
-        ]
-        document["record_overlaps"] = []
-        for relation in summary.record_overlaps:
-            overlap = relation.model_dump(mode="json", exclude={"matches", "left_only_rows", "right_only_rows"})
-            overlap["matches_count"] = len(relation.matches)
-            overlap["exclusive_counts"] = {"left": len(relation.left_only_rows), "right": len(relation.right_only_rows)}
-            overlap["samples_truncated"] = (
-                len(relation.matches) > 8 or len(relation.left_only_rows) > 12 or len(relation.right_only_rows) > 12
-            )
-            overlap["matches"] = [match.model_dump(mode="json") for match in relation.matches[:8]]
-            overlap["left_only_rows"] = relation.left_only_rows[:12]
-            overlap["right_only_rows"] = relation.right_only_rows[:12]
-            document["record_overlaps"].append(overlap)
-        for sheet in document["sheets"]:
-            for formula in sheet.get("formula_sample", []):
-                expression = formula["formula"]
-                if len(expression) > 200:
-                    formula["formula"] = expression[:200]
-                    formula["formula_characters"] = len(expression)
-                    formula["formula_is_preview"] = True
-        return document
+    def _bounded_locator(locator: dict[str, Any]) -> dict[str, Any]:
+        content = json.dumps(locator, ensure_ascii=False, separators=(",", ":"), default=str)
+        if len(content) > 4096:
+            return {"preview": content[:4096], "truncated": True}
+        return json.loads(content)
+
+    def _sample(self, table: PreparedTable) -> list[list[Any]]:
+        count = min(len(table.rows), self._settings.sample_rows)
+        indices = [round(index * (len(table.rows) - 1) / max(1, count - 1)) for index in range(count)]
+        rows: list[list[Any]] = []
+        remaining = 16_000
+        for index in indices:
+            row = [self._cell_preview(table.rows[index].get(column["sql_name"])) for column in table.columns]
+            size = len(json.dumps(row, ensure_ascii=False))
+            if size > remaining:
+                break
+            rows.append(row)
+            remaining -= size
+        return rows
+
+    @staticmethod
+    def _cell_preview(value: Any) -> Any:
+        if value is None or isinstance(value, (bool, int)):
+            return value
+        if isinstance(value, float):
+            return value if math.isfinite(value) else str(value)
+        if isinstance(value, (date, datetime)):
+            return value.isoformat()
+        if isinstance(value, Decimal):
+            return str(value)
+        text = str(value)
+        return text if len(text) <= 160 else text[:160] + " [muestra truncada]"
+
+
+class OllamaEmbeddingProvider:
+    def __init__(self, settings: TabularSettings, *, transport: httpx.AsyncBaseTransport | None = None) -> None:
+        self._settings = settings
+        self._client = _OllamaClient(settings, transport)
+
+    async def embed(self, texts: list[str]) -> list[list[float]]:
+        if not texts:
+            return []
+        if any(not isinstance(text, str) or not text.strip() for text in texts):
+            raise LLMProviderError("Los embeddings requieren textos no vacíos.")
+        body = await self._client.post("/api/embed", {
+            "model": self._settings.embedding_model, "input": texts, "truncate": False,
+        }, self._settings.embedding_timeout_seconds)
+        vectors = body.get("embeddings")
+        if not isinstance(vectors, list) or len(vectors) != len(texts):
+            raise LLMProviderError("Ollama no devolvió un embedding por texto.")
+        dimension = None
+        for vector in vectors:
+            if not isinstance(vector, list) or not vector:
+                raise LLMProviderError("Ollama devolvió un embedding vacío o inválido.")
+            if any(isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value)
+                   for value in vector) or not any(value != 0 for value in vector):
+                raise LLMProviderError("Ollama devolvió componentes inválidos en un embedding.")
+            if dimension is not None and len(vector) != dimension:
+                raise LLMProviderError("Ollama devolvió embeddings con dimensiones diferentes.")
+            dimension = len(vector)
+        return [[float(value) for value in vector] for vector in vectors]

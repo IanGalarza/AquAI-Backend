@@ -11,7 +11,7 @@ from aquai.application.errors import FileTooLargeError
 from aquai.application.useCases.sources import (
     GetSourceHandler,
     ListSourcesHandler,
-    ReviewSourceHandler,
+    ActivateSourceHandler,
     UploadSourceHandler,
 )
 from aquai.infrastructure.providers.sources import SourceRuntime
@@ -36,14 +36,14 @@ def get_source_handler(request: Request) -> GetSourceHandler:
     return _get_source_runtime(request).get
 
 
-def get_review_source_handler(request: Request) -> ReviewSourceHandler:
-    return _get_source_runtime(request).review
+def get_activate_source_handler(request: Request) -> ActivateSourceHandler:
+    return _get_source_runtime(request).activate
 
 
 UploadSourceDependency = Annotated[UploadSourceHandler, Depends(get_upload_source_handler)]
 ListSourcesDependency = Annotated[ListSourcesHandler, Depends(get_list_sources_handler)]
 GetSourceDependency = Annotated[GetSourceHandler, Depends(get_source_handler)]
-ReviewSourceDependency = Annotated[ReviewSourceHandler, Depends(get_review_source_handler)]
+ActivateSourceDependency = Annotated[ActivateSourceHandler, Depends(get_activate_source_handler)]
 
 
 async def read_source_file(

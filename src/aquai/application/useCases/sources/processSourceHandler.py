@@ -1,176 +1,89 @@
-"""Procesa una fuente reclamada y persiste cada etapa del pipeline."""
-
+"""Prepara y confirma SQL antes de cualquier dependencia semántica externa."""
 import asyncio
-from copy import deepcopy
-from dataclasses import dataclass
 from uuid import UUID
+from aquai.application.errors import SemanticIndexError
 
-from aquai.application.contracts.tabular.results import TabularEvaluation
-from aquai.application.errors import SourceConflictError
 from aquai.application.interfaces.sources import SourceCommands, SourceQueries
-from aquai.application.services.sourceReviews import SourceReviewService
-from aquai.application.services.tabularEvaluation import TabularEvaluationService
-from aquai.application.useCases.sources.constants import DATASET_STORAGE
-
-
-_FINAL_STAGES = {
-    "ready": "prepared",
-    "ready_with_warnings": "prepared",
-    "review_required": "awaiting_review",
-    "failed": "failed",
-}
-
-
-@dataclass
-class _ProcessingState:
-    recipe_data: dict
-    report: dict
-    rules: dict
-
-    @classmethod
-    def from_source(cls, source: dict) -> "_ProcessingState":
-        return cls(
-            recipe_data=deepcopy(source["recipe_data"]),
-            report=deepcopy(source.get("validation_report") or {}),
-            rules=deepcopy(source["rules_snapshot"]),
-        )
-
-    @property
-    def workflow(self) -> dict:
-        return self.recipe_data["_workflow"]
-
-    def saved_evaluation(self) -> TabularEvaluation | None:
-        if self.workflow.get("resume_stage") and self.report.get("evaluation"):
-            return TabularEvaluation.model_validate(self.report["evaluation"])
-        return None
-
-    def checkpoint(
-        self, stage: str, evaluation: TabularEvaluation | None, rules: dict | None,
-    ) -> None:
-        self.workflow["stage"] = stage
-        if rules is not None:
-            self.rules = deepcopy(rules)
-        if evaluation is not None:
-            self.report["evaluation"] = evaluation.model_dump(mode="json")
-            if evaluation.recipe is not None:
-                effective = evaluation.recipe.model_dump(mode="json")
-                if self.recipe_data.get("proposal") is None:
-                    self.recipe_data["proposal"] = deepcopy(effective)
-                self.recipe_data["effective"] = effective
-        self.report["dataset_storage"] = DATASET_STORAGE
+from aquai.application.interfaces.tabular import SemanticIndex, SemanticProvider, TabularProcessor
+from aquai.application.utils.background import complete_write
 
 
 class ProcessSourceHandler:
-    def __init__(
-        self,
-        commands: SourceCommands,
-        queries: SourceQueries,
-        evaluator: TabularEvaluationService,
-        *,
-        reviews: SourceReviewService | None = None,
-    ) -> None:
+    def __init__(self, commands: SourceCommands, queries: SourceQueries,
+                 processor: TabularProcessor, semantics: SemanticProvider,
+                 index: SemanticIndex) -> None:
         self._commands = commands
         self._queries = queries
-        self._evaluator = evaluator
-        self._reviews = reviews or SourceReviewService()
+        self._processor = processor
+        self._semantics = semantics
+        self._index = index
 
     async def handle(self, source_id: UUID) -> None:
         source = await asyncio.to_thread(self._queries.get, source_id, include_content=True)
-        state = _ProcessingState.from_source(source)
-        saved = state.saved_evaluation()
-
-        async def checkpoint(
-            stage: str, evaluation: TabularEvaluation | None, rules: dict | None,
-        ) -> None:
-            state.checkpoint(stage, evaluation, rules)
-            await self._save(source_id, state)
-
-        result = await self._evaluator.process_source(
-            source["original_filename"],
-            source["file_content"],
-            checkpoint=checkpoint,
-            saved_evaluation=saved,
-            saved_rules=state.rules if saved is not None else None,
-            resume_stage=state.workflow.get("resume_stage", "execution"),
+        if source["datasets"]:
+            await self.reindex(source_id)
+            return
+        prepared = await asyncio.to_thread(
+            self._processor.prepare, source["original_filename"], source["file_content"],
         )
-        await self._complete(source_id, state, result)
-
-    async def _save(
-        self,
-        source_id: UUID,
-        state: _ProcessingState,
-        *,
-        processing_status: str | None = None,
-        validation_status: str | None = None,
-    ) -> None:
-        statuses = {}
-        if processing_status is not None:
-            statuses["processing_status"] = processing_status
-        if validation_status is not None:
-            statuses["validation_status"] = validation_status
-        saved = await asyncio.to_thread(
-            self._commands.save,
-            source_id,
-            recipe_data=state.recipe_data,
-            rules_snapshot=state.rules,
-            validation_report=state.report,
-            expected_processing_status="processing",
-            **statuses,
-        )
-        if not saved:
-            message = (
-                "La fuente dejó de pertenecer al procesamiento actual."
-                if processing_status is None
-                else "No se pudo guardar el resultado en el estado actual."
-            )
-            raise SourceConflictError(message)
-
-    async def _complete(
-        self, source_id: UUID, state: _ProcessingState, result: TabularEvaluation,
-    ) -> None:
-        validation_status = result.validation.status.value
-        reviews = self._reviews.build_reviews(
-            source_id, result, state.rules, revision=state.workflow.get("revision", 0),
-        )
-        # Una corrección pendiente puede conservar el estado de validación failed.
-        processing_status = "review_required" if reviews else validation_status
-        state.workflow.pop("resume_stage", None)
-        try:
-            state.workflow["stage"] = _FINAL_STAGES[processing_status]
-        except KeyError as exc:
-            raise SourceConflictError("Estado de procesamiento final desconocido.") from exc
-        state.report.update(
-            evaluation=result.model_dump(mode="json"),
-            reviews=reviews,
-            technical_errors=self._technical_errors(result, reviews),
-        )
-        await self._save(
-            source_id, state,
-            processing_status=processing_status,
-            validation_status=validation_status,
-        )
-
-    def _technical_errors(self, result: TabularEvaluation, reviews: list[dict]) -> list[dict]:
-        corrective_errors = {
-            (f"Hoja '{review['sheet_name']}': " if review.get("sheet_name") else "")
-            + review["message"]
-            for review in reviews
-            if review.get("options") and review["finding"].get("severity") == "error"
+        warnings = list(dict.fromkeys(
+            prepared.warnings + [warning for table in prepared.tables for warning in table.warnings]
+        ))
+        report = {
+            "summary": f"{len(prepared.tables)} conjuntos preparados.",
+            "warnings": [item[:500] for item in warnings[:100]],
+            "warning_count": len(warnings),
+            "errors": [],
+            "dataset_count": len(prepared.tables),
+            "row_count": sum(len(table.rows) for table in prepared.tables),
+            "steps": ["original_saved", "tables_prepared", "sql_persisted"],
         }
-        errors = [
-            {"code": "validation_error", "message": error}
-            for error in result.validation.errors
-            if error not in corrective_errors
-        ]
-        errors.extend(
-            {
-                "code": finding.code,
-                "message": finding.message,
-                "sheet_name": finding.sheet_name,
-                "cell": finding.cell,
-                "range": finding.range,
-            }
-            for finding in result.validation.findings
-            if self._reviews.is_technical_finding(finding)
-        )
-        return errors
+        await complete_write(self._commands.save_prepared, source_id, prepared.tables, report)
+        if not prepared.tables:
+            return
+
+        # El catálogo usa el mismo orden y locator que las tablas preparadas.
+        persisted = await asyncio.to_thread(self._queries.get, source_id)
+        for table in prepared.tables:
+            dataset = next(
+                item for item in persisted["datasets"] if item["source_locator"] == table.source_locator
+            )
+            try:
+                result = await self._semantics.describe(table)
+                description, columns, semantic_warnings = (
+                    result.description, result.columns or table.columns, result.warnings,
+                )
+            except Exception as error:
+                description, columns = dataset["description"], table.columns
+                semantic_warnings = [
+                    f"Descripción automática no disponible ({type(error).__name__}); "
+                    "se conserva la descripción estructural."
+                ]
+            await complete_write(
+                self._commands.save_dataset_semantics, dataset["id"],
+                description, columns, warnings=semantic_warnings,
+            )
+        await self.reindex(source_id)
+
+    async def reindex(self, source_id: UUID) -> None:
+        await complete_write(self._commands.set_index_status, source_id, "processing")
+        try:
+            source = await asyncio.to_thread(self._queries.get, source_id)
+            await self._index.index_source(source)
+        except asyncio.CancelledError:
+            await complete_write(
+                self._commands.set_index_status, source_id, "pending",
+                error="Indexación interrumpida; puede reconstruirse desde PostgreSQL.",
+            )
+            raise
+        except Exception as error:
+            detail = str(error) if isinstance(error, SemanticIndexError) else type(error).__name__
+            await complete_write(
+                self._commands.set_index_status, source_id, "failed",
+                error=f"Índice semántico no disponible: {detail}",
+            )
+        else:
+            await complete_write(
+                self._commands.set_index_status, source_id, "ready",
+                expected_active=source["is_active"],
+            )

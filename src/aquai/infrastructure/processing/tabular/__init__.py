@@ -1,4 +1,4 @@
 
-from aquai.infrastructure.processing.tabular.processor import PandasTabularProcessor
+from aquai.infrastructure.processing.tabular.processor import SimpleTabularProcessor
 
-__all__ = ["PandasTabularProcessor"]
+__all__ = ["SimpleTabularProcessor"]

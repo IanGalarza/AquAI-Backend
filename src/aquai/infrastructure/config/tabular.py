@@ -1,4 +1,4 @@
-from pydantic import AnyHttpUrl, Field, TypeAdapter, field_validator
+from pydantic import AnyHttpUrl, Field, TypeAdapter, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -14,26 +14,39 @@ class TabularSettings(BaseSettings):
     ollama_base_url: str = "http://localhost:11434"
     default_model: str = Field(default="qwen3.5:9b", min_length=1, max_length=200)
     llm_timeout_seconds: float = Field(default=600, gt=0, allow_inf_nan=False)
-    llm_num_ctx: int = Field(default=16384, ge=1024)
+    llm_num_ctx: int = Field(default=32768, ge=1024)
     llm_think: bool = False
     max_upload_bytes: int = Field(default=10 * 1024 * 1024, gt=0)
     max_cells: int = Field(default=2_000_000, gt=0)
     max_sheets: int = Field(default=30, gt=0, le=30)
     max_expanded_bytes: int = Field(default=100 * 1024 * 1024, gt=0)
     sample_rows: int = Field(default=12, gt=0, le=100)
+    max_datasets: int = Field(default=100, gt=0, le=1000)
+    max_columns: int = Field(default=256, gt=0, le=2048)
+    embedding_model: str = Field(default="nomic-embed-text", min_length=1, max_length=200)
+    embedding_timeout_seconds: float = Field(default=120, gt=0, allow_inf_nan=False)
+    qdrant_url: str = "http://localhost:6333"
+    qdrant_collection: str = Field(default="aquai_datasets", min_length=1, max_length=200)
+    index_timeout_seconds: float = Field(default=60, gt=0, allow_inf_nan=False)
 
-    @field_validator("ollama_base_url")
+    @field_validator("ollama_base_url", "qdrant_url")
     @classmethod
     def validate_ollama_base_url(cls, value: str) -> str:
         url = TypeAdapter(AnyHttpUrl).validate_python(value)
         if url.query or url.fragment:
-            raise ValueError("La URL de Ollama no debe incluir parámetros ni fragmentos.")
+            raise ValueError("La URL no debe incluir parámetros ni fragmentos.")
         return str(url).rstrip("/")
 
-    @field_validator("default_model")
+    @field_validator("default_model", "embedding_model", "qdrant_collection")
     @classmethod
     def validate_default_model(cls, value: str) -> str:
         model = value.strip()
         if not model:
-            raise ValueError("El modelo predeterminado no puede estar vacío.")
+            raise ValueError("El modelo o colección no puede estar vacío.")
         return model
+
+    @model_validator(mode="after")
+    def validate_separate_embedding_model(self) -> "TabularSettings":
+        if self.default_model.removesuffix(":latest") == self.embedding_model.removesuffix(":latest"):
+            raise ValueError("La descripción y los embeddings requieren modelos diferentes.")
+        return self

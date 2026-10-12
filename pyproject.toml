@@ -14,22 +14,14 @@ dependencies = [
     "sqlalchemy",
     "alembic",
     "psycopg[binary]",
-    "qdrant-client",
-    "langgraph",
+    "qdrant-client>=1.19,<2",
     "pandas",
-    "numpy",
     "openpyxl",
-    "plotly",
-    "pymupdf",
     "pydantic>=2",
     "pydantic-settings",
     "httpx",
-    "jsonschema>=4",
     "python-multipart",
 ]
 
 [tool.setuptools.packages.find]
 where = ["src"]
-
-[tool.setuptools.package-data]
-"aquai.infrastructure.config" = ["tabularRules.json"]

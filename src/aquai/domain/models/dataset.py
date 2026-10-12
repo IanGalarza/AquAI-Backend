@@ -21,9 +21,15 @@ class Dataset:
     name: str
     description: str | None = None
     source_locator: JsonDocument
-    physical_table_name: str | None = None
-    version: int
-    is_active: bool
+    physical_table_name: str
+    version: int = 1
+    is_active: bool = True
+    row_count: int = 0
+    columns_metadata: list[JsonDocument] = field(default_factory=list)
+    queryable: bool = False
+    quality_warnings: list[str] = field(default_factory=list)
+    semantic_description: str | None = None
+    semantic_point_id: UUID | None = None
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime | None = None
 

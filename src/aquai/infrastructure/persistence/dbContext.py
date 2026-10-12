@@ -30,7 +30,12 @@ class DbContext:
         """Construye el motor al acceder por primera vez, sin abrir una conexión."""
         with self._engine_lock:
             if self._engine is None:
-                self._engine = create_engine(self._settings.sqlalchemy_url)
+                self._engine = create_engine(
+                    self._settings.sqlalchemy_url,
+                    connect_args={"connect_timeout": 5},
+                    pool_pre_ping=True,
+                    pool_timeout=10,
+                )
                 self._session_factory = sessionmaker(
                     bind=self._engine,
                     expire_on_commit=False,

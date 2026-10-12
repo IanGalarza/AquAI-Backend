@@ -1,9 +1,6 @@
-"""Proyección acotada del listado de fuentes."""
-
+"""Proyección paginada sin originales ni informes."""
 from datetime import datetime
-
 from pydantic import BaseModel, Field
-
 from aquai.application.dtos.responses.uploadSource import SourceAcceptedResponse
 
 
@@ -13,6 +10,7 @@ class SourceListItem(SourceAcceptedResponse):
     file_size_bytes: int = Field(ge=0)
     created_at: datetime
     is_active: bool = Field(serialization_alias="isActive")
+    dataset_count: int = Field(default=0, ge=0)
 
 
 class SourceListResponse(BaseModel):
