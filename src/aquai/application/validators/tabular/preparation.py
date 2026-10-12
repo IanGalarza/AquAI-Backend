@@ -12,6 +12,7 @@ from aquai.application.contracts.tabular.policies import DateColumnPolicy, Prepa
 from aquai.application.contracts.tabular.recipe import PreparationRecipe
 from aquai.application.contracts.tabular.results import AuxiliaryRowTreatment, ExecutionResult, TabularFinding, TemporalDateTreatment
 from aquai.application.contracts.tabular.structure import SheetSummary, SourceHeaderEvidence, StructuralSummary
+from aquai.application.utils.tabularCoordinates import cell_position
 
 
 SourceHeaders = dict[tuple[str, int], SourceHeaderEvidence]
@@ -354,16 +355,6 @@ def _association_status(target_count: int) -> Literal["missing", "matched", "amb
             return "matched"
         case _:
             return "ambiguous"
-
-
-def cell_position(cell: str) -> tuple[int, int] | None:
-    match = re.fullmatch(r"([A-Z]+)([1-9][0-9]*)", cell)
-    if match is None:
-        return None
-    column = 0
-    for character in match[1]:
-        column = column * 26 + ord(character) - ord("A") + 1
-    return int(match[2]), column
 
 
 def policy_headers_match(

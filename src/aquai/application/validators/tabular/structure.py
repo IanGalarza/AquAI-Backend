@@ -9,6 +9,7 @@ from aquai.application.contracts.tabular.policies import PreparationPolicies, Re
 from aquai.application.contracts.tabular.recipe import PreparationRecipe, RenameColumns, SheetRecipe
 from aquai.application.contracts.tabular.results import AuxiliaryRowTreatment, ExecutionResult, TabularFinding
 from aquai.application.contracts.tabular.structure import SheetSummary, StructuralRegion, StructuralSummary
+from aquai.application.utils.tabularCoordinates import column_label
 from aquai.application.validators.tabular.preparation import AuxiliaryRows, SourceHeaders, cell_position, policy_headers_match
 
 
@@ -312,14 +313,6 @@ def block_range(block: SheetRecipe, source: SheetSummary) -> str:
         f"{column_label(block.data_start_column)}{block.data_start_row}:"
         f"{column_label(block.data_end_column)}{block.data_end_row}"
     )
-
-
-def column_label(column: int) -> str:
-    label = ""
-    while column:
-        column, remainder = divmod(column - 1, 26)
-        label = chr(65 + remainder) + label
-    return label
 
 
 def validate_unit_labels(

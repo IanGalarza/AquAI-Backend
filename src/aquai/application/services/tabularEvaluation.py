@@ -9,6 +9,7 @@ from aquai.application.contracts.tabular.results import (
     TabularFinding,
     ValidationResult,
 )
+from aquai.application.contracts.tabular.rules import RuleComposition
 from aquai.application.errors import FileTooLargeError, LLMProviderError, TabularInputError
 from aquai.application.interfaces.tabular import LLMProvider, TabularProcessor
 from aquai.application.services.tabularRecipe import (
@@ -16,7 +17,7 @@ from aquai.application.services.tabularRecipe import (
     parse_preparation_recipe,
 )
 from aquai.application.services.tabularValidation import TabularValidationService
-from aquai.application.services.tabularRules import RuleComposition, TabularRuleService
+from aquai.application.services.tabularRules import TabularRuleService
 from aquai.domain.enums.tabular import EvaluationStatus
 
 

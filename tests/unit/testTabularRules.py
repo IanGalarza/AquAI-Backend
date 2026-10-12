@@ -1,7 +1,9 @@
 import json
 import unittest
 from copy import deepcopy
-from unittest.mock import patch
+from hashlib import sha256
+from pathlib import Path
+from unittest.mock import Mock, patch
 
 import httpx
 
@@ -14,7 +16,7 @@ from aquai.application.contracts.tabular.structure import (
 )
 from aquai.application.contracts.tabular.recipe import PreparationRecipe
 from aquai.application.errors import TabularInputError
-from aquai.application.services.tabularRules import TabularRuleService
+from aquai.application.services.tabularRules import RuleComposition, TabularRuleService
 from aquai.application.services.tabularEvaluation import TabularEvaluationService
 from aquai.infrastructure.config.tabular import TabularSettings
 from aquai.infrastructure.processing.tabular.processor import PandasTabularProcessor
@@ -549,3 +551,91 @@ class ConfiguredSheetRoleTests(unittest.TestCase):
         self.assertIn("synthetic_sheet_role", rejected[0]["message"])
         self.assertEqual(rejected[0]["sheet_name"], "Codes")
         self.assertEqual(service.validate_recipe(source, self.recipe(source, "summary"), composition), [])
+
+
+class RuleCompositionCharacterizationTests(unittest.TestCase):
+    def setUp(self):
+        self.fixture = json.loads(Path(__file__).with_name("sourceReviewFixtures.json").read_text(encoding="utf-8"))
+        self.catalog = FileTabularRuleCatalog().load()
+        self.catalog_before = deepcopy(self.catalog)
+        self.service = TabularRuleService(Mock(load=Mock(return_value=self.catalog)))
+
+    def test_conflict_messages_order_and_negation_match_captured_behavior(self):
+        source = structural_summary("data.csv")
+        for case in self.fixture["conflicts"] + self.fixture["profile_conflicts"]:
+            with self.subTest(profile=case.get("profile"), additional=case["additional"]):
+                composition = self.service.compose(source, case.get("profile"), case["additional"])
+                actual = [finding for finding in composition.findings
+                          if finding["code"] == "rule_additional_conflict"]
+                self.assertEqual(actual, case["result"])
+                self.assertEqual(composition.metadata["additional_rules"], case["additional"])
+                self.assertEqual(composition.prompt_rules["additional"], case["additional"])
+                self.assertEqual(self.catalog, self.catalog_before)
+
+    def test_composition_snapshots_keep_the_captured_format_and_effective_scope(self):
+        for case in self.fixture["rule_compositions"]:
+            with self.subTest(profile=case["profile"]):
+                composition = self.service.compose(
+                    structural_summary(case["file_name"], tuple(case["sheets"])), case["profile"],
+                    source_sha256=case["source_sha256"],
+                )
+                snapshot = composition.snapshot()
+                encoded = json.dumps(snapshot, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+                self.assertEqual(list(snapshot), case["snapshot_keys"])
+                self.assertEqual(sha256(encoded.encode()).hexdigest(), case["snapshot_sha256"])
+                self.assertEqual(RuleComposition.restore(json.loads(encoded)).snapshot(), snapshot)
+                self.assertEqual(self.catalog, self.catalog_before)
+
+    def test_snapshots_and_restored_compositions_are_independent_from_inputs_and_catalog(self):
+        case = next(case for case in self.fixture["rule_compositions"]
+                    if case["profile"] == "belen_cyanobacteria")
+        composition = self.service.compose(
+            structural_summary(case["file_name"], tuple(case["sheets"])), case["profile"],
+            source_sha256=case["source_sha256"],
+        )
+        original = composition.snapshot()
+        snapshot = composition.snapshot()
+        snapshot["source_decisions"].append({"review_id": "stored", "values": {"nested": [1]}})
+        stored = deepcopy(snapshot)
+        restored = RuleComposition.restore(snapshot)
+        snapshot["metadata"]["common_rules"][0]["text"] = "changed input"
+        snapshot["prompt_rules"]["common"][0]["text"] = "changed input"
+        snapshot["preparation_policies"]["number_columns"][0]["expected_headers"].clear()
+        snapshot["source_decisions"][0]["values"]["nested"].append(2)
+        self.assertEqual(restored.snapshot(), stored)
+        self.assertEqual(composition.snapshot(), original)
+        self.assertEqual(self.catalog, self.catalog_before)
+        restored.metadata["common_rules"][0]["text"] = "changed restored"
+        restored.prompt_rules["common"][0]["text"] = "changed restored"
+        restored.preparation_policies.number_columns[0].expected_headers.clear()
+        restored.source_decisions[0]["values"]["nested"].append(3)
+        self.assertEqual(composition.snapshot(), original)
+        self.assertEqual(self.catalog, self.catalog_before)
+
+    def test_legacy_snapshot_defaults_and_previous_public_import_remain_available(self):
+        from aquai.application.contracts.tabular.rules import RuleComposition as ContractRuleComposition
+
+        self.assertIs(RuleComposition, ContractRuleComposition)
+        stored = {"metadata": {"version": "legacy"}, "prompt_rules": {"common": []}}
+        restored = RuleComposition.restore(stored)
+        self.assertEqual(restored.snapshot(), {
+            "metadata": {"version": "legacy"}, "prompt_rules": {"common": []},
+            "review_reasons": [], "findings": [], "identity_clarifications": [],
+            "preparation_policies": None, "source_decisions": [],
+        })
+        self.assertEqual(stored, {"metadata": {"version": "legacy"}, "prompt_rules": {"common": []}})
+
+    def test_automatic_selection_requires_matching_digest_name_and_expected_sheets(self):
+        case = next(case for case in self.fixture["rule_compositions"]
+                    if case["profile"] == "belen_cyanobacteria")
+        for name, sheets, digest, expected in (
+            (case["file_name"], case["sheets"], case["source_sha256"], case["profile"]),
+            (case["file_name"].upper(), case["sheets"], case["source_sha256"], case["profile"]),
+            ("another.xlsx", case["sheets"], case["source_sha256"], None),
+            (case["file_name"], case["sheets"], "0" * 64, None),
+            (case["file_name"], ["BASE CIANO", "REFERENCIAS"], case["source_sha256"], None),
+        ):
+            with self.subTest(name=name, sheets=sheets, digest=digest):
+                summary = structural_summary(name, tuple(sheets))
+                self.assertEqual(self.service.select_compatible_profile(summary, digest), expected)
+        self.assertEqual(self.catalog, self.catalog_before)
