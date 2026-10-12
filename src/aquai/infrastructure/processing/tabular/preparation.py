@@ -8,7 +8,7 @@ import pandas as pd
 from openpyxl.utils.cell import coordinate_to_tuple, get_column_letter
 
 from aquai.application.dtos.tabular import SheetRecipe, TabularFinding
-from aquai.application.dtos.tabular_policies import (
+from aquai.application.dtos.tabularPolicies import (
     AssociationDiagnostic,
     AuxiliaryFormulaEvidence,
     AuxiliaryRowTreatment,

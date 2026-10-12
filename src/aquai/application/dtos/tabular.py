@@ -3,7 +3,7 @@ from typing import Annotated, Literal
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_serializer, model_validator
 
 from aquai.domain.enums.tabular import EvaluationStatus
-from aquai.application.dtos.tabular_policies import (
+from aquai.application.dtos.tabularPolicies import (
     AssociationDiagnostic,
     AuxiliaryRowTreatment,
     CellNormalization,
@@ -350,6 +350,8 @@ class RecordIdentityClarification(BaseModel):
     statement: str = Field(min_length=1)
     confirmed_by: str = Field(min_length=1)
     source_reference: str = Field(min_length=1)
+    sheet_name: str | None = None
+    cell: str | None = Field(default=None, pattern=r"^[A-Z]+[1-9][0-9]*$")
 
 
 class TabularFinding(BaseModel):

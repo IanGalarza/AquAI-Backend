@@ -37,9 +37,9 @@ from aquai.application.dtos.tabular import (
     SourceRowMatch,
 )
 from aquai.infrastructure.processing.tabular.reader import SheetData, TableReader
-from aquai.application.dtos.tabular_policies import PreparationPolicies, SourceHeaderEvidence
-from aquai.infrastructure.processing.tabular.date_consistency import date_consistency_findings
-from aquai.infrastructure.processing.tabular.temporal_priority import select_temporal_dates
+from aquai.application.dtos.tabularPolicies import PreparationPolicies, SourceHeaderEvidence
+from aquai.infrastructure.processing.tabular.dateConsistency import date_consistency_findings
+from aquai.infrastructure.processing.tabular.temporalPriority import select_temporal_dates
 from aquai.infrastructure.processing.tabular.normalization import trace_value
 from aquai.infrastructure.processing.tabular.preparation import association_diagnostics, headers_match, prepare_frame, strict_missing
 

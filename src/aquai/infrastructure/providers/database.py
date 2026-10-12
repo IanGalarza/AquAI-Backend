@@ -6,7 +6,7 @@ from functools import lru_cache
 from sqlalchemy.orm import Session
 
 from aquai.infrastructure.config.database import DatabaseSettings
-from aquai.infrastructure.persistence.db_context import DbContext
+from aquai.infrastructure.persistence.dbContext import DbContext
 
 
 @lru_cache(maxsize=1)

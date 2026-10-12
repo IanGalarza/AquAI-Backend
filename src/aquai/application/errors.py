@@ -8,3 +8,19 @@ class FileTooLargeError(TabularInputError):
 
 class LLMProviderError(RuntimeError):
     pass
+
+
+class SourceNotFoundError(LookupError):
+    pass
+
+
+class SourceConflictError(RuntimeError):
+    pass
+
+
+class SourceDecisionError(TabularInputError):
+    pass
+
+
+class SourcesUnavailableError(RuntimeError):
+    pass

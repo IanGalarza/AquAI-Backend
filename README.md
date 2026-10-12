@@ -30,7 +30,7 @@ src/aquai/
 │   │   ├── env.py               # Integración de Alembic con la configuración
 │   │   └── versions/            # Historial de migraciones
 │   ├── persistence/
-│   │   ├── db_context.py        # Motor y sesiones de base de datos
+│   │   ├── dbContext.py         # Motor y sesiones de base de datos
 │   │   ├── mapping.py           # Registro de los mapeos
 │   │   └── configurations/      # Configuración de tablas y relaciones
 │   └── providers/
@@ -55,6 +55,39 @@ El proyecto sigue una separación inspirada en **Clean Architecture**:
 - **Infrastructure**: implementa la configuración y el acceso a PostgreSQL.
 - **Presentation**: organiza los controllers y schemas de entrada y salida.
 
+### Casos de uso y nomenclatura
+
+Los nombres de archivos y carpetas del proyecto usan camelCase, por ejemplo
+`dbContext.py`, `sourceWorker.py`, `useCases/` y `valueObjects/`. Se conservan los
+nombres especiales requeridos por Python y sus herramientas, como `__init__.py`.
+Los identificadores de Python, los contratos HTTP y los nombres SQL mantienen
+sus convenciones existentes.
+
+Los casos de uso se agrupan por funcionalidad en
+`application/useCases/<funcionalidad>/`. Cada operación tiene su propio archivo
+`<accion><Recurso>Handler.py`, por ejemplo `getSourceHandler.py` o
+`listSourcesHandler.py`, una clase `<Accion><Recurso>Handler` y un método de entrada
+`handle(...)`. Esta convención se aplica a los casos de uso del proyecto.
+
+Las fuentes se organizan en `application/useCases/sources/`:
+
+| Handler | Responsabilidad |
+| --- | --- |
+| `UploadSourceHandler` | Validar y guardar el archivo original. |
+| `ListSourcesHandler` | Consultar el listado con paginación y filtros. |
+| `GetSourceHandler` | Construir el detalle, los hallazgos y las muestras acotadas. |
+| `ReviewSourceHandler` | Registrar una decisión de revisión y encolar la reanudación. |
+| `ProcessSourceHandler` | Procesar una fuente y persistir los checkpoints y el resultado. |
+
+Los controllers reciben el handler de su operación mediante dependencias de
+FastAPI. `infrastructure/providers/sources.py` compone las dependencias en
+`SourceRuntime`, un contenedor sin lógica de casos de uso.
+`infrastructure/workers/sourceWorker.py` administra la cola, el arranque,
+la detención y la recuperación de interrupciones. La lógica reutilizable de
+evaluación tabular y revisión se mantiene en servicios de Application.
+
+Las convenciones para futuros cambios también están registradas en `AGENTS.md`.
+
 ## Modelos de Datos
 
 Los modelos se encuentran en `src/aquai/domain/models`:
@@ -73,7 +106,7 @@ Los modelos se encuentran en `src/aquai/domain/models`:
 
 - **`DatabaseSettings`** (`config/database.py`): carga y valida `DATABASE_URL`
   desde el entorno o el archivo `.env`.
-- **`DbContext`** (`persistence/db_context.py`): administra el motor y las
+- **`DbContext`** (`persistence/dbContext.py`): administra el motor y las
   sesiones, con commit explícito desde el caso de uso, rollback y cierre de recursos.
 - **Configuraciones** (`persistence/configurations`): definen los nombres SQL,
   tipos de columnas, claves y relaciones de cada modelo.
@@ -100,7 +133,7 @@ de uso llama a `session.commit()` dentro del bloque `context.session()`.
 
 ### Catálogos de Estados
 
-Los datos iniciales están definidos en `persistence/configurations/status_seeds.py`:
+Los datos iniciales están definidos en `persistence/configurations/statusSeeds.py`:
 
 - **ProcessingStatus**: `uploaded`, `processing`, `ready`, `ready_with_warnings`,
   `review_required` y `failed` (IDs del 1 al 6, en ese orden).
@@ -179,6 +212,10 @@ Desde la raíz del proyecto, en PowerShell:
 | Revertir la última migración aplicada | `.\.venv\Scripts\python.exe -m alembic downgrade -1` |
 | Consultar la versión actual de la base | `.\.venv\Scripts\python.exe -m alembic current --verbose` |
 | Ver el historial | `.\.venv\Scripts\python.exe -m alembic history --verbose` |
+
+Renombrá el archivo generado a camelCase, como `addSourceRecipeValidationStatus.py`,
+conservando sus valores `revision` y `down_revision`. Alembic utiliza esos valores
+para identificar las migraciones y mantener la cadena del historial.
 
 Para generar el SQL y revisarlo sin aplicarlo:
 

@@ -6,7 +6,7 @@ from aquai.application.dtos.tabular import (
     PreparationRecipe,
     StructuralSummary,
 )
-from aquai.application.dtos.tabular_policies import PreparationPolicies
+from aquai.application.dtos.tabularPolicies import PreparationPolicies
 
 
 class TabularProcessor(Protocol):

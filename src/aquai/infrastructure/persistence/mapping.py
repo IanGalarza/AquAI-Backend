@@ -6,15 +6,15 @@ from sqlalchemy import MetaData
 from sqlalchemy.orm import registry
 
 from aquai.infrastructure.persistence.configurations import (
-    conversation_configuration,
-    dataset_configuration,
-    message_configuration,
-    message_source_configuration,
-    message_status_configuration,
-    processing_status_configuration,
-    source_configuration,
-    source_recipe_configuration,
-    validation_status_configuration,
+    conversationConfiguration,
+    datasetConfiguration,
+    messageConfiguration,
+    messageSourceConfiguration,
+    messageStatusConfiguration,
+    processingStatusConfiguration,
+    sourceConfiguration,
+    sourceRecipeConfiguration,
+    validationStatusConfiguration,
 )
 
 metadata = MetaData(naming_convention={
@@ -37,15 +37,15 @@ def configure_mappings() -> None:
             return
 
         for configuration in (
-            processing_status_configuration,
-            message_status_configuration,
-            validation_status_configuration,
-            source_configuration,
-            source_recipe_configuration,
-            dataset_configuration,
-            conversation_configuration,
-            message_configuration,
-            message_source_configuration,
+            processingStatusConfiguration,
+            messageStatusConfiguration,
+            validationStatusConfiguration,
+            sourceConfiguration,
+            sourceRecipeConfiguration,
+            datasetConfiguration,
+            conversationConfiguration,
+            messageConfiguration,
+            messageSourceConfiguration,
         ):
             configuration.configure(mapper_registry)
 

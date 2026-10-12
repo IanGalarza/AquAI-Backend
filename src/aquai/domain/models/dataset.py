@@ -7,10 +7,10 @@ from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 from uuid import UUID, uuid4
 
-from aquai.domain.models.json_types import JsonDocument
+from aquai.domain.models.jsonTypes import JsonDocument
 
 if TYPE_CHECKING:
-    from aquai.domain.models.message_source import MessageSource
+    from aquai.domain.models.messageSource import MessageSource
     from aquai.domain.models.source import Source
 
 

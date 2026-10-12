@@ -9,9 +9,9 @@ from uuid import UUID, uuid4
 
 if TYPE_CHECKING:
     from aquai.domain.models.dataset import Dataset
-    from aquai.domain.models.message_source import MessageSource
-    from aquai.domain.models.processing_status import ProcessingStatus
-    from aquai.domain.models.source_recipe import SourceRecipe
+    from aquai.domain.models.messageSource import MessageSource
+    from aquai.domain.models.processingStatus import ProcessingStatus
+    from aquai.domain.models.sourceRecipe import SourceRecipe
 
 
 @dataclass(kw_only=True, eq=False)
