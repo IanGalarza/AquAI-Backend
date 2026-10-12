@@ -44,7 +44,28 @@ def source_snapshot(
     if include_content:
         columns += (Source.file_content,)
     row = session.execute(_source_join(select(*columns)).where(Source.id == source_id)).mappings().first()
-    return deepcopy(dict(row)) if row is not None else None
+    if row is None:
+        return None
+    snapshot = {
+        "id": row["id"],
+        "name": row["name"],
+        "original_filename": row["original_filename"],
+        "file_type": row["file_type"],
+        "mime_type": row["mime_type"],
+        "file_size_bytes": row["file_size_bytes"],
+        "is_active": row["is_active"],
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+        "processing_status": row["processing_status"],
+        "validation_status": row["validation_status"],
+        "recipe_id": row["recipe_id"],
+        "recipe_data": row["recipe_data"],
+        "rules_snapshot": row["rules_snapshot"],
+        "validation_report": row["validation_report"],
+    }
+    if include_content:
+        snapshot["file_content"] = row["file_content"]
+    return deepcopy(snapshot)
 
 
 class SqlAlchemySourceQueries:
@@ -81,5 +102,20 @@ class SqlAlchemySourceQueries:
                 statement.order_by(Source.created_at.desc(), Source.id.desc())
                 .offset((page - 1) * page_size).limit(page_size)
             ).mappings()
-            items = [dict(row) for row in rows]
+            items = [
+                {
+                    "id": row["id"],
+                    "name": row["name"],
+                    "original_filename": row["original_filename"],
+                    "file_type": row["file_type"],
+                    "mime_type": row["mime_type"],
+                    "file_size_bytes": row["file_size_bytes"],
+                    "is_active": row["is_active"],
+                    "created_at": row["created_at"],
+                    "updated_at": row["updated_at"],
+                    "processing_status": row["processing_status"],
+                    "validation_status": row["validation_status"],
+                }
+                for row in rows
+            ]
         return {"items": items, "total": total or 0, "page": page, "page_size": page_size}

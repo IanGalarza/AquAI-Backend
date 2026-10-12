@@ -216,6 +216,27 @@ class SourcesPersistenceTests(unittest.TestCase):
         with self.assertRaises(SourceNotFoundError):
             self.commands.save(uuid4(), processing_status="processing")
 
+    def test_save_distinguishes_omitted_documents_from_explicit_null(self) -> None:
+        source_id, _ = self.upload()
+        report = {"reviews": [{"id": "review-1"}], "optional": None}
+        self.commands.save(source_id, validation_report=report)
+        report["reviews"].append({"id": "changed outside the database"})
+        self.commands.save(source_id, processing_status="processing")
+        snapshot = self.queries.get(source_id)
+        self.assertEqual(snapshot["validation_report"], {
+            "reviews": [{"id": "review-1"}], "optional": None,
+        })
+        original_recipe = snapshot["recipe_data"]
+        self.commands.save(source_id, validation_report=None)
+        cleared = self.queries.get(source_id)
+        self.assertIn("validation_report", cleared)
+        self.assertIsNone(cleared["validation_report"])
+        self.assertEqual(cleared["recipe_data"], original_recipe)
+        for field in ("recipe_data", "rules_snapshot"):
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                self.commands.save(source_id, **{field: None})
+        self.assertEqual(self.queries.get(source_id)["recipe_data"], original_recipe)
+
     def test_atomic_decision_callback_replays_without_duplicate_decisions(self) -> None:
         source_id, _ = self.upload()
         report = {"reviews": [{"id": "review-1"}], "decisions": []}

@@ -82,7 +82,10 @@ class ReviewSourceHandler:
             "values": deepcopy(values),
             "scope": {
                 "source_id": str(source_id),
-                **{key: review.get(key) for key in ("sheet_name", "block_id", "range", "cell")},
+                "sheet_name": review.get("sheet_name"),
+                "block_id": review.get("block_id"),
+                "range": review.get("range"),
+                "cell": review.get("cell"),
             },
             "created_at": datetime.now(timezone.utc).isoformat(),
             "response": response,

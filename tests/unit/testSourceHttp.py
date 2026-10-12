@@ -286,6 +286,19 @@ class SourceHttpTests(unittest.TestCase):
         self.assertTrue(all(route.matches(scope)[0] == Match.NONE for route in self.client.app.routes))
         self.assertEqual(self.client.post("/experimental/tabular/evaluate").status_code, 404)
 
+    def test_openapi_contracts_have_no_manual_documentation_examples(self) -> None:
+        schema = self.client.get("/openapi.json").json()
+        pending = [schema]
+        while pending:
+            value = pending.pop()
+            if isinstance(value, dict):
+                self.assertNotIn("example", value)
+                self.assertNotIn("examples", value)
+                self.assertNotIn("openapi_examples", value)
+                pending.extend(value.values())
+            elif isinstance(value, list):
+                pending.extend(value)
+
 
 if __name__ == "__main__":
     unittest.main()

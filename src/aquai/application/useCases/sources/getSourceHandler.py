@@ -12,12 +12,6 @@ from aquai.application.services.sourceReviews import SourceReviewService
 from aquai.application.useCases.sources.constants import DATASET_STORAGE
 
 
-_METADATA_FIELDS = (
-    "id", "name", "original_filename", "file_type", "mime_type", "file_size_bytes",
-    "created_at", "updated_at", "is_active", "processing_status", "validation_status",
-)
-
-
 class GetSourceHandler:
     def __init__(
         self, queries: SourceQueries, *, reviews: SourceReviewService | None = None,
@@ -35,7 +29,17 @@ class GetSourceHandler:
         reviews = report.get("reviews", []) if source["processing_status"] == "review_required" else []
 
         return SourceDetailResponse.model_validate({
-            **{key: source[key] for key in _METADATA_FIELDS},
+            "id": source["id"],
+            "name": source["name"],
+            "original_filename": source["original_filename"],
+            "file_type": source["file_type"],
+            "mime_type": source["mime_type"],
+            "file_size_bytes": source["file_size_bytes"],
+            "created_at": source["created_at"],
+            "updated_at": source["updated_at"],
+            "is_active": source["is_active"],
+            "processing_status": source["processing_status"],
+            "validation_status": source["validation_status"],
             "stage": workflow.get("stage", "uploaded"),
             "revision": workflow.get("revision", 0),
             "blocks": self._blocks(evaluation),

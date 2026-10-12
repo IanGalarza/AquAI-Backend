@@ -138,7 +138,13 @@ class SourceReviewService:
             raise SourceDecisionError("Los valores de la decisión no cumplen el contrato de la receta.") from exc
         snapshot.setdefault("source_decisions", []).append({
             "review_id": review["id"], "action": action, "values": deepcopy(values),
-            "scope": {key: review.get(key) for key in ("sheet_name", "block_id", "cell", "range", "region_id")},
+            "scope": {
+                "sheet_name": review.get("sheet_name"),
+                "block_id": review.get("block_id"),
+                "cell": review.get("cell"),
+                "range": review.get("range"),
+                "region_id": review.get("region_id"),
+            },
         })
         return result, snapshot, restart
 

@@ -191,12 +191,21 @@ class SqlAlchemySourceCommands:
             if not isinstance(updates["is_active"], bool):
                 raise ValueError("is_active debe ser booleano.")
             source.is_active = updates["is_active"]
-        for field in ("recipe_data", "rules_snapshot", "validation_report"):
-            if field in updates:
-                value = updates[field]
-                if not isinstance(value, dict) and not (field == "validation_report" and value is None):
-                    raise ValueError(f"{field} debe ser un objeto JSON.")
-                setattr(recipe, field, deepcopy(value))
+        if "recipe_data" in updates:
+            value = updates["recipe_data"]
+            if not isinstance(value, dict):
+                raise ValueError("recipe_data debe ser un objeto JSON.")
+            recipe.recipe_data = deepcopy(value)
+        if "rules_snapshot" in updates:
+            value = updates["rules_snapshot"]
+            if not isinstance(value, dict):
+                raise ValueError("rules_snapshot debe ser un objeto JSON.")
+            recipe.rules_snapshot = deepcopy(value)
+        if "validation_report" in updates:
+            value = updates["validation_report"]
+            if not isinstance(value, dict) and value is not None:
+                raise ValueError("validation_report debe ser un objeto JSON.")
+            recipe.validation_report = deepcopy(value)
         now = datetime.now(timezone.utc)
         source.updated_at = now
         recipe.updated_at = now
@@ -207,12 +216,19 @@ class SqlAlchemySourceCommands:
         validation_status: Any = _UNSET, is_active: Any = _UNSET,
         expected_processing_status: str | None = None,
     ) -> bool:
-        values = {
-            "recipe_data": recipe_data, "rules_snapshot": rules_snapshot,
-            "validation_report": validation_report, "processing_status": processing_status,
-            "validation_status": validation_status, "is_active": is_active,
-        }
-        updates = {key: value for key, value in values.items() if value is not _UNSET}
+        updates: dict[str, Any] = {}
+        if recipe_data is not _UNSET:
+            updates["recipe_data"] = recipe_data
+        if rules_snapshot is not _UNSET:
+            updates["rules_snapshot"] = rules_snapshot
+        if validation_report is not _UNSET:
+            updates["validation_report"] = validation_report
+        if processing_status is not _UNSET:
+            updates["processing_status"] = processing_status
+        if validation_status is not _UNSET:
+            updates["validation_status"] = validation_status
+        if is_active is not _UNSET:
+            updates["is_active"] = is_active
         with self._write_session() as session:
             source, recipe = self._locked_entities(session, source_id)
             if expected_processing_status is not None:
