@@ -1,22 +1,23 @@
 import json
 import unittest
 
-from aquai.application.dtos.tabular import (
+from aquai.application.contracts.tabular.results import (
     EmptySheetTreatment,
     ExecutionResult,
-    FormulaSample,
     LLMResponse,
-    PreparationRecipe,
-    RecordIdentityClarification,
-    SampleRow,
-    SheetContentEvidence,
     SheetCoverage,
     SheetExecution,
-    SheetRecipe,
-    SheetSummary,
-    StructuralSummary,
     TabularFinding,
 )
+from aquai.application.contracts.tabular.structure import (
+    FormulaSample,
+    SampleRow,
+    SheetContentEvidence,
+    SheetSummary,
+    StructuralSummary,
+)
+from aquai.application.contracts.tabular.recipe import PreparationRecipe, SheetRecipe
+from aquai.application.contracts.tabular.policies import RecordIdentityClarification
 from aquai.application.services.tabularRules import TabularRuleService
 from aquai.application.services.tabularValidation import TabularValidationService
 from aquai.application.services.tabularEvaluation import TabularEvaluationService

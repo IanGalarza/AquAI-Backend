@@ -14,30 +14,35 @@ from openpyxl.formula.tokenizer import Tokenizer, TokenizerError
 from openpyxl.utils.cell import column_index_from_string, get_column_letter
 from openpyxl.worksheet.cell_range import CellRange
 
-from aquai.application.dtos.tabular import (
+from aquai.application.contracts.tabular.recipe import (
     ConvertType,
     DropEmptyColumns,
     DropEmptyRows,
+    PreparationRecipe,
+    RenameColumns,
+    SheetRecipe,
+    StripStrings,
+)
+from aquai.application.contracts.tabular.results import (
     EmptySheetTreatment,
     ExecutionResult,
-    FormulaSample,
-    PreparationRecipe,
-    RecordOverlap,
-    RenameColumns,
-    SampleRow,
     SheetExecution,
-    SheetContentEvidence,
-    SheetRecipe,
-    SheetSummary,
     SheetCoverage,
-    StructuralRegion,
     TabularFinding,
-    StripStrings,
+)
+from aquai.application.contracts.tabular.structure import (
+    FormulaSample,
+    RecordOverlap,
+    SampleRow,
+    SheetContentEvidence,
+    SheetSummary,
+    StructuralRegion,
     StructuralSummary,
     SourceRowMatch,
 )
 from aquai.infrastructure.processing.tabular.reader import SheetData, TableReader
-from aquai.application.dtos.tabularPolicies import PreparationPolicies, SourceHeaderEvidence
+from aquai.application.contracts.tabular.policies import PreparationPolicies
+from aquai.application.contracts.tabular.structure import SourceHeaderEvidence
 from aquai.infrastructure.processing.tabular.dateConsistency import date_consistency_findings
 from aquai.infrastructure.processing.tabular.temporalPriority import select_temporal_dates
 from aquai.infrastructure.processing.tabular.normalization import trace_value
@@ -1110,60 +1115,62 @@ class PandasTabularProcessor:
         formula_positions: dict[str, set[int]],
         column_positions: dict[str, int],
     ) -> pd.DataFrame:
-        if isinstance(transformation, DropEmptyRows):
-            empty = frame.map(is_empty).all(axis=1)
-            formula_rows = set().union(*formula_positions.values()) if formula_positions else set()
-            empty &= ~(frame.index + 1).isin(formula_rows)
-            result.dropped_empty_rows += int(empty.sum())
-            return frame.loc[~empty].copy()
-        if isinstance(transformation, DropEmptyColumns):
-            empty_columns = [
-                name for name in frame.columns
-                if name not in formula_positions and frame[name].map(is_empty).all()
-            ]
-            result.dropped_empty_columns.extend(empty_columns)
-            return frame.drop(columns=empty_columns)
-        if isinstance(transformation, RenameColumns):
-            self._require_columns(frame, list(transformation.mapping))
-            names = [transformation.mapping.get(name, name) for name in frame.columns]
-            if any(not name.strip() for name in names) or len(names) != len(set(names)):
-                raise ValueError("El renombrado produce nombres vacíos o columnas duplicadas.")
-            for mapping in (formula_positions, column_positions):
-                renamed = {transformation.mapping.get(name, name): value for name, value in mapping.items()}
-                mapping.clear()
-                mapping.update(renamed)
-            return frame.rename(columns=transformation.mapping)
-        if isinstance(transformation, StripStrings):
-            selected = transformation.columns if transformation.columns is not None else list(frame.columns)
-            self._require_columns(frame, selected)
-            for name in selected:
-                frame[name] = frame[name].map(
-                    lambda value: value.strip() if isinstance(value, str) else value
-                )
-            return frame
-        if isinstance(transformation, ConvertType):
-            self._require_columns(frame, transformation.columns)
-            for name in transformation.columns:
-                original = frame[name].copy()
-                converted = self._convert(original, transformation.target_type)
-                invalid = ~original.map(is_empty) & converted.isna()
-                failures = int(invalid.sum())
-                if failures:
-                    result.conversion_failures[name] = result.conversion_failures.get(name, 0) + failures
-                    for row in original.index[invalid]:
-                        coordinate = f"{get_column_letter(column_positions[name])}{int(row) + 1}"
-                        result.findings.append(TabularFinding(
-                            code="conversion_preserved", sheet_name=result.sheet_name,
-                            block_id=result.block_id, cell=coordinate,
-                            message=(f"No se convirtió {coordinate} a {transformation.target_type}; "
-                                     "se conservó el valor original."),
-                        ))
-                converted = converted.astype(object)
-                unchanged = converted.isna()
-                converted.loc[unchanged] = original.loc[unchanged]
-                frame[name] = converted
-            return frame
-        raise ValueError("La receta contiene una operación no permitida.")
+        match transformation:
+            case DropEmptyRows():
+                empty = frame.map(is_empty).all(axis=1)
+                formula_rows = set().union(*formula_positions.values()) if formula_positions else set()
+                empty &= ~(frame.index + 1).isin(formula_rows)
+                result.dropped_empty_rows += int(empty.sum())
+                return frame.loc[~empty].copy()
+            case DropEmptyColumns():
+                empty_columns = [
+                    name for name in frame.columns
+                    if name not in formula_positions and frame[name].map(is_empty).all()
+                ]
+                result.dropped_empty_columns.extend(empty_columns)
+                return frame.drop(columns=empty_columns)
+            case RenameColumns():
+                self._require_columns(frame, list(transformation.mapping))
+                names = [transformation.mapping.get(name, name) for name in frame.columns]
+                if any(not name.strip() for name in names) or len(names) != len(set(names)):
+                    raise ValueError("El renombrado produce nombres vacíos o columnas duplicadas.")
+                for mapping in (formula_positions, column_positions):
+                    renamed = {transformation.mapping.get(name, name): value for name, value in mapping.items()}
+                    mapping.clear()
+                    mapping.update(renamed)
+                return frame.rename(columns=transformation.mapping)
+            case StripStrings():
+                selected = transformation.columns if transformation.columns is not None else list(frame.columns)
+                self._require_columns(frame, selected)
+                for name in selected:
+                    frame[name] = frame[name].map(
+                        lambda value: value.strip() if isinstance(value, str) else value
+                    )
+                return frame
+            case ConvertType():
+                self._require_columns(frame, transformation.columns)
+                for name in transformation.columns:
+                    original = frame[name].copy()
+                    converted = self._convert(original, transformation.target_type)
+                    invalid = ~original.map(is_empty) & converted.isna()
+                    failures = int(invalid.sum())
+                    if failures:
+                        result.conversion_failures[name] = result.conversion_failures.get(name, 0) + failures
+                        for row in original.index[invalid]:
+                            coordinate = f"{get_column_letter(column_positions[name])}{int(row) + 1}"
+                            result.findings.append(TabularFinding(
+                                code="conversion_preserved", sheet_name=result.sheet_name,
+                                block_id=result.block_id, cell=coordinate,
+                                message=(f"No se convirtió {coordinate} a {transformation.target_type}; "
+                                         "se conservó el valor original."),
+                            ))
+                    converted = converted.astype(object)
+                    unchanged = converted.isna()
+                    converted.loc[unchanged] = original.loc[unchanged]
+                    frame[name] = converted
+                return frame
+            case _:
+                raise ValueError("La receta contiene una operación no permitida.")
 
     def _require_columns(self, frame: pd.DataFrame, columns: list[str]) -> None:
         missing = [name for name in columns if name not in frame.columns]
@@ -1171,63 +1178,65 @@ class PandasTabularProcessor:
             raise ValueError(f"La transformación referencia columnas inexistentes: {', '.join(missing)}.")
 
     def _convert(self, series: pd.Series, target_type: str) -> pd.Series:
-        if target_type == "number":
-            converted = pd.to_numeric(series.dropna(), errors="coerce").astype(object).reindex(series.index)
-            values = []
-            for original, value in zip(series, converted, strict=True):
-                if (is_empty(value) or not math.isfinite(value)
-                        or isinstance(original, (bool, np.bool_)) or self._is_padded_code(original)):
-                    values.append(None)
-                    continue
-                try:
-                    source = Decimal(str(original).strip())
-                    precise = source == Decimal(str(value))
-                except InvalidOperation:
-                    precise = False
-                values.append(value if precise else None)
-            return pd.Series(values, index=series.index, dtype=object)
-        if target_type == "integer":
-            def to_integer(value: object) -> int | None:
-                if is_empty(value):
+        match target_type:
+            case "number":
+                converted = pd.to_numeric(series.dropna(), errors="coerce").astype(object).reindex(series.index)
+                values = []
+                for original, value in zip(series, converted, strict=True):
+                    if (is_empty(value) or not math.isfinite(value)
+                            or isinstance(original, (bool, np.bool_)) or self._is_padded_code(original)):
+                        values.append(None)
+                        continue
+                    try:
+                        source = Decimal(str(original).strip())
+                        precise = source == Decimal(str(value))
+                    except InvalidOperation:
+                        precise = False
+                    values.append(value if precise else None)
+                return pd.Series(values, index=series.index, dtype=object)
+            case "integer":
+                def to_integer(value: object) -> int | None:
+                    if is_empty(value):
+                        return None
+                    if isinstance(value, (bool, np.bool_)) or self._is_padded_code(value):
+                        return None
+                    try:
+                        number = Decimal(str(value).strip())
+                        if (
+                            number.is_finite()
+                            and number == number.to_integral_value()
+                            and -(2 ** 63) <= number < 2 ** 63
+                        ):
+                            return int(number)
+                    except InvalidOperation:
+                        pass
                     return None
-                if isinstance(value, (bool, np.bool_)) or self._is_padded_code(value):
-                    return None
-                try:
-                    number = Decimal(str(value).strip())
-                    if (
-                        number.is_finite()
-                        and number == number.to_integral_value()
-                        and -(2 ** 63) <= number < 2 ** 63
+                return pd.Series([to_integer(value) for value in series], index=series.index, dtype="Int64")
+            case "datetime":
+                def unambiguous_date(value: object) -> object:
+                    if isinstance(value, (datetime, date, pd.Timestamp)):
+                        return value
+                    if isinstance(value, str) and re.fullmatch(
+                        r"\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d{1,9})?)?(?:Z|[+-]\d{2}:\d{2})?)?",
+                        value.strip(),
                     ):
-                        return int(number)
-                except InvalidOperation:
-                    pass
-                return None
-            return pd.Series([to_integer(value) for value in series], index=series.index, dtype="Int64")
-        if target_type == "datetime":
-            def unambiguous_date(value: object) -> object:
-                if isinstance(value, (datetime, date, pd.Timestamp)):
-                    return value
-                if isinstance(value, str) and re.fullmatch(
-                    r"\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d{1,9})?)?(?:Z|[+-]\d{2}:\d{2})?)?",
-                    value.strip(),
-                ):
-                    return value.strip()
-                return None
-            unambiguous = series.map(unambiguous_date)
-            return pd.to_datetime(unambiguous, errors="coerce", format="mixed", utc=True)
-        if target_type == "boolean":
-            values = {
-                "true": True, "false": False,
-            }
-            def to_boolean(value: object) -> bool | None:
-                if is_empty(value):
+                        return value.strip()
                     return None
-                if isinstance(value, bool):
-                    return value
-                return values.get(str(value).strip().casefold())
-            return pd.Series([to_boolean(value) for value in series], index=series.index, dtype="boolean")
-        raise ValueError("El tipo de conversión no está permitido.")
+                unambiguous = series.map(unambiguous_date)
+                return pd.to_datetime(unambiguous, errors="coerce", format="mixed", utc=True)
+            case "boolean":
+                values = {
+                    "true": True, "false": False,
+                }
+                def to_boolean(value: object) -> bool | None:
+                    if is_empty(value):
+                        return None
+                    if isinstance(value, bool):
+                        return value
+                    return values.get(str(value).strip().casefold())
+                return pd.Series([to_boolean(value) for value in series], index=series.index, dtype="boolean")
+            case _:
+                raise ValueError("El tipo de conversión no está permitido.")
 
     def _is_padded_code(self, value: object) -> bool:
         return isinstance(value, str) and bool(re.fullmatch(

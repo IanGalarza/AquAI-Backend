@@ -1,13 +1,10 @@
 import asyncio
 import json
 from hashlib import sha256
-from collections import Counter
 from collections.abc import Awaitable, Callable
 from copy import deepcopy
-from time import perf_counter
 
-from aquai.application.dtos.tabular import (
-    EvaluationMetrics,
+from aquai.application.contracts.tabular.results import (
     TabularEvaluation,
     TabularFinding,
     ValidationResult,
@@ -16,7 +13,7 @@ from aquai.application.errors import FileTooLargeError, LLMProviderError, Tabula
 from aquai.application.interfaces.tabular import LLMProvider, TabularProcessor
 from aquai.application.services.tabularRecipe import (
     RecipeParseError,
-    parse_preparation_recipe_with_metrics,
+    parse_preparation_recipe,
 )
 from aquai.application.services.tabularValidation import TabularValidationService
 from aquai.application.services.tabularRules import RuleComposition, TabularRuleService
@@ -101,7 +98,6 @@ class TabularEvaluationService:
         resume_stage: str = "execution",
         automatic_profile: bool = False,
     ) -> TabularEvaluation:
-        started = perf_counter()
 
         async def persist(stage, result=None, composition=None):
             if checkpoint is not None:
@@ -109,22 +105,17 @@ class TabularEvaluationService:
 
         original_proposal = saved_evaluation.validation.original_proposal if saved_evaluation else None
         if saved_evaluation is None:
-            metrics = EvaluationMetrics()
             await persist("inspecting")
-            stage_started = perf_counter()
             summary = await self._run_processor(self._processor.inspect, file_name, content)
-            metrics.inspection_duration_ms = self._elapsed_ms(stage_started)
             result = TabularEvaluation(
                 model=selected_model,
                 structural_summary=summary,
                 validation=ValidationResult(status=EvaluationStatus.FAILED),
-                metrics=metrics,
             )
             await persist("inspected", result)
         else:
             result = saved_evaluation.model_copy(deep=True)
             summary = result.structural_summary
-            metrics = result.metrics
             result.validation = ValidationResult(status=EvaluationStatus.FAILED)
 
         rule_composition = RuleComposition.restore(saved_rules) if saved_rules is not None else None
@@ -144,24 +135,17 @@ class TabularEvaluationService:
 
         if result.recipe is None:
             await persist("generating_recipe", result, rule_composition)
-            stage_started = perf_counter()
             try:
                 result.llm_response = await self._llm_provider.generate_recipe(
                     summary, selected_model, prompt_rules
                 )
             except LLMProviderError as exc:
                 result.validation.errors.append(str(exc))
-            finally:
-                metrics.llm_duration_ms = self._elapsed_ms(stage_started)
-
             if result.llm_response is not None:
                 result.model = result.llm_response.model
                 try:
-                    parsed = parse_preparation_recipe_with_metrics(result.llm_response.content)
-                    result.recipe = parsed.recipe
-                    result.response_format = parsed.response_format
+                    result.recipe = parse_preparation_recipe(result.llm_response.content)
                 except RecipeParseError as exc:
-                    result.response_format = exc.response_format
                     result.validation.errors.append(str(exc))
             await persist("recipe_generated", result, rule_composition)
 
@@ -171,17 +155,14 @@ class TabularEvaluationService:
                 recipe_findings = self._rule_service.validate_recipe(summary, result.recipe, rule_composition)
             if result.recipe.status != "failed" and (saved_evaluation is None or resume_stage == "execution"):
                 await persist("executing", result, rule_composition)
-                stage_started = perf_counter()
                 execution_options = {}
                 if rule_composition is not None and rule_composition.preparation_policies is not None:
                     execution_options["policies"] = rule_composition.preparation_policies
                 result.execution = await self._run_processor(
                     self._processor.execute, file_name, content, result.recipe, summary, **execution_options,
                 )
-                metrics.execution_duration_ms = self._elapsed_ms(stage_started)
                 await persist("executed", result, rule_composition)
             await persist("validating", result, rule_composition)
-            stage_started = perf_counter()
             validation_options = {}
             if rule_composition is not None:
                 if rule_composition.identity_clarifications:
@@ -193,8 +174,6 @@ class TabularEvaluationService:
             )
             if original_proposal is not None:
                 result.validation.original_proposal = original_proposal
-            metrics.validation_duration_ms = self._elapsed_ms(stage_started)
-            result.response_format.recipe_executable = self._is_executable(result)
 
         if rule_composition is not None:
             all_rule_findings = rule_composition.findings + recipe_findings
@@ -218,7 +197,6 @@ class TabularEvaluationService:
             finding.model_dump_json(): finding for finding in result.validation.findings if finding.requires_review
         }.values())
 
-        metrics.total_duration_ms = self._elapsed_ms(started)
         await persist("completed", result, rule_composition)
         return result
 
@@ -257,24 +235,3 @@ class TabularEvaluationService:
         if len(content) > self._max_upload_bytes:
             raise FileTooLargeError("El archivo supera el tamaño máximo permitido.")
         return normalized_name
-
-    @staticmethod
-    def _is_executable(result: TabularEvaluation) -> bool:
-        recipe = result.recipe
-        if recipe is None or recipe.status == "failed" or not recipe.sheets or result.validation.errors:
-            return False
-        planned_blocks = Counter((sheet.sheet_name, sheet.block_id) for sheet in recipe.sheets)
-        executed_blocks = Counter((sheet.sheet_name, sheet.block_id) for sheet in result.execution.sheets)
-        treated_blocks = Counter((treatment.sheet_name, block_id) for treatment in result.execution.empty_sheets
-                                 for block_id in treatment.skipped_block_ids)
-        return (
-            planned_blocks == executed_blocks + treated_blocks
-            and all(
-                sheet.rows_after > 0 and bool(sheet.columns_after) and not sheet.errors
-                for sheet in result.execution.sheets
-            )
-        )
-
-    @staticmethod
-    def _elapsed_ms(started: float) -> float:
-        return round((perf_counter() - started) * 1000, 3)

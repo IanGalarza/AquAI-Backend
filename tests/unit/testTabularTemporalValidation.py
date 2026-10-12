@@ -3,12 +3,16 @@ from copy import deepcopy
 
 from pydantic import ValidationError
 
-from aquai.application.dtos.tabular import (
-    ExecutionResult, PreparationRecipe, SheetExecution, SheetSummary, StructuralSummary, TabularFinding,
+from aquai.application.contracts.tabular.results import (
+    ExecutionResult,
+    SheetExecution,
+    TabularFinding,
 )
-from aquai.application.dtos.tabularPolicies import (
-    DateColumnPolicy, PreparationPolicies, SourceHeaderEvidence, TemporalDateTreatment,
-)
+from aquai.application.contracts.tabular.recipe import PreparationRecipe
+from aquai.application.contracts.tabular.structure import SheetSummary, StructuralSummary
+from aquai.application.contracts.tabular.policies import DateColumnPolicy, PreparationPolicies
+from aquai.application.contracts.tabular.structure import SourceHeaderEvidence
+from aquai.application.contracts.tabular.results import TemporalDateTreatment
 from aquai.application.services.tabularValidation import TabularValidationService
 from aquai.domain.enums.tabular import EvaluationStatus
 
@@ -233,4 +237,3 @@ class TemporalDateValidationTests(unittest.TestCase):
         result = self.validate(execution)
         self.assertEqual(result.status, EvaluationStatus.REVIEW_REQUIRED)
         self.assertEqual([finding.code for finding in result.review_reasons], ["identifier_conflict"])
-

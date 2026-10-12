@@ -6,12 +6,13 @@ from unittest.mock import patch
 import httpx
 from openpyxl import Workbook
 
-from aquai.application.dtos.tabular import PreparationRecipe
+from aquai.application.contracts.tabular.recipe import PreparationRecipe
 from aquai.application.errors import FileTooLargeError, TabularInputError
 from aquai.application.services.tabularEvaluation import TabularEvaluationService
 from aquai.infrastructure.config.tabular import TabularSettings
 from aquai.infrastructure.processing.tabular.processor import PandasTabularProcessor
 from aquai.infrastructure.providers.llm.ollama import OllamaProvider
+from aquai.infrastructure.providers.llm.recipeSchema import build_recipe_schema
 
 
 def recipe(sheet_name: str = "data", **sheet_overrides: object) -> dict:
@@ -65,7 +66,7 @@ class TabularPipelineTests(unittest.IsolatedAsyncioTestCase):
         result = await self.evaluator.execute(file_name, content, **kwargs)
         return result.model_dump(mode="json")
 
-    async def test_csv_full_pipeline_returns_counts_samples_raw_response_and_metrics(self) -> None:
+    async def test_csv_full_pipeline_returns_counts_samples_and_raw_response(self) -> None:
         self.raw_content = json.dumps(recipe(transformations=[
             {"operation": "strip_strings"},
             {"operation": "convert_type", "columns": ["score"], "target_type": "integer"},
@@ -82,18 +83,8 @@ class TabularPipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sheet["sample"][0]["values"], ["Ana", 10])
         self.assertEqual(body["llm_response"]["content"], self.raw_content)
         self.assertEqual(body["llm_response"]["metadata"]["eval_count"], 37)
-        self.assertGreater(body["metrics"]["total_duration_ms"], 0)
         self.assertEqual(self.requests[0]["model"], "test-model:small")
         self.assertFalse(self.requests[0]["stream"])
-        self.assertEqual(body["response_format"], {
-            "proposed_status": "ready",
-            "json_valid": True,
-            "strict_json": True,
-            "cleanup_required": False,
-            "schema_valid": True,
-            "recipe_valid": True,
-            "recipe_executable": True,
-        })
 
     async def test_known_rules_and_default_model_reach_provider(self) -> None:
         result = await self.evaluate(known_rules="Conservar todos los registros.")
@@ -168,7 +159,6 @@ class TabularPipelineTests(unittest.IsolatedAsyncioTestCase):
         })
         result = await self.evaluate(b"taxon,count\nA,0\nB,2\nTotal,2\n\nnote,nd\n")
         self.assertIn(result["validation"]["status"], {"ready", "ready_with_warnings"})
-        self.assertTrue(result["response_format"]["recipe_executable"])
         self.assertEqual(result["execution"]["coverage"][0]["uncovered_nonempty_cells"], 0)
         self.assertEqual(result["execution"]["sheets"][0]["sample"][0]["values"], ["A", 0])
         self.assertEqual(result["execution"]["sheets"][2]["sample"][0]["values"], ["note", "nd"])
@@ -179,8 +169,6 @@ class TabularPipelineTests(unittest.IsolatedAsyncioTestCase):
         result = await self.evaluate()
         self.assertEqual(result["validation"]["status"], "ready")
         self.assertEqual(result["llm_response"]["content"], self.raw_content)
-        self.assertTrue(result["response_format"]["cleanup_required"])
-        self.assertFalse(result["response_format"]["strict_json"])
 
     async def test_invalid_or_executable_recipes_fail_without_executing(self) -> None:
         invalid_responses = [
@@ -245,9 +233,6 @@ class TabularPipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(body["validation"]["status"], "failed")
         self.assertIsNone(body["llm_response"])
         self.assertTrue(body["validation"]["errors"])
-        self.assertGreater(body["metrics"]["llm_duration_ms"], 0)
-        self.assertIsNone(body["response_format"]["schema_valid"])
-        self.assertIsNone(body["response_format"]["recipe_executable"])
 
     async def test_model_can_report_review_without_an_executable_recipe(self) -> None:
         self.raw_content = json.dumps({
@@ -258,8 +243,6 @@ class TabularPipelineTests(unittest.IsolatedAsyncioTestCase):
         body = result
         self.assertEqual(body["validation"]["status"], "review_required")
         self.assertEqual(body["execution"]["sheets"], [])
-        self.assertTrue(body["response_format"]["recipe_valid"])
-        self.assertFalse(body["response_format"]["recipe_executable"])
 
     async def test_failed_recipe_does_not_execute_even_if_it_includes_sheets(self) -> None:
         self.raw_content = json.dumps({
@@ -269,8 +252,6 @@ class TabularPipelineTests(unittest.IsolatedAsyncioTestCase):
         body = result
         self.assertEqual(body["validation"]["status"], "failed")
         self.assertEqual(body["execution"]["sheets"], [])
-        self.assertEqual(body["metrics"]["execution_duration_ms"], 0)
-        self.assertFalse(body["response_format"]["recipe_executable"])
 
     async def test_invalid_uploads_never_call_the_provider(self) -> None:
         for file_name, content in [
@@ -301,7 +282,7 @@ class TabularPipelineTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_provider_uses_shared_recipe_schema(self) -> None:
         await self.evaluate()
-        self.assertEqual(self.requests[0]["format"], PreparationRecipe.model_json_schema())
+        self.assertEqual(self.requests[0]["format"], build_recipe_schema())
 
 
 if __name__ == "__main__":

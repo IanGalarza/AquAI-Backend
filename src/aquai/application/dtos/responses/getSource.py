@@ -1,16 +1,20 @@
-"""Contratos públicos de gestión de fuentes, sin originales binarios."""
+"""Detalle de una fuente con revisiones y vistas previas tipadas."""
 
 from datetime import datetime
-from typing import Literal
-from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, JsonValue
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, field_serializer
 
+from aquai.application.dtos.responses.listSources import SourceListItem
+from aquai.application.dtos.responses.sourceDetails import (
+    SourceBlock,
+    SourceDatasetStorage,
+    SourceDecision,
+    SourceFinding,
+    SourcePreview,
+    SourceReview,
+    SourceTechnicalError,
+)
 
-ProcessingStatus = Literal[
-    "uploaded", "processing", "ready", "ready_with_warnings", "review_required", "failed"
-]
-ValidationStatus = Literal["pending", "ready", "ready_with_warnings", "review_required", "failed"]
 
 _EXAMPLE_RECIPE = {
     "status": "ready", "requires_human_review": False, "warnings": [],
@@ -19,27 +23,6 @@ _EXAMPLE_RECIPE = {
                 "data_start_column": 1, "data_end_column": 2,
                 "transformations": [{"operation": "convert_type", "columns": ["score"], "target_type": "integer"}]}],
 }
-
-
-class SourceAcceptedResponse(BaseModel):
-    id: UUID
-    processing_status: ProcessingStatus
-    validation_status: ValidationStatus
-
-
-class SourceListItem(SourceAcceptedResponse):
-    name: str
-    file_type: str
-    file_size_bytes: int = Field(ge=0)
-    created_at: datetime
-    is_active: bool = Field(serialization_alias="isActive")
-
-
-class SourceListResponse(BaseModel):
-    items: list[SourceListItem]
-    total: int = Field(ge=0)
-    page: int = Field(ge=1)
-    page_size: int = Field(ge=1, le=100)
 
 
 class SourceDetailResponse(SourceListItem):
@@ -73,34 +56,24 @@ class SourceDetailResponse(SourceListItem):
     updated_at: datetime | None = None
     stage: str
     revision: int = Field(ge=0)
-    blocks: list[dict[str, JsonValue]] = Field(default_factory=list, description="Bloques detectados y sus rangos de origen.")
-    preview: list[dict[str, JsonValue]] = Field(default_factory=list, description="Vista previa acotada; no contiene el archivo completo.")
-    findings: list[dict[str, JsonValue]] = Field(default_factory=list, description="Hallazgos de la última validación.")
-    reviews: list[dict[str, JsonValue]] = Field(default_factory=list, description="Revisiones vigentes: identificador estable, explicación, hoja/rango y acciones admitidas.")
-    decisions: list[dict[str, JsonValue]] = Field(default_factory=list, description="Decisiones registradas con alcance exclusivo de esta fuente.")
-    technical_errors: list[dict[str, JsonValue]] = Field(default_factory=list, description="Fallos técnicos que no constituyen preguntas para el usuario.")
-    dataset_storage: dict[str, JsonValue] = Field(default_factory=dict, description="Estado real del almacenamiento de datos preparados.")
+    blocks: list[SourceBlock] = Field(default_factory=list, description="Bloques detectados y sus rangos de origen.")
+    preview: list[SourcePreview] = Field(default_factory=list, description="Vista previa acotada; no contiene el archivo completo.")
+    findings: list[SourceFinding] = Field(default_factory=list, description="Hallazgos de la última validación.")
+    reviews: list[SourceReview] = Field(default_factory=list, description="Revisiones vigentes: identificador estable, explicación, hoja/rango y acciones admitidas.")
+    decisions: list[SourceDecision] = Field(default_factory=list, description="Decisiones registradas con alcance exclusivo de esta fuente.")
+    technical_errors: list[SourceTechnicalError] = Field(default_factory=list, description="Fallos técnicos que no constituyen preguntas para el usuario.")
+    dataset_storage: SourceDatasetStorage = Field(default_factory=SourceDatasetStorage, description="Estado real del almacenamiento de datos preparados.")
     queryable: bool = Field(description="Sólo puede ser verdadero si se publicaron datos aceptados y persistidos.")
     original_proposal: dict[str, JsonValue] | None = None
     effective_recipe: dict[str, JsonValue] | None = None
     rules: dict[str, JsonValue] = Field(default_factory=dict)
 
-
-class SourceDecisionRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid", strict=True, json_schema_extra={
-        "examples": [
-            {"action": "correct_transformations", "values": {"transformations": []}},
-            {"action": "clarify_record_identity", "values": {
-                "identity": "distinct", "statement": "Los registros corresponden a campañas independientes.",
-            }},
-        ],
-    })
-
-    action: str = Field(min_length=1, max_length=80, description="Una acción admitida en la revisión vigente devuelta por GET /sources/{id}.")
-    values: dict[str, JsonValue] = Field(default_factory=dict, description="Valores estructurados exigidos por esa acción; se validan contra el estado actual.")
-
-
-class SourceDecisionResponse(SourceAcceptedResponse):
-    review_id: str | None = None
-    revision: int = Field(default=0, ge=0)
-    duplicate: bool = False
+    @field_serializer(
+        "blocks", "preview", "findings", "reviews", "decisions", "technical_errors", "dataset_storage",
+        when_used="json",
+    )
+    def serialize_details(self, value: list[BaseModel] | BaseModel):
+        # Los documentos existentes distinguen campos ausentes de valores null.
+        if isinstance(value, list):
+            return [item.model_dump(mode="json", exclude_unset=True) for item in value]
+        return value.model_dump(mode="json", exclude_unset=True)

@@ -8,13 +8,9 @@ from numbers import Number
 
 from openpyxl.utils.cell import coordinate_to_tuple, get_column_letter
 
-from aquai.application.dtos.tabular import TabularFinding
-from aquai.application.dtos.tabularPolicies import (
-    AssociationDiagnostic,
-    DateColumnPolicy,
-    PreparationPolicies,
-    TemporalDateTreatment,
-)
+from aquai.application.contracts.tabular.results import TabularFinding
+from aquai.application.contracts.tabular.results import AssociationDiagnostic, TemporalDateTreatment
+from aquai.application.contracts.tabular.policies import DateColumnPolicy, PreparationPolicies
 from aquai.infrastructure.processing.tabular.normalization import parse_explicit_date, trace_value
 from aquai.infrastructure.processing.tabular.preparation import cell_metadata, headers_match, strict_missing
 from aquai.infrastructure.processing.tabular.reader import SheetData
@@ -94,7 +90,12 @@ def _code_parts(value: object, formats: tuple[str, ...]) -> _DateParts | None:
     numeric = _integer(value) if not isinstance(value, str) else None
     if numeric is not None and numeric < 0:
         return None
-    text = str(numeric) if numeric is not None else value.strip() if isinstance(value, str) else ""
+    if numeric is not None:
+        text = str(numeric)
+    elif isinstance(value, str):
+        text = value.strip()
+    else:
+        return None
     if not text.isdigit():
         return None
     # Numeric cells can have lost one leading zero. Never expand a six-digit
@@ -190,6 +191,7 @@ def date_consistency_findings(
                     # they cannot substantiate a contradiction by themselves.
                     continue
                 comparable = parts
+                components = {"month": parts.month, "year": parts.year, "day": parts.day}
                 discrepancies = []
                 for component, related_column in policy.related_date_columns.items():
                     related = sheet.frame.iat[row - 1, related_column - 1]
@@ -209,7 +211,7 @@ def date_consistency_findings(
                             comparable = _DateParts(parts.year, parts.month, None)
                     else:
                         actual = _month(related) if component == "month" else _integer(related)
-                        expected = getattr(parts, component)
+                        expected = components[component]
                         if actual != expected:
                             discrepancies.append(label_evidence + " difiere del componente de la fecha original")
                 comparable_dates[(sheet.name, row, column)] = comparable

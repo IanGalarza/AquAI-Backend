@@ -8,14 +8,10 @@ from uuid import UUID
 
 from pydantic import ValidationError
 
-from aquai.application.dtos.tabular import (
-    PreparationRecipe,
-    RecordIdentityClarification,
-    SheetRecipe,
-    StructuralSummary,
-    TabularEvaluation,
-    TabularFinding,
-)
+from aquai.application.contracts.tabular.recipe import PreparationRecipe, SheetRecipe
+from aquai.application.contracts.tabular.policies import RecordIdentityClarification
+from aquai.application.contracts.tabular.structure import StructuralSummary
+from aquai.application.contracts.tabular.results import TabularEvaluation, TabularFinding
 from aquai.application.errors import SourceDecisionError
 
 
@@ -119,58 +115,25 @@ class SourceReviewService:
             "metadata": {}, "prompt_rules": {}, "findings": [], "review_reasons": [],
             "identity_clarifications": [], "preparation_policies": None,
         }
-        restart = "execution"
         try:
-            if action == "clarify_record_identity":
-                self._check_keys(values, {"identity", "statement"})
-                statement = values["statement"]
-                if values["identity"] != "distinct" or not isinstance(statement, str) or not statement.strip():
-                    raise SourceDecisionError("Debe confirmar registros distintos y explicar la aclaración.")
-                if len(statement) > 4000:
-                    raise SourceDecisionError("La aclaración no puede superar 4000 caracteres.")
-                original_note = self._original_note(result.structural_summary, finding)
-                if original_note is None:
-                    raise SourceDecisionError("No se encontró la nota original en la ubicación del hallazgo.")
-                clarification = RecordIdentityClarification(
-                    rule_id=f"source_review:{review['id']}", original_note=original_note,
-                    statement=statement.strip(), confirmed_by="source_review",
-                    source_reference=f"source:{review['source_id']}:review:{review['id']}",
-                    sheet_name=finding.sheet_name, cell=finding.cell,
-                )
-                snapshot.setdefault("identity_clarifications", []).append(clarification.model_dump(mode="json"))
-                restart = "validation"
-            else:
-                if result.recipe is None:
-                    raise SourceDecisionError("No hay una receta vigente que pueda corregirse.")
-                recipe = result.recipe.model_dump(mode="json")
-                if action == "correct_transformations":
-                    self._check_keys(values, {"transformations"})
-                    if not isinstance(values["transformations"], list):
-                        raise SourceDecisionError("transformations debe ser una lista de operaciones admitidas.")
-                    index = self._block_index(recipe, finding)
-                    previous = deepcopy(recipe["sheets"][index])
-                    recipe["sheets"][index]["transformations"] = values["transformations"]
-                    candidate = SheetRecipe.model_validate(recipe["sheets"][index])
-                    if candidate.model_dump(mode="json") == previous:
-                        raise SourceDecisionError("La decisión no modifica la propuesta afectada.")
-                else:
-                    self._check_keys(values, {"block"})
-                    candidate = SheetRecipe.model_validate(values["block"])
-                    if candidate.sheet_name != finding.sheet_name:
-                        raise SourceDecisionError("El bloque debe pertenecer a la hoja afectada.")
-                    self._check_bounds(candidate, result.structural_summary)
-                    if action == "replace_block":
-                        if candidate.block_id != finding.block_id:
-                            raise SourceDecisionError("La corrección debe conservar el identificador del bloque afectado.")
-                        index = self._block_index(recipe, finding)
-                        if candidate.model_dump(mode="json")["transformations"] != recipe["sheets"][index]["transformations"]:
-                            raise SourceDecisionError("Esta acción sólo corrige la estructura; las transformaciones requieren su revisión específica.")
-                        if candidate.model_dump(mode="json") == recipe["sheets"][index]:
-                            raise SourceDecisionError("La decisión no modifica la propuesta afectada.")
-                        recipe["sheets"][index] = candidate.model_dump(mode="json")
-                    else:
-                        recipe["sheets"].append(candidate.model_dump(mode="json"))
-                result.recipe = PreparationRecipe.model_validate(recipe)
+            match action:
+                case "clarify_record_identity":
+                    self._clarify_identity(review, finding, values, result, snapshot)
+                    restart = "validation"
+                case "correct_transformations" | "replace_block" | "add_block":
+                    if result.recipe is None:
+                        raise SourceDecisionError("No hay una receta vigente que pueda corregirse.")
+                    recipe = result.recipe.model_dump(mode="json")
+                    corrections = {
+                        "correct_transformations": self._correct_transformations,
+                        "replace_block": self._replace_block,
+                        "add_block": self._add_block,
+                    }
+                    corrections[action](recipe, finding, values, result.structural_summary)
+                    result.recipe = PreparationRecipe.model_validate(recipe)
+                    restart = "execution"
+                case _:
+                    raise SourceDecisionError("La acción no está admitida para esta revisión.")
         except (ValidationError, KeyError, TypeError) as exc:
             raise SourceDecisionError("Los valores de la decisión no cumplen el contrato de la receta.") from exc
         snapshot.setdefault("source_decisions", []).append({
@@ -178,6 +141,70 @@ class SourceReviewService:
             "scope": {key: review.get(key) for key in ("sheet_name", "block_id", "cell", "range", "region_id")},
         })
         return result, snapshot, restart
+
+    def _clarify_identity(
+        self, review: dict, finding: TabularFinding, values: dict,
+        result: TabularEvaluation, snapshot: dict,
+    ) -> None:
+        self._check_keys(values, {"identity", "statement"})
+        statement = values["statement"]
+        if values["identity"] != "distinct" or not isinstance(statement, str) or not statement.strip():
+            raise SourceDecisionError("Debe confirmar registros distintos y explicar la aclaración.")
+        if len(statement) > 4000:
+            raise SourceDecisionError("La aclaración no puede superar 4000 caracteres.")
+        original_note = self._original_note(result.structural_summary, finding)
+        if original_note is None:
+            raise SourceDecisionError("No se encontró la nota original en la ubicación del hallazgo.")
+        clarification = RecordIdentityClarification(
+            rule_id=f"source_review:{review['id']}", original_note=original_note,
+            statement=statement.strip(), confirmed_by="source_review",
+            source_reference=f"source:{review['source_id']}:review:{review['id']}",
+            sheet_name=finding.sheet_name, cell=finding.cell,
+        )
+        snapshot.setdefault("identity_clarifications", []).append(clarification.model_dump(mode="json"))
+
+    def _correct_transformations(
+        self, recipe: dict, finding: TabularFinding, values: dict, summary: StructuralSummary,
+    ) -> None:
+        self._check_keys(values, {"transformations"})
+        if not isinstance(values["transformations"], list):
+            raise SourceDecisionError("transformations debe ser una lista de operaciones admitidas.")
+        index = self._block_index(recipe, finding)
+        previous = deepcopy(recipe["sheets"][index])
+        recipe["sheets"][index]["transformations"] = values["transformations"]
+        candidate = SheetRecipe.model_validate(recipe["sheets"][index])
+        if candidate.model_dump(mode="json") == previous:
+            raise SourceDecisionError("La decisión no modifica la propuesta afectada.")
+
+    def _candidate_block(
+        self, finding: TabularFinding, values: dict, summary: StructuralSummary,
+    ) -> SheetRecipe:
+        self._check_keys(values, {"block"})
+        candidate = SheetRecipe.model_validate(values["block"])
+        if candidate.sheet_name != finding.sheet_name:
+            raise SourceDecisionError("El bloque debe pertenecer a la hoja afectada.")
+        self._check_bounds(candidate, summary)
+        return candidate
+
+    def _replace_block(
+        self, recipe: dict, finding: TabularFinding, values: dict, summary: StructuralSummary,
+    ) -> None:
+        candidate = self._candidate_block(finding, values, summary)
+        if candidate.block_id != finding.block_id:
+            raise SourceDecisionError("La corrección debe conservar el identificador del bloque afectado.")
+        index = self._block_index(recipe, finding)
+        block = candidate.model_dump(mode="json")
+        if block["transformations"] != recipe["sheets"][index]["transformations"]:
+            raise SourceDecisionError("Esta acción sólo corrige la estructura; las transformaciones requieren su revisión específica.")
+        if block == recipe["sheets"][index]:
+            raise SourceDecisionError("La decisión no modifica la propuesta afectada.")
+        recipe["sheets"][index] = block
+
+    def _add_block(
+        self, recipe: dict, finding: TabularFinding, values: dict, summary: StructuralSummary,
+    ) -> None:
+        candidate = self._candidate_block(finding, values, summary)
+        recipe["sheets"].append(candidate.model_dump(mode="json"))
 
     def _options(self, finding: TabularFinding, evaluation: TabularEvaluation) -> list[dict]:
         if evaluation.recipe is None:

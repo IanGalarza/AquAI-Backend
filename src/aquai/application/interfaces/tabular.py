@@ -1,12 +1,9 @@
 from typing import Protocol
 
-from aquai.application.dtos.tabular import (
-    ExecutionResult,
-    LLMResponse,
-    PreparationRecipe,
-    StructuralSummary,
-)
-from aquai.application.dtos.tabularPolicies import PreparationPolicies
+from aquai.application.contracts.tabular.results import ExecutionResult, LLMResponse
+from aquai.application.contracts.tabular.recipe import PreparationRecipe
+from aquai.application.contracts.tabular.structure import StructuralSummary
+from aquai.application.contracts.tabular.policies import PreparationPolicies
 
 
 class TabularProcessor(Protocol):

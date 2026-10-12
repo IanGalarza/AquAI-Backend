@@ -5,10 +5,10 @@ from datetime import date
 
 from openpyxl.utils.cell import get_column_letter
 
-from aquai.application.dtos.tabular import SheetRecipe, TabularFinding
-from aquai.application.dtos.tabularPolicies import (
-    DateColumnPolicy,
-    PreparationPolicies,
+from aquai.application.contracts.tabular.recipe import SheetRecipe
+from aquai.application.contracts.tabular.results import TabularFinding
+from aquai.application.contracts.tabular.policies import DateColumnPolicy, PreparationPolicies
+from aquai.application.contracts.tabular.results import (
     TemporalDateTreatment,
     TemporalDiscrepancy,
     TemporalSourceEvidence,
@@ -26,6 +26,14 @@ from aquai.infrastructure.processing.tabular.reader import SheetData
 
 def _missing(value: object) -> bool:
     return strict_missing(value) or isinstance(value, str) and not value.strip()
+
+
+def _select_date(code_date: date | None, original_date: date | None) -> tuple[date | None, str | None]:
+    if code_date is not None:
+        return code_date, "date_code"
+    if original_date is not None:
+        return original_date, "date"
+    return None, None
 
 
 def _full_code(value: object, metadata, policy: DateColumnPolicy):
@@ -107,8 +115,8 @@ def select_temporal_dates(
                              if date_parts is not None else None)
                 # An uncached formula cannot substantiate a candidate. A cached
                 # formula retains its expression elsewhere and its cache here.
-                chosen = code_date if code_date is not None else date_date
-                source_field = "date_code" if code_date is not None else "date" if date_date is not None else None
+                chosen, source_field = _select_date(code_date, date_date)
+                components = {"month": chosen.month, "year": chosen.year, "day": chosen.day} if chosen else {}
                 discrepancies = []
 
                 def discrepancy(code, message, fields):
@@ -142,7 +150,7 @@ def select_temporal_dates(
                         continue
                     value = sheet.frame.iat[row - 1, columns[component] - 1]
                     actual = _month(value) if component == "month" else _integer(value)
-                    if chosen is not None and actual != getattr(chosen, component):
+                    if chosen is not None and actual != components[component]:
                         discrepancy(component + "_disagrees",
                                     f"{evidence[component].cell}={original[component]!r} difiere del componente de {chosen.isoformat()}; es un campo de contraste.",
                                     (component, source_field))

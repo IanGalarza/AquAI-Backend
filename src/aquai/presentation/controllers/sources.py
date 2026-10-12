@@ -5,6 +5,16 @@ from uuid import UUID
 
 from fastapi import APIRouter, Query
 
+from aquai.application.dtos.requests.listSources import ListSourcesRequest
+from aquai.application.dtos.requests.reviewSource import SourceDecisionRequest
+from aquai.application.dtos.responses.getSource import SourceDetailResponse
+from aquai.application.dtos.responses.listSources import SourceListResponse
+from aquai.application.dtos.responses.reviewSource import SourceDecisionResponse
+from aquai.application.dtos.responses.uploadSource import (
+    ProcessingStatus,
+    SourceAcceptedResponse,
+    ValidationStatus,
+)
 from aquai.presentation.dependencies import (
     GetSourceDependency,
     ListSourcesDependency,
@@ -13,15 +23,6 @@ from aquai.presentation.dependencies import (
     UploadSourceDependency,
 )
 from aquai.presentation.errors import ERROR_RESPONSES
-from aquai.presentation.schemas.sources import (
-    ProcessingStatus,
-    SourceAcceptedResponse,
-    SourceDecisionRequest,
-    SourceDecisionResponse,
-    SourceDetailResponse,
-    SourceListResponse,
-    ValidationStatus,
-)
 
 
 router = APIRouter(prefix="/sources", tags=["Fuentes"])
@@ -46,8 +47,8 @@ router = APIRouter(prefix="/sources", tags=["Fuentes"])
 async def upload_source(
     file: SourceFileDependency,
     handler: UploadSourceDependency,
-) -> dict:
-    return await handler.handle(file.filename, file.content)
+) -> SourceAcceptedResponse:
+    return await handler.handle(file)
 
 
 @router.get(
@@ -65,14 +66,14 @@ async def list_sources(
     ] = None,
     processing_status: Annotated[ProcessingStatus | None, Query()] = None,
     validation_status: Annotated[ValidationStatus | None, Query()] = None,
-) -> dict:
-    return await handler.handle(
+) -> SourceListResponse:
+    return await handler.handle(ListSourcesRequest(
         page=page,
         page_size=page_size,
         name=name,
         processing_status=processing_status,
         validation_status=validation_status,
-    )
+    ))
 
 
 @router.get(
@@ -81,7 +82,7 @@ async def list_sources(
     summary="Consultar una fuente",
     responses=ERROR_RESPONSES,
 )
-async def get_source(id: UUID, handler: GetSourceDependency) -> dict:
+async def get_source(id: UUID, handler: GetSourceDependency) -> SourceDetailResponse:
     return await handler.handle(id)
 
 
@@ -103,5 +104,5 @@ async def decide_source_review(
     review_id: str,
     decision: SourceDecisionRequest,
     handler: ReviewSourceDependency,
-) -> dict:
-    return await handler.handle(id, review_id, decision.action, decision.values)
+) -> SourceDecisionResponse:
+    return await handler.handle(id, review_id, decision)

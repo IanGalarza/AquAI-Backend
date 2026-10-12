@@ -3,9 +3,11 @@ import json
 import httpx
 
 from aquai.application.agents.prompts.tabular import TABULAR_RECIPE_PROMPT
-from aquai.application.dtos.tabular import LLMResponse, PreparationRecipe, StructuralSummary
+from aquai.application.contracts.tabular.results import LLMResponse
+from aquai.application.contracts.tabular.structure import StructuralSummary
 from aquai.application.errors import LLMProviderError
 from aquai.infrastructure.config.tabular import TabularSettings
+from aquai.infrastructure.providers.llm.recipeSchema import build_recipe_schema
 
 
 class OllamaProvider:
@@ -24,7 +26,7 @@ class OllamaProvider:
         model: str,
         known_rules: str | None = None,
     ) -> LLMResponse:
-        schema = PreparationRecipe.model_json_schema()
+        schema = build_recipe_schema()
         payload = {
             "model": model,
             "stream": False,

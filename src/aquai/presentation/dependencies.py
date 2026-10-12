@@ -1,12 +1,12 @@
 """Dependencias HTTP de cada handler y lectura acotada de archivos."""
 
 from collections.abc import AsyncIterator
-from dataclasses import dataclass
 from typing import Annotated
 
 from fastapi import Depends, File, HTTPException, Request, UploadFile
 from starlette.datastructures import UploadFile as StarletteUploadFile
 
+from aquai.application.dtos.requests.uploadSource import UploadSourceRequest
 from aquai.application.errors import FileTooLargeError
 from aquai.application.useCases.sources import (
     GetSourceHandler,
@@ -46,17 +46,11 @@ GetSourceDependency = Annotated[GetSourceHandler, Depends(get_source_handler)]
 ReviewSourceDependency = Annotated[ReviewSourceHandler, Depends(get_review_source_handler)]
 
 
-@dataclass(frozen=True)
-class SourceFile:
-    filename: str | None
-    content: bytes
-
-
 async def read_source_file(
     request: Request,
     file: Annotated[UploadFile, File(description="Archivo original CSV o XLSX.")],
     handler: UploadSourceDependency,
-) -> AsyncIterator[SourceFile]:
+) -> AsyncIterator[UploadSourceRequest]:
     form = await request.form()
     try:
         parts = list(form.multi_items())
@@ -68,11 +62,11 @@ async def read_source_file(
         content = await file.read(handler.max_upload_bytes + 1)
         if len(content) > handler.max_upload_bytes:
             raise FileTooLargeError("El archivo supera el tamaño máximo permitido.")
-        yield SourceFile(filename=file.filename, content=content)
+        yield UploadSourceRequest(filename=file.filename, content=content)
     finally:
         for _, part in form.multi_items():
             if isinstance(part, StarletteUploadFile):
                 await part.close()
 
 
-SourceFileDependency = Annotated[SourceFile, Depends(read_source_file)]
+SourceFileDependency = Annotated[UploadSourceRequest, Depends(read_source_file)]

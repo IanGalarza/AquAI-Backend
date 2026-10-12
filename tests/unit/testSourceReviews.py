@@ -9,7 +9,7 @@ from threading import Event
 
 from jsonschema import Draft202012Validator
 
-from aquai.application.dtos.tabular import LLMResponse, TabularFinding
+from aquai.application.contracts.tabular.results import LLMResponse, TabularFinding
 from aquai.application.errors import SourceDecisionError
 from aquai.application.services.sourceReviews import SourceReviewService
 from aquai.application.services.tabularRules import RuleComposition, TabularRuleService

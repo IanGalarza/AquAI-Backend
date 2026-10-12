@@ -1,23 +1,27 @@
 import unittest
 
-from aquai.application.dtos.tabular import (
+from aquai.application.contracts.tabular.results import (
     ExecutionResult,
-    FormulaSample,
-    PreparationRecipe,
-    RecordIdentityClarification,
-    RecordOverlap,
     SheetExecution,
     SheetCoverage,
-    RenameColumns,
-    SheetRecipe,
+    TabularFinding,
+    ValidationResult,
+)
+from aquai.application.contracts.tabular.structure import (
+    FormulaSample,
+    RecordOverlap,
     SheetSummary,
     SampleRow,
     StructuralSummary,
     StructuralRegion,
-    TabularFinding,
     SourceRowMatch,
-    ValidationResult,
 )
+from aquai.application.contracts.tabular.recipe import (
+    PreparationRecipe,
+    RenameColumns,
+    SheetRecipe,
+)
+from aquai.application.contracts.tabular.policies import RecordIdentityClarification
 from aquai.application.services.tabularValidation import TabularValidationService
 from aquai.domain.enums.tabular import EvaluationStatus
 
@@ -332,6 +336,31 @@ class TabularValidationTests(unittest.TestCase):
         self.assertEqual(self._validate().status, EvaluationStatus.READY)
         self.execution.sheets[0].columns_after = ["place"]
         self.assertEqual(self._validate().status, EvaluationStatus.REVIEW_REQUIRED)
+
+    def test_independent_integrity_checks_all_run_and_keep_finding_order(self) -> None:
+        self.summary.sheets[0].formula_count = 1
+        self.summary.sheets[0].missing_formula_cache_count = 1
+        self.summary.sheets[0].regions = [StructuralRegion(
+            region_id="uncertain", kind="unknown", reason="Tratamiento sin confirmar.",
+            start_row=2, end_row=4, start_column=1, end_column=2,
+        )]
+        self.execution.coverage = [SheetCoverage(
+            sheet_name="Measurements", nonempty_cells=6, covered_nonempty_cells=6,
+            uncovered_nonempty_cells=0, overlapping_nonempty_cells=1,
+        )]
+        self.execution.sheets[0] = self._execution_sheet(
+            "Measurements", rows_after=2, conversion_failures={"value": 1},
+            source_nonempty_cells=6, preserved_nonempty_cells=5, unresolved_formula_cells=["B2"],
+        )
+
+        result = self._validate()
+
+        self.assertEqual(result.status, EvaluationStatus.FAILED)
+        self.assertEqual([finding.code for finding in result.findings], [
+            "source_missing_formula_cache", "overlapping_source_cells", "unexplained_row_loss",
+            "conversion_failures", "nonempty_value_loss", "unresolved_formula_cache",
+            "unresolved_structural_region",
+        ])
 
     def test_zero_failed_conversions_do_not_require_review(self) -> None:
         self.execution.sheets[0].conversion_failures = {"value": 0}

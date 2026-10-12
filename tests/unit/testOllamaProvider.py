@@ -8,13 +8,20 @@ import httpx
 from pydantic import ValidationError
 
 from aquai.application.agents.prompts.tabular import TABULAR_RECIPE_PROMPT
-from aquai.application.dtos.tabular import (
-    ExecutionResult, FormulaSample, PreparationRecipe, RecordOverlap, SampleRow, SheetSummary,
-    SourceRowMatch, StructuralRegion, StructuralSummary,
+from aquai.application.contracts.tabular.results import ExecutionResult
+from aquai.application.contracts.tabular.structure import (
+    FormulaSample,
+    RecordOverlap,
+    SampleRow,
+    SheetSummary,
+    SourceRowMatch,
+    StructuralRegion,
+    StructuralSummary,
 )
 from aquai.application.errors import LLMProviderError
 from aquai.infrastructure.config.tabular import TabularSettings
 from aquai.infrastructure.providers.llm.ollama import OllamaProvider
+from aquai.infrastructure.providers.llm.recipeSchema import build_recipe_schema
 
 
 def summary() -> StructuralSummary:
@@ -218,7 +225,7 @@ class OllamaProviderTests(unittest.IsolatedAsyncioTestCase):
         payload = json.loads(request.content)
         self.assertEqual(payload["model"], "another-model:9b")
         self.assertIs(payload["stream"], False)
-        self.assertEqual(payload["format"], PreparationRecipe.model_json_schema())
+        self.assertEqual(payload["format"], build_recipe_schema())
         system_message = payload["messages"][0]["content"]
         self.assertTrue(system_message.startswith(TABULAR_RECIPE_PROMPT))
         self.assertEqual(json.loads(system_message[len(TABULAR_RECIPE_PROMPT):]), payload["format"])

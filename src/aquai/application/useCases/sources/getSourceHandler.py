@@ -6,6 +6,7 @@ from copy import deepcopy
 from hashlib import sha256
 from uuid import UUID
 
+from aquai.application.dtos.responses.getSource import SourceDetailResponse
 from aquai.application.interfaces.sources import SourceQueries
 from aquai.application.services.sourceReviews import SourceReviewService
 from aquai.application.useCases.sources.constants import DATASET_STORAGE
@@ -24,7 +25,7 @@ class GetSourceHandler:
         self._queries = queries
         self._reviews = reviews or SourceReviewService()
 
-    async def handle(self, source_id: UUID) -> dict:
+    async def handle(self, source_id: UUID) -> SourceDetailResponse:
         source = await asyncio.to_thread(self._queries.get, source_id)
         report = source.get("validation_report") or {}
         data = source.get("recipe_data") or {}
@@ -33,7 +34,7 @@ class GetSourceHandler:
         validation = evaluation.get("validation") or {}
         reviews = report.get("reviews", []) if source["processing_status"] == "review_required" else []
 
-        return {
+        return SourceDetailResponse.model_validate({
             **{key: source[key] for key in _METADATA_FIELDS},
             "stage": workflow.get("stage", "uploaded"),
             "revision": workflow.get("revision", 0),
@@ -48,7 +49,7 @@ class GetSourceHandler:
             "original_proposal": data.get("proposal"),
             "effective_recipe": data.get("effective"),
             "rules": source.get("rules_snapshot") or {},
-        }
+        })
 
     def _findings(self, source_id: UUID, findings: list[dict], reviews: list[dict]) -> list[dict]:
         result = []

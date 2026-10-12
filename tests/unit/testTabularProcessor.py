@@ -7,7 +7,7 @@ from zipfile import ZIP_DEFLATED, ZipFile
 
 from openpyxl import Workbook
 
-from aquai.application.dtos.tabular import PreparationRecipe, SheetRecipe
+from aquai.application.contracts.tabular.recipe import PreparationRecipe, SheetRecipe
 from aquai.application.errors import FileTooLargeError, TabularInputError
 from aquai.application.services.tabularValidation import TabularValidationService
 from aquai.domain.enums.tabular import EvaluationStatus

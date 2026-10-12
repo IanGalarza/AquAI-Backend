@@ -4,6 +4,8 @@ import asyncio
 from collections.abc import Callable
 from hashlib import sha256
 
+from aquai.application.dtos.requests.uploadSource import UploadSourceRequest
+from aquai.application.dtos.responses.uploadSource import SourceAcceptedResponse
 from aquai.application.interfaces.sources import SourceCommands, SourceQueries
 from aquai.application.services.tabularEvaluation import TabularEvaluationService
 from aquai.domain.models.source import Source
@@ -25,25 +27,20 @@ class UploadSourceHandler:
         self._notify = notify
         self.max_upload_bytes = max_upload_bytes
 
-    async def handle(self, filename: str | None, content: bytes) -> dict:
-        filename = self._evaluator.validate_upload(filename, content)
-        source = self._build_source(filename, content)
+    async def handle(self, request: UploadSourceRequest) -> SourceAcceptedResponse:
+        filename = self._evaluator.validate_upload(request.filename, request.content)
+        source = self._build_source(filename, request.content)
         source_id, created = await asyncio.to_thread(
-            self._commands.create_upload, source, self._initial_recipe(content)
+            self._commands.create_upload, source, self._initial_recipe(request.content)
         )
         if self._notify is not None:
             self._notify()
         if created:
-            return {
-                "id": source_id,
-                "processing_status": "uploaded",
-                "validation_status": "pending",
-            }
+            return SourceAcceptedResponse(
+                id=source_id, processing_status="uploaded", validation_status="pending",
+            )
         existing = await asyncio.to_thread(self._queries.get, source_id)
-        return {
-            key: existing[key]
-            for key in ("id", "processing_status", "validation_status")
-        }
+        return SourceAcceptedResponse.model_validate(existing)
 
     @staticmethod
     def _build_source(filename: str, content: bytes) -> Source:

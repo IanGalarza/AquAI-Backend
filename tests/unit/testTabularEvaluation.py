@@ -2,13 +2,12 @@ import json
 import unittest
 from unittest.mock import AsyncMock, Mock
 
-from aquai.application.dtos.tabular import (
+from aquai.application.contracts.tabular.results import (
     ExecutionResult,
     LLMResponse,
     SheetExecution,
-    SheetSummary,
-    StructuralSummary,
 )
+from aquai.application.contracts.tabular.structure import SheetSummary, StructuralSummary
 from aquai.application.errors import LLMProviderError
 from aquai.application.services.tabularEvaluation import TabularEvaluationService
 from aquai.domain.enums.tabular import EvaluationStatus
@@ -44,26 +43,24 @@ class TabularEvaluationServiceTests(unittest.IsolatedAsyncioTestCase):
     async def evaluate(self, **kwargs):
         return await self.evaluator.execute("data.csv", self.content, **kwargs)
 
-    async def test_normal_request_inspects_and_preserves_response_metrics(self) -> None:
+    async def test_normal_request_inspects_and_preserves_operational_result(self) -> None:
         result = await self.evaluate()
         self.processor.inspect.assert_called_once_with("data.csv", self.content)
-        self.assertGreater(result.metrics.inspection_duration_ms, 0)
-        self.assertTrue(result.response_format.strict_json)
-        self.assertTrue(result.response_format.recipe_valid)
-        self.assertTrue(result.response_format.recipe_executable)
         self.assertEqual(result.validation.status, EvaluationStatus.READY)
+        self.assertEqual(result.recipe.sheets[0].block_id, "observations")
+        self.assertEqual(result.execution, self.execution)
+        self.assertNotIn("metrics", result.model_dump())
+        self.assertNotIn("response_format", result.model_dump())
 
     async def test_no_response_does_not_claim_attempted_validation(self) -> None:
         self.provider.generate_recipe.side_effect = LLMProviderError("No se pudo contactar Ollama.")
         result = await self.evaluate()
         self.assertIsNone(result.llm_response)
-        self.assertFalse(result.response_format.json_valid)
-        self.assertIsNone(result.response_format.schema_valid)
-        self.assertIsNone(result.response_format.recipe_valid)
-        self.assertIsNone(result.response_format.recipe_executable)
+        self.assertEqual(result.validation.status, EvaluationStatus.FAILED)
+        self.assertEqual(result.validation.errors, ["No se pudo contactar Ollama."])
         self.processor.execute.assert_not_called()
 
-    async def test_schema_failure_and_contract_failure_keep_distinct_metrics(self) -> None:
+    async def test_schema_failure_and_contract_failure_keep_distinct_errors(self) -> None:
         duplicate_blocks = recipe_document()
         duplicate_blocks["sheets"] *= 2
         for document, expected_schema in (({"status": "ready"}, False),
@@ -74,12 +71,9 @@ class TabularEvaluationServiceTests(unittest.IsolatedAsyncioTestCase):
                 )
                 result = await self.evaluate()
                 self.assertIsNone(result.recipe)
-                self.assertTrue(result.response_format.json_valid)
-                self.assertEqual(result.response_format.schema_valid, expected_schema)
-                self.assertEqual(result.response_format.recipe_valid, False if expected_schema else None)
-                self.assertEqual(result.response_format.proposed_status, "ready")
-                self.assertFalse(result.response_format.recipe_executable)
                 self.assertEqual(result.validation.status, EvaluationStatus.FAILED)
+                expected_error = "contrato Pydantic" if expected_schema else "JSON Schema"
+                self.assertIn(expected_error, result.validation.errors[0])
         self.processor.execute.assert_not_called()
 
     async def test_review_and_failed_empty_recipes_are_not_executable(self) -> None:
@@ -96,15 +90,12 @@ class TabularEvaluationServiceTests(unittest.IsolatedAsyncioTestCase):
                 )
                 self.processor.execute.return_value = ExecutionResult()
                 result = await self.evaluate()
-                self.assertTrue(result.response_format.recipe_valid)
-                self.assertFalse(result.response_format.recipe_executable)
                 self.assertEqual(result.validation.status.value, status)
 
     async def test_executable_recipe_can_require_review_for_data_quality(self) -> None:
         self.execution.sheets[0].conversion_failures = {"a": 1}
         result = await self.evaluate()
         self.assertEqual(result.validation.status, EvaluationStatus.REVIEW_REQUIRED)
-        self.assertTrue(result.response_format.recipe_executable)
 
     async def test_incomplete_empty_or_failed_execution_is_not_executable(self) -> None:
         for execution in (
@@ -116,8 +107,6 @@ class TabularEvaluationServiceTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(execution=execution):
                 self.processor.execute.return_value = execution
                 result = await self.evaluate()
-                self.assertTrue(result.response_format.recipe_valid)
-                self.assertFalse(result.response_format.recipe_executable)
                 self.assertEqual(result.validation.status, EvaluationStatus.FAILED)
 
     async def test_execution_must_match_block_ids_even_when_sheet_names_match(self) -> None:
@@ -128,7 +117,8 @@ class TabularEvaluationServiceTests(unittest.IsolatedAsyncioTestCase):
         )
         self.execution.sheets[0].block_id = "another-block"
         result = await self.evaluate()
-        self.assertFalse(result.response_format.recipe_executable)
+        self.assertEqual(result.validation.status, EvaluationStatus.FAILED)
+        self.assertTrue(result.validation.errors)
 
 
 if __name__ == "__main__":

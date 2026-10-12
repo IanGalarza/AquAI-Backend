@@ -5,14 +5,14 @@ from unittest.mock import patch
 
 import httpx
 
-from aquai.application.dtos.tabular import (
+from aquai.application.contracts.tabular.structure import (
     FormulaSample,
-    PreparationRecipe,
     SampleRow,
     SheetContentEvidence,
     SheetSummary,
     StructuralSummary,
 )
+from aquai.application.contracts.tabular.recipe import PreparationRecipe
 from aquai.application.errors import TabularInputError
 from aquai.application.services.tabularRules import TabularRuleService
 from aquai.application.services.tabularEvaluation import TabularEvaluationService

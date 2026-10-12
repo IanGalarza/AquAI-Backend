@@ -1,23 +1,14 @@
 import json
-from dataclasses import dataclass
 
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import ValidationError as SchemaValidationError
 from pydantic import ValidationError
 
-from aquai.application.dtos.tabular import PreparationRecipe, ResponseFormatMetrics
-
-
-@dataclass
-class RecipeParseResult:
-    recipe: PreparationRecipe
-    response_format: ResponseFormatMetrics
+from aquai.application.contracts.tabular.recipe import PreparationRecipe
 
 
 class RecipeParseError(ValueError):
-    def __init__(self, message: str, response_format: ResponseFormatMetrics) -> None:
-        super().__init__(message)
-        self.response_format = response_format
+    pass
 
 
 class _InvalidJSON(ValueError):
@@ -37,19 +28,17 @@ def _reject_constant(value: str) -> None:
     raise _InvalidJSON(f"La respuesta JSON contiene el valor no permitido '{value}'.")
 
 
-def _decode_document(content: str, metrics: ResponseFormatMetrics) -> object:
+def _decode_document(content: str) -> object:
     decoder = json.JSONDecoder(object_pairs_hook=_unique_object, parse_constant=_reject_constant)
     try:
         document = decoder.decode(content)
     except json.JSONDecodeError:
         pass
     except _InvalidJSON as exc:
-        raise RecipeParseError(str(exc), metrics) from exc
+        raise RecipeParseError(str(exc)) from exc
     except RecursionError as exc:
-        raise RecipeParseError("La respuesta JSON tiene demasiados niveles de anidación.", metrics) from exc
+        raise RecipeParseError("La respuesta JSON tiene demasiados niveles de anidación.") from exc
     else:
-        metrics.json_valid = True
-        metrics.strict_json = True
         return document
 
     for index, character in enumerate(content):
@@ -60,15 +49,13 @@ def _decode_document(content: str, metrics: ResponseFormatMetrics) -> object:
         except json.JSONDecodeError:
             continue
         except _InvalidJSON as exc:
-            raise RecipeParseError(str(exc), metrics) from exc
+            raise RecipeParseError(str(exc)) from exc
         except RecursionError as exc:
-            raise RecipeParseError("La respuesta JSON tiene demasiados niveles de anidación.", metrics) from exc
+            raise RecipeParseError("La respuesta JSON tiene demasiados niveles de anidación.") from exc
         if not isinstance(document, dict) or not {"status", "sheets"}.intersection(document):
             continue
-        metrics.json_valid = True
-        metrics.cleanup_required = True
         return document
-    raise RecipeParseError("La respuesta del modelo no contiene una receta JSON válida.", metrics)
+    raise RecipeParseError("La respuesta del modelo no contiene una receta JSON válida.")
 
 
 def _schema_error_detail(error: SchemaValidationError) -> str:
@@ -127,33 +114,23 @@ def _schema_error_details(error: SchemaValidationError) -> list[str]:
     return [_schema_error_detail(error)]
 
 
-def parse_preparation_recipe_with_metrics(content: str) -> RecipeParseResult:
-    metrics = ResponseFormatMetrics(recipe_executable=False)
-    document = _decode_document(content, metrics)
-    if isinstance(document, dict) and isinstance(document.get("status"), str):
-        metrics.proposed_status = document["status"]
+def parse_preparation_recipe(content: str) -> PreparationRecipe:
+    document = _decode_document(content)
     validator = Draft202012Validator(PreparationRecipe.model_json_schema())
     schema_errors = sorted(validator.iter_errors(document), key=lambda error: str(error.absolute_path))
-    metrics.schema_valid = not schema_errors
     if schema_errors:
         details = "; ".join(dict.fromkeys(
             detail for error in schema_errors for detail in _schema_error_details(error)
         ))
-        raise RecipeParseError(f"La receta no cumple el JSON Schema: {details}", metrics)
+        raise RecipeParseError(f"La receta no cumple el JSON Schema: {details}")
 
     try:
         recipe = PreparationRecipe.model_validate(document)
     except ValidationError as exc:
-        metrics.recipe_valid = False
         details = "; ".join(
             f"{'.'.join(str(part) for part in error['loc']) or 'receta'}: "
             f"{error.get('ctx', {}).get('error', 'no cumple el contrato estricto de Pydantic')}"
             for error in exc.errors(include_input=False, include_url=False)
         )
-        raise RecipeParseError(f"La receta no cumple el contrato Pydantic: {details}", metrics) from exc
-    metrics.recipe_valid = True
-    return RecipeParseResult(recipe=recipe, response_format=metrics)
-
-
-def parse_preparation_recipe(content: str) -> PreparationRecipe:
-    return parse_preparation_recipe_with_metrics(content).recipe
+        raise RecipeParseError(f"La receta no cumple el contrato Pydantic: {details}") from exc
+    return recipe

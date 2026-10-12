@@ -5,12 +5,20 @@ from copy import deepcopy
 from dataclasses import dataclass
 from uuid import UUID
 
-from aquai.application.dtos.tabular import TabularEvaluation
+from aquai.application.contracts.tabular.results import TabularEvaluation
 from aquai.application.errors import SourceConflictError
 from aquai.application.interfaces.sources import SourceCommands, SourceQueries
 from aquai.application.services.sourceReviews import SourceReviewService
 from aquai.application.services.tabularEvaluation import TabularEvaluationService
 from aquai.application.useCases.sources.constants import DATASET_STORAGE
+
+
+_FINAL_STAGES = {
+    "ready": "prepared",
+    "ready_with_warnings": "prepared",
+    "review_required": "awaiting_review",
+    "failed": "failed",
+}
 
 
 @dataclass
@@ -127,10 +135,10 @@ class ProcessSourceHandler:
         # Una corrección pendiente puede conservar el estado de validación failed.
         processing_status = "review_required" if reviews else validation_status
         state.workflow.pop("resume_stage", None)
-        if reviews:
-            state.workflow["stage"] = "awaiting_review"
-        else:
-            state.workflow["stage"] = "failed" if validation_status == "failed" else "prepared"
+        try:
+            state.workflow["stage"] = _FINAL_STAGES[processing_status]
+        except KeyError as exc:
+            raise SourceConflictError("Estado de procesamiento final desconocido.") from exc
         state.report.update(
             evaluation=result.model_dump(mode="json"),
             reviews=reviews,

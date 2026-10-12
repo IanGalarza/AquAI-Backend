@@ -4,11 +4,8 @@ from datetime import datetime
 
 import pandas as pd
 
-from aquai.application.dtos.tabularPolicies import (
-    AssociationDiagnostic,
-    DateColumnPolicy,
-    PreparationPolicies,
-)
+from aquai.application.contracts.tabular.results import AssociationDiagnostic
+from aquai.application.contracts.tabular.policies import DateColumnPolicy, PreparationPolicies
 from aquai.infrastructure.processing.tabular.dateConsistency import date_consistency_findings
 from aquai.infrastructure.processing.tabular.reader import CellMetadata, SheetData
 

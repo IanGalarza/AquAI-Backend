@@ -15,6 +15,7 @@ from openpyxl import Workbook
 from sqlalchemy import func, select
 from starlette.routing import Match
 
+from aquai.application.contracts.tabular.results import TabularEvaluation
 from aquai.application.services.tabularRules import TabularRuleService
 from aquai.application.services.tabularEvaluation import TabularEvaluationService
 from aquai.domain.models import Dataset, Source, SourceRecipe
@@ -350,6 +351,49 @@ class SourceEndpointTests(unittest.TestCase):
             "action": "correct_transformations", "values": {"transformations": []},
         })
         self.assertEqual(stale.status_code, 409, stale.text)
+
+    def test_historical_evaluation_keeps_recipe_rules_and_pending_review_resumption(self) -> None:
+        source_id, review = self.review_source()
+        before = self.detail(source_id)
+        saved = self.queries.get(source_id)
+        operational = deepcopy(saved["validation_report"]["evaluation"])
+        historical = dict(deepcopy(operational), metrics={
+            "inspection_duration_ms": 12.5, "llm_duration_ms": 200,
+            "execution_duration_ms": 5, "validation_duration_ms": 3, "total_duration_ms": 220.5,
+        }, response_format={
+            "proposed_status": "ready", "json_valid": True, "strict_json": True,
+            "cleanup_required": False, "schema_valid": True, "recipe_valid": True, "recipe_executable": True,
+        })
+        restored = TabularEvaluation.model_validate(json.loads(json.dumps(historical)))
+        self.assertEqual(restored.model_dump(mode="json"), operational)
+
+        def persist_historical(source):
+            report = deepcopy(source["validation_report"])
+            report["evaluation"] = historical
+            return {"validation_report": report}, {}
+
+        self.commands.mutate(source_id, persist_historical)
+        current = self.detail(source_id)
+        for field in ("stage", "revision", "reviews", "findings", "preview", "original_proposal", "effective_recipe", "rules"):
+            with self.subTest(field=field):
+                self.assertEqual(current[field], before[field])
+        decision = self.decide(source_id, review)
+        self.assertEqual(decision.status_code, 202, decision.text)
+        queued = self.detail(source_id)
+        self.assertEqual(queued["stage"], "queued_resume")
+        self.assertEqual(queued["revision"], before["revision"] + 1)
+        self.assertEqual(queued["original_proposal"], before["original_proposal"])
+        self.assertEqual(queued["effective_recipe"]["sheets"][0]["transformations"], [])
+        self.process()
+        resumed = self.detail(source_id)
+        self.assertEqual(resumed["stage"], "prepared")
+        self.assertEqual(resumed["validation_status"], "ready")
+        self.assertEqual(resumed["preview"][0]["rows"][0]["values"], ["Ana", "invalid"])
+        self.assertEqual(resumed["original_proposal"], before["original_proposal"])
+        self.assertEqual(resumed["rules"]["metadata"], before["rules"]["metadata"])
+        self.assertEqual(resumed["rules"]["prompt_rules"], before["rules"]["prompt_rules"])
+        self.assertEqual(len(resumed["decisions"]), 1)
+        self.assertEqual(len(self.requests), 1)
 
     def test_invalid_decision_actions_values_and_executable_operations_are_rejected(self) -> None:
         source_id, review = self.review_source()

@@ -9,7 +9,9 @@ from hashlib import sha256
 import json
 from uuid import UUID
 
-from aquai.application.dtos.tabular import TabularEvaluation
+from aquai.application.contracts.tabular.results import TabularEvaluation
+from aquai.application.dtos.requests.reviewSource import SourceDecisionRequest
+from aquai.application.dtos.responses.reviewSource import SourceDecisionResponse
 from aquai.application.errors import SourceConflictError, SourceDecisionError
 from aquai.application.interfaces.sources import SourceCommands
 from aquai.application.services.sourceReviews import SourceReviewService
@@ -28,20 +30,20 @@ class ReviewSourceHandler:
         self._notify = notify
 
     async def handle(
-        self, source_id: UUID, review_id: str, action: str, values: dict
-    ) -> dict:
+        self, source_id: UUID, review_id: str, decision: SourceDecisionRequest,
+    ) -> SourceDecisionResponse:
         update = partial(
             self._apply_decision,
             source_id=source_id,
             review_id=review_id,
-            action=action,
-            values=values,
-            decision_key=self._decision_key(action, values),
+            action=decision.action,
+            values=decision.values,
+            decision_key=self._decision_key(decision.action, decision.values),
         )
         response = await asyncio.to_thread(self._commands.mutate, source_id, update)
         if self._notify is not None:
             self._notify()
-        return response
+        return SourceDecisionResponse.model_validate(response)
 
     def _apply_decision(
         self,

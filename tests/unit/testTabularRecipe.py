@@ -4,12 +4,12 @@ import unittest
 from jsonschema import Draft202012Validator
 from pydantic import ValidationError
 
-from aquai.application.dtos.tabular import PreparationRecipe, SheetRecipe
+from aquai.application.contracts.tabular.recipe import PreparationRecipe, SheetRecipe
 from aquai.application.services.tabularRecipe import (
     RecipeParseError,
     parse_preparation_recipe,
-    parse_preparation_recipe_with_metrics,
 )
+from aquai.infrastructure.providers.llm.recipeSchema import build_recipe_schema
 
 
 def recipe_document() -> dict:
@@ -34,7 +34,7 @@ def recipe_document() -> dict:
 class TabularRecipeTests(unittest.TestCase):
     def assert_parse_failure(self, content: str) -> RecipeParseError:
         with self.assertRaises(RecipeParseError) as captured:
-            parse_preparation_recipe_with_metrics(content)
+            parse_preparation_recipe(content)
         return captured.exception
 
     def test_generated_schema_requires_structural_fields_and_forbids_extras(self) -> None:
@@ -45,8 +45,8 @@ class TabularRecipeTests(unittest.TestCase):
         for state_schema in schema["oneOf"]:
             self.assertEqual(set(state_schema["required"]), {"status", "sheets", "warnings", "requires_human_review"})
             self.assertFalse(state_schema["additionalProperties"])
-        for name in ("SheetRecipeHeader", "SheetRecipeUnknown", "SheetRecipeContent"):
-            sheet_schema = schema["$defs"][name]
+        role_branches = schema["$defs"]["SheetRecipe"]["oneOf"]
+        for sheet_schema in role_branches:
             self.assertEqual(set(sheet_schema["required"]), {
                 "sheet_name", "block_id", "role", "header_rows", "data_start_row",
                 "data_end_row", "data_start_column", "data_end_column", "transformations",
@@ -57,8 +57,8 @@ class TabularRecipeTests(unittest.TestCase):
             for field in ("data_start_row", "data_end_row", "data_start_column", "data_end_column"):
                 self.assertEqual(sheet_schema["properties"][field]["type"], "integer")
                 self.assertEqual(sheet_schema["properties"][field]["minimum"], 1)
-        self.assertEqual(schema["$defs"]["SheetRecipeHeader"]["properties"]["header_rows"]["maxItems"], 0)
-        self.assertEqual(schema["$defs"]["SheetRecipeUnknown"]["properties"]["transformations"]["maxItems"], 0)
+        self.assertEqual(role_branches[0]["properties"]["header_rows"]["maxItems"], 0)
+        self.assertEqual(role_branches[1]["properties"]["transformations"]["maxItems"], 0)
 
     def test_role_branches_agree_with_pydantic_for_every_permitted_role(self) -> None:
         schema = SheetRecipe.model_json_schema()
@@ -82,6 +82,7 @@ class TabularRecipeTests(unittest.TestCase):
     def test_state_branches_agree_with_pydantic_for_roles_flags_and_warnings(self) -> None:
         schema = PreparationRecipe.model_json_schema()
         validator = Draft202012Validator(schema)
+        provider_validator = Draft202012Validator(build_recipe_schema())
         for status in ("ready", "review_required", "failed"):
             for role in ("observations", "header", "unknown"):
                 for requires_review in (False, True):
@@ -96,6 +97,50 @@ class TabularRecipeTests(unittest.TestCase):
                             except ValidationError:
                                 valid_pydantic = False
                             self.assertEqual(validator.is_valid(document), valid_pydantic)
+                            self.assertEqual(provider_validator.is_valid(document), valid_pydantic)
+
+    def test_provider_schema_preserves_operations_limits_and_required_fields(self) -> None:
+        application_validator = Draft202012Validator(PreparationRecipe.model_json_schema())
+        provider_schema = build_recipe_schema()
+        provider_validator = Draft202012Validator(provider_schema)
+        transformations = provider_schema["$defs"]["SheetRecipeContent"]["properties"]["transformations"]["items"]
+        self.assertEqual(transformations["discriminator"]["propertyName"], "operation")
+        self.assertEqual(len(transformations["oneOf"]), 5)
+        operations = [
+            {"operation": "drop_empty_rows"}, {"operation": "drop_empty_columns"},
+            {"operation": "strip_strings", "columns": ["measure"]},
+            {"operation": "rename_columns", "mapping": {"measure": "value"}},
+            {"operation": "convert_type", "columns": ["value"], "target_type": "number"},
+        ]
+        valid = recipe_document()
+        valid["sheets"][0]["transformations"] = operations
+        documents = [(valid, True)]
+        for operation in (
+            {"operation": "run_python"}, {"operation": "rename_columns", "mapping": {}},
+            {"operation": "convert_type", "columns": [], "target_type": "number"},
+            {"operation": "convert_type", "columns": ["value"], "target_type": "object"},
+            {"operation": "drop_empty_rows", "extra": True},
+        ):
+            document = recipe_document()
+            document["sheets"][0]["transformations"] = [operation]
+            documents.append((document, False))
+        for field in ("data_start_row", "data_end_row", "data_start_column", "data_end_column"):
+            for change in (None, 0, True, "1"):
+                document = recipe_document()
+                document["sheets"][0][field] = change
+                documents.append((document, False))
+            document = recipe_document()
+            del document["sheets"][0][field]
+            documents.append((document, False))
+        for document, expected in documents:
+            with self.subTest(document=document):
+                self.assertEqual(application_validator.is_valid(document), expected)
+                self.assertEqual(provider_validator.is_valid(document), expected)
+                if expected:
+                    PreparationRecipe.model_validate(document)
+                else:
+                    with self.assertRaises(ValidationError):
+                        PreparationRecipe.model_validate(document)
 
     def test_header_self_reference_fails_schema_without_repairs(self) -> None:
         document = recipe_document()
@@ -106,9 +151,7 @@ class TabularRecipeTests(unittest.TestCase):
             **recipe_document()["sheets"][0], "header_rows": [], "data_start_row": 2, "data_end_row": 3,
         })
         error = self.assert_parse_failure(json.dumps(document))
-        self.assertFalse(error.response_format.schema_valid)
-        self.assertIsNone(error.response_format.recipe_valid)
-        self.assertFalse(error.response_format.recipe_executable)
+        self.assertIn("JSON Schema", str(error))
         self.assertIn("sheets.0.header_rows", str(error))
         self.assertNotIn("requires_human_review", str(error))
         self.assertNotIn("status:", str(error))
@@ -116,8 +159,8 @@ class TabularRecipeTests(unittest.TestCase):
     def test_nonblank_patterns_preserve_existing_string_semantics_and_legal_newlines(self) -> None:
         document = recipe_document()
         document["sheets"][0].update(sheet_name="first\nsecond", block_id="block\nname")
-        self.assertTrue(parse_preparation_recipe_with_metrics(json.dumps(document)).response_format.schema_valid)
-        properties = PreparationRecipe.model_json_schema()["$defs"]["SheetRecipeContent"]["properties"]
+        self.assertIsInstance(parse_preparation_recipe(json.dumps(document)), PreparationRecipe)
+        properties = PreparationRecipe.model_json_schema()["$defs"]["SheetRecipe"]["oneOf"][2]["properties"]
         for field in ("sheet_name", "block_id"):
             self.assertEqual(properties[field]["pattern"], r"\S")
 
@@ -127,9 +170,7 @@ class TabularRecipeTests(unittest.TestCase):
                 document = recipe_document()
                 del document[field]
                 error = self.assert_parse_failure(json.dumps(document))
-                self.assertTrue(error.response_format.json_valid)
-                self.assertFalse(error.response_format.schema_valid)
-                self.assertIsNone(error.response_format.recipe_valid)
+                self.assertIn("JSON Schema", str(error))
                 self.assertIn(field, str(error))
                 with self.assertRaises(ValidationError):
                     PreparationRecipe.model_validate(document)
@@ -138,7 +179,7 @@ class TabularRecipeTests(unittest.TestCase):
             with self.subTest(sheet_field=field):
                 document = recipe_document()
                 del document["sheets"][0][field]
-                self.assertFalse(self.assert_parse_failure(json.dumps(document)).response_format.schema_valid)
+                self.assertIn("JSON Schema", str(self.assert_parse_failure(json.dumps(document))))
                 with self.assertRaises(ValidationError):
                     PreparationRecipe.model_validate(document)
 
@@ -147,9 +188,7 @@ class TabularRecipeTests(unittest.TestCase):
         for field in ("block_id", "role", "data_end_row", "data_start_column", "data_end_column"):
             del document["sheets"][0][field]
         error = self.assert_parse_failure(json.dumps(document))
-        self.assertFalse(error.response_format.schema_valid)
-        self.assertIsNone(error.response_format.recipe_valid)
-        self.assertFalse(error.response_format.recipe_executable)
+        self.assertIn("JSON Schema", str(error))
         with self.assertRaises(ValidationError):
             PreparationRecipe.model_validate(document)
 
@@ -161,69 +200,50 @@ class TabularRecipeTests(unittest.TestCase):
                     document["sheets"][0][field] = value
                     with self.assertRaises(ValidationError):
                         PreparationRecipe.model_validate(document)
-                    metrics = self.assert_parse_failure(json.dumps(document)).response_format
-                    self.assertEqual(metrics.schema_valid, type(value) is float)
+                    error = self.assert_parse_failure(json.dumps(document))
+                    self.assertIn("Pydantic" if type(value) is float else "JSON Schema", str(error))
 
     def test_block_identifier_cannot_be_null_blank_or_whitespace(self) -> None:
         for value in (None, "", "  ", "\n\t"):
             with self.subTest(value=value):
                 document = recipe_document()
                 document["sheets"][0]["block_id"] = value
-                self.assertFalse(self.assert_parse_failure(json.dumps(document)).response_format.schema_valid)
+                self.assertIn("JSON Schema", str(self.assert_parse_failure(json.dumps(document))))
                 with self.assertRaises(ValidationError):
                     PreparationRecipe.model_validate(document)
 
     def test_header_and_transformation_lists_can_be_empty(self) -> None:
         document = recipe_document()
         document["sheets"][0]["header_rows"] = []
-        parsed = parse_preparation_recipe_with_metrics(json.dumps(document))
-        self.assertEqual(parsed.recipe.sheets[0].header_rows, [])
-        self.assertEqual(parsed.recipe.sheets[0].transformations, [])
+        parsed = parse_preparation_recipe(json.dumps(document))
+        self.assertEqual(parsed.sheets[0].header_rows, [])
+        self.assertEqual(parsed.sheets[0].transformations, [])
 
-    def test_direct_json_has_no_cleanup_and_compatibility_parser_returns_recipe(self) -> None:
+    def test_direct_json_returns_a_real_recipe(self) -> None:
         content = " \n" + json.dumps(recipe_document()) + "\n "
-        parsed = parse_preparation_recipe_with_metrics(content)
-        self.assertEqual(parsed.response_format.model_dump(), {
-            "proposed_status": "ready",
-            "json_valid": True,
-            "strict_json": True,
-            "cleanup_required": False,
-            "schema_valid": True,
-            "recipe_valid": True,
-            "recipe_executable": False,
-        })
-        self.assertEqual(parse_preparation_recipe(content), parsed.recipe)
+        parsed = parse_preparation_recipe(content)
+        self.assertIsInstance(parsed, PreparationRecipe)
+        self.assertEqual(parsed.model_dump(), recipe_document())
 
-    def test_markdown_and_prose_are_distinguished_from_direct_json(self) -> None:
+    def test_markdown_and_prose_can_contain_a_valid_recipe(self) -> None:
         for prefix, suffix in (("```json\n", "\n```"), ('Nota {"note":"datos"}. Receta: ', " Fin.")):
             with self.subTest(prefix=prefix):
-                parsed = parse_preparation_recipe_with_metrics(prefix + json.dumps(recipe_document()) + suffix)
-                self.assertTrue(parsed.response_format.json_valid)
-                self.assertTrue(parsed.response_format.cleanup_required)
-                self.assertFalse(parsed.response_format.strict_json)
-                self.assertTrue(parsed.response_format.schema_valid)
-                self.assertTrue(parsed.response_format.recipe_valid)
+                parsed = parse_preparation_recipe(prefix + json.dumps(recipe_document()) + suffix)
+                self.assertEqual(parsed.model_dump(), recipe_document())
 
-    def test_json_validity_and_schema_validity_are_separate(self) -> None:
+    def test_valid_json_without_recipe_fields_fails_the_schema(self) -> None:
         for content in ('{"explanation":"sin receta"}', '[{"status":"ready"}]', 'null', '"respuesta"'):
             with self.subTest(content=content):
-                metrics = self.assert_parse_failure(content).response_format
-                self.assertTrue(metrics.json_valid)
-                self.assertTrue(metrics.strict_json)
-                self.assertFalse(metrics.cleanup_required)
-                self.assertFalse(metrics.schema_valid)
-                self.assertIsNone(metrics.recipe_valid)
+                self.assertIn("JSON Schema", str(self.assert_parse_failure(content)))
 
-    def test_invalid_json_preserves_not_attempted_schema_and_contract_metrics(self) -> None:
+    def test_invalid_json_is_rejected_before_schema_or_model_validation(self) -> None:
         for content in ("No puedo decidir.", '{"status":', '{"status":"failed","status":"ready"}',
                         '{"status":NaN}', '{"status":Infinity}'):
             with self.subTest(content=content):
-                metrics = self.assert_parse_failure(content).response_format
-                self.assertFalse(metrics.json_valid)
-                self.assertFalse(metrics.strict_json)
-                self.assertIsNone(metrics.schema_valid)
-                self.assertIsNone(metrics.recipe_valid)
-                self.assertFalse(metrics.recipe_executable)
+                error = self.assert_parse_failure(content)
+                self.assertIn("JSON", str(error))
+                self.assertNotIn("JSON Schema", str(error))
+                self.assertNotIn("Pydantic", str(error))
 
     def test_unknown_operations_and_extra_fields_fail_schema(self) -> None:
         documents = []
@@ -238,10 +258,7 @@ class TabularRecipeTests(unittest.TestCase):
         documents.append(unknown_operation)
         for document in documents:
             with self.subTest(document=document):
-                metrics = self.assert_parse_failure(json.dumps(document)).response_format
-                self.assertTrue(metrics.json_valid)
-                self.assertFalse(metrics.schema_valid)
-                self.assertIsNone(metrics.recipe_valid)
+                self.assertIn("JSON Schema", str(self.assert_parse_failure(json.dumps(document))))
 
     def test_schema_success_does_not_imply_business_contract_success(self) -> None:
         documents = []
@@ -260,24 +277,21 @@ class TabularRecipeTests(unittest.TestCase):
         for document in documents:
             with self.subTest(document=document):
                 error = self.assert_parse_failure(json.dumps(document))
-                self.assertTrue(error.response_format.schema_valid)
-                self.assertFalse(error.response_format.recipe_valid)
-                self.assertEqual(error.response_format.proposed_status, document["status"])
                 self.assertIn("Pydantic", str(error))
 
-    def test_proposed_status_survives_schema_failure_without_valid_recipe(self) -> None:
-        metrics = self.assert_parse_failure('{"status":"ready"}').response_format
-        self.assertEqual(metrics.proposed_status, "ready")
-        self.assertFalse(metrics.schema_valid)
-        self.assertIsNone(metrics.recipe_valid)
+    def test_a_ready_flag_without_required_fields_is_rejected(self) -> None:
+        error = self.assert_parse_failure('{"status":"ready"}')
+        self.assertIn("JSON Schema", str(error))
+        self.assertIn("sheets", str(error))
 
-    def test_review_can_be_valid_without_executable_sheets(self) -> None:
+    def test_review_can_be_valid_without_sheets(self) -> None:
         document = recipe_document()
         document.update(status="review_required", sheets=[], requires_human_review=True,
                         warnings=["No se pudieron justificar los límites de la región."])
-        parsed = parse_preparation_recipe_with_metrics(json.dumps(document))
-        self.assertTrue(parsed.response_format.recipe_valid)
-        self.assertFalse(parsed.response_format.recipe_executable)
+        parsed = parse_preparation_recipe(json.dumps(document))
+        self.assertEqual(parsed.status, "review_required")
+        self.assertEqual(parsed.sheets, [])
+        self.assertTrue(parsed.requires_human_review)
 
     def test_recipe_warning_count_is_bounded_by_schema_and_pydantic(self) -> None:
         warning_schema = next(
@@ -289,11 +303,11 @@ class TabularRecipeTests(unittest.TestCase):
         document.update(status="review_required", requires_human_review=True)
         document["warnings"] = ["Advertencia de prueba."] * 20
         self.assertEqual(len(PreparationRecipe.model_validate(document).warnings), 20)
-        self.assertTrue(parse_preparation_recipe_with_metrics(json.dumps(document)).response_format.schema_valid)
+        self.assertIsInstance(parse_preparation_recipe(json.dumps(document)), PreparationRecipe)
         document["warnings"].append("Advertencia adicional.")
         with self.assertRaises(ValidationError):
             PreparationRecipe.model_validate(document)
-        self.assertFalse(self.assert_parse_failure(json.dumps(document)).response_format.schema_valid)
+        self.assertIn("JSON Schema", str(self.assert_parse_failure(json.dumps(document))))
 
     def test_recipe_warning_length_is_bounded_by_schema_and_pydantic(self) -> None:
         warning_schema = next(
@@ -305,11 +319,11 @@ class TabularRecipeTests(unittest.TestCase):
         document.update(status="review_required", requires_human_review=True)
         document["warnings"] = ["a" * 512] * 20
         self.assertEqual(len(PreparationRecipe.model_validate(document).warnings[0]), 512)
-        self.assertTrue(parse_preparation_recipe_with_metrics(json.dumps(document)).response_format.schema_valid)
+        self.assertIsInstance(parse_preparation_recipe(json.dumps(document)), PreparationRecipe)
         document["warnings"][0] += "a"
         with self.assertRaises(ValidationError):
             PreparationRecipe.model_validate(document)
-        self.assertFalse(self.assert_parse_failure(json.dumps(document)).response_format.schema_valid)
+        self.assertIn("JSON Schema", str(self.assert_parse_failure(json.dumps(document))))
 
     def test_explicit_blocks_can_share_a_sheet_and_header_without_overlapping_data(self) -> None:
         document = recipe_document()
@@ -321,18 +335,15 @@ class TabularRecipeTests(unittest.TestCase):
             "data_start_row": 2, "data_end_row": 4, "data_start_column": 3, "data_end_column": 4,
             "transformations": [],
         })
-        parsed = parse_preparation_recipe_with_metrics(json.dumps(document))
-        self.assertTrue(parsed.response_format.recipe_valid)
-        self.assertEqual([block.block_id for block in parsed.recipe.sheets], ["observations", "derived"])
+        parsed = parse_preparation_recipe(json.dumps(document))
+        self.assertEqual([block.block_id for block in parsed.sheets], ["observations", "derived"])
 
     def test_block_identifiers_must_be_unique_even_across_different_sheets(self) -> None:
         for sheet_name in ("data", "another-sheet"):
             with self.subTest(sheet_name=sheet_name):
                 document = recipe_document()
                 document["sheets"].append({**document["sheets"][0], "sheet_name": sheet_name})
-                metrics = self.assert_parse_failure(json.dumps(document)).response_format
-                self.assertTrue(metrics.schema_valid)
-                self.assertFalse(metrics.recipe_valid)
+                self.assertIn("Pydantic", str(self.assert_parse_failure(json.dumps(document))))
                 with self.assertRaises(ValidationError):
                     PreparationRecipe.model_validate(document)
 
@@ -362,18 +373,17 @@ class TabularRecipeTests(unittest.TestCase):
         documents.append({**failed_without_explanation, "sheets": []})
         for document in documents:
             with self.subTest(document=document):
-                metrics = self.assert_parse_failure(json.dumps(document)).response_format
-                self.assertFalse(metrics.schema_valid)
-                self.assertIsNone(metrics.recipe_valid)
+                self.assertIn("JSON Schema", str(self.assert_parse_failure(json.dumps(document))))
                 with self.assertRaises(ValidationError):
                     PreparationRecipe.model_validate(document)
 
-    def test_failed_recipe_retains_identified_impediment_and_is_not_executable(self) -> None:
+    def test_failed_recipe_retains_identified_impediment(self) -> None:
         document = recipe_document()
         document.update(status="failed", sheets=[], warnings=["No hay evidencia suficiente para una propuesta utilizable."])
-        parsed = parse_preparation_recipe_with_metrics(json.dumps(document))
-        self.assertTrue(parsed.response_format.recipe_valid)
-        self.assertFalse(parsed.response_format.recipe_executable)
+        parsed = parse_preparation_recipe(json.dumps(document))
+        self.assertEqual(parsed.status, "failed")
+        self.assertEqual(parsed.sheets, [])
+        self.assertEqual(parsed.warnings, document["warnings"])
 
     def test_header_block_cannot_name_another_header_or_copy_observations(self) -> None:
         document = recipe_document()
@@ -384,13 +394,12 @@ class TabularRecipeTests(unittest.TestCase):
             **document["sheets"][0], "block_id": "observations", "role": "observations", "header_rows": [],
         })
         error = self.assert_parse_failure(json.dumps(document))
-        self.assertFalse(error.response_format.schema_valid)
+        self.assertIn("JSON Schema", str(error))
         with self.assertRaises(ValidationError):
             PreparationRecipe.model_validate(document)
         document["sheets"][0]["header_rows"] = []
         error = self.assert_parse_failure(json.dumps(document))
-        self.assertTrue(error.response_format.schema_valid)
-        self.assertFalse(error.response_format.recipe_valid)
+        self.assertIn("Pydantic", str(error))
         self.assertIn("header-copy", str(error))
         self.assertIn("observations", str(error))
         self.assertIn("data", str(error))
@@ -409,8 +418,7 @@ class TabularRecipeTests(unittest.TestCase):
                     "data_end_column": 3, "transformations": [],
                 })
                 error = self.assert_parse_failure(json.dumps(document))
-                self.assertTrue(error.response_format.schema_valid)
-                self.assertFalse(error.response_format.recipe_valid)
+                self.assertIn("Pydantic", str(error))
                 self.assertIn("later", str(error))
                 self.assertIn("observations", str(error))
                 self.assertIn("filas [2]", str(error))
@@ -423,7 +431,7 @@ class TabularRecipeTests(unittest.TestCase):
             "data_start_row": 4, "data_end_row": 4, "data_start_column": 3, "data_end_column": 4,
             "transformations": [],
         })
-        self.assertTrue(parse_preparation_recipe_with_metrics(json.dumps(document)).response_format.recipe_valid)
+        self.assertEqual(len(parse_preparation_recipe(json.dumps(document)).sheets), 2)
 
     def test_explicit_header_content_and_shared_references_are_valid(self) -> None:
         document = recipe_document()
@@ -440,25 +448,23 @@ class TabularRecipeTests(unittest.TestCase):
                 "transformations": [],
             },
         ])
-        parsed = parse_preparation_recipe_with_metrics(json.dumps(document))
-        self.assertTrue(parsed.response_format.schema_valid)
-        self.assertTrue(parsed.response_format.recipe_valid)
+        parsed = parse_preparation_recipe(json.dumps(document))
+        self.assertEqual(len(parsed.sheets), 3)
 
     def test_unknown_block_is_valid_only_untouched_and_with_explained_review(self) -> None:
         document = recipe_document()
         document.update(status="review_required", requires_human_review=True,
                         warnings=["data!A2: el rol de la región no puede determinarse."])
         document["sheets"][0]["role"] = "unknown"
-        parsed = parse_preparation_recipe_with_metrics(json.dumps(document))
-        self.assertTrue(parsed.response_format.recipe_valid)
-        self.assertEqual(parsed.recipe.sheets[0].transformations, [])
+        parsed = parse_preparation_recipe(json.dumps(document))
+        self.assertEqual(parsed.sheets[0].transformations, [])
         transformed_unknown = json.loads(json.dumps(document))
         transformed_unknown["sheets"][0]["transformations"] = [{"operation": "strip_strings"}]
         ready_unknown = {**document, "status": "ready", "warnings": [], "requires_human_review": False}
         failed_unknown = {**document, "status": "failed"}
         for invalid in (transformed_unknown, ready_unknown, failed_unknown):
             with self.subTest(document=invalid):
-                self.assertFalse(self.assert_parse_failure(json.dumps(invalid)).response_format.schema_valid)
+                self.assertIn("JSON Schema", str(self.assert_parse_failure(json.dumps(invalid))))
                 with self.assertRaises(ValidationError):
                     PreparationRecipe.model_validate(invalid)
 
@@ -467,21 +473,19 @@ class TabularRecipeTests(unittest.TestCase):
         document["sheets"][0].update(block_id="first", data_end_row=4, data_end_column=2)
         document["sheets"].append({**document["sheets"][0], "block_id": "second", "data_start_row": 4})
         error = self.assert_parse_failure(json.dumps(document))
-        self.assertTrue(error.response_format.schema_valid)
-        self.assertFalse(error.response_format.recipe_valid)
+        self.assertIn("Pydantic", str(error))
         self.assertIn("solaparse", str(error))
 
     def test_reversed_column_range_is_rejected_by_the_business_contract(self) -> None:
         document = recipe_document()
         document["sheets"][0].update(data_start_column=3, data_end_column=2)
         error = self.assert_parse_failure(json.dumps(document))
-        self.assertTrue(error.response_format.schema_valid)
-        self.assertFalse(error.response_format.recipe_valid)
+        self.assertIn("Pydantic", str(error))
 
     def test_unknown_block_roles_fail_the_json_schema(self) -> None:
         document = recipe_document()
         document["sheets"][0]["role"] = "toxic"
-        self.assertFalse(self.assert_parse_failure(json.dumps(document)).response_format.schema_valid)
+        self.assertIn("JSON Schema", str(self.assert_parse_failure(json.dumps(document))))
 
 
 if __name__ == "__main__":

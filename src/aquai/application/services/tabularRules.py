@@ -6,23 +6,22 @@ import unicodedata
 
 from pydantic import JsonValue
 
-from aquai.application.dtos.tabular import (
+from aquai.application.contracts.tabular.recipe import (
     ConvertType,
     PreparationRecipe,
-    RecordIdentityClarification,
     RenameColumns,
     SheetRecipe,
-    SheetSummary,
-    StructuralSummary,
 )
+from aquai.application.contracts.tabular.structure import SheetSummary, StructuralSummary
 from aquai.application.errors import TabularInputError
-from aquai.application.dtos.tabularPolicies import (
+from aquai.application.contracts.tabular.policies import (
     AssociationPolicy,
     ConfirmedCellPolicy,
     DateColumnPolicy,
     NumberColumnPolicy,
     ObservationRowPolicy,
     PreparationPolicies,
+    RecordIdentityClarification,
 )
 from aquai.application.interfaces.tabularRules import TabularRuleCatalog
 
@@ -186,15 +185,18 @@ class TabularRuleService:
                             "version": rule["version"], "origin": rule["origin"],
                         }
                         if name == "confirmed_cells":
-                            origin = self._catalog["sources"].get(rule["origin"], {})
-                            if not file_specific or origin.get("verification") != "user_confirmation":
-                                raise TabularInputError(
-                                    "Una corrección confirmada requiere una regla de archivo con hash y origen humano."
-                                )
-                            values["source_sha256"] = rule["sha256"]
+                            values["source_sha256"] = self._confirmed_source_hash(rule, file_specific)
                         collected[name].append(kinds[name].model_validate(values))
         policies = PreparationPolicies.model_validate(collected)
         return policies if policies.enabled else None
+
+    def _confirmed_source_hash(self, rule: dict[str, JsonValue], file_specific: bool) -> str:
+        origin = self._catalog["sources"].get(rule["origin"], {})
+        if not file_specific or origin.get("verification") != "user_confirmation":
+            raise TabularInputError(
+                "Una corrección confirmada requiere una regla de archivo con hash y origen humano."
+            )
+        return rule["sha256"]
 
     def _file_specific_rules(
         self, summary: StructuralSummary, selected: str | None, source_sha256: str | None,
@@ -224,48 +226,54 @@ class TabularRuleService:
                 continue
             findings.extend(self._validate_configured_sheet_role(source, block, composition))
             findings.extend(self._validate_preparation_policy_block(source, block, composition))
-            if profile == "cyanobacterial_alerts":
-                findings.extend(self._validate_alert_block(source, block))
-            elif profile == "biological_counts":
-                evidence = composition.metadata["evidence"]
-                verified = evidence["file_name_matches"] and not evidence["missing_expected_sheets"]
-                presence_header = any(
-                    "presencia" in _normalized(name) for name in source.initial_columns
-                )
-                if verified and _normalized(source.name) == "hoja1" and presence_header:
-                    if block.role == "observations":
-                        findings.append(self._block_finding(
-                            "rule_profile_role_conflict",
-                            "Hoja1 contiene un resumen de presencias verificado por su encabezado; "
-                            "clasificarlo como observaciones puede mezclar presencia y abundancia.",
-                            source,
-                            block,
-                        ))
+            match profile:
+                case "cyanobacterial_alerts":
+                    findings.extend(self._validate_alert_block(source, block))
+                case "biological_counts":
+                    findings.extend(self._validate_presence_summary(source, block, composition))
         return findings
 
-    def _validate_preparation_policy_block(self, source, block, composition):
+    def _validate_presence_summary(
+        self, source: SheetSummary, block: SheetRecipe, composition: RuleComposition,
+    ) -> list[dict[str, JsonValue]]:
+        evidence = composition.metadata["evidence"]
+        if not evidence["file_name_matches"] or evidence["missing_expected_sheets"]:
+            return []
+        if _normalized(source.name) != "hoja1" or block.role != "observations":
+            return []
+        if not any("presencia" in _normalized(name) for name in source.initial_columns):
+            return []
+        return [self._block_finding(
+            "rule_profile_role_conflict",
+            "Hoja1 contiene un resumen de presencias verificado por su encabezado; "
+            "clasificarlo como observaciones puede mezclar presencia y abundancia.",
+            source, block,
+        )]
+
+    def _validate_preparation_policy_block(
+        self, source: SheetSummary, block: SheetRecipe, composition: RuleComposition,
+    ) -> list[dict[str, JsonValue]]:
         policies = composition.preparation_policies
         if policies is None:
             return []
-        findings = []
+        findings: list[dict[str, JsonValue]] = []
         protected_number_names = {
             policy.expected_headers[column] for policy in policies.number_columns
             if policy.sheet_name == source.name for column in policy.column_indices
         }
         for transformation in block.transformations:
-            if isinstance(transformation, RenameColumns):
-                protected_number_names = {
-                    transformation.mapping.get(name, name) for name in protected_number_names
-                }
-            elif isinstance(transformation, ConvertType) and transformation.target_type == "datetime":
-                incompatible = protected_number_names.intersection(transformation.columns)
-                if incompatible:
-                    findings.append(self._block_finding(
-                        "rule_policy_type_conflict",
-                        "La política numérica no permite interpretar como fechas las columnas de abundancia: "
-                        + ", ".join(sorted(incompatible)) + ". Conservar sus valores y revisar la receta.",
-                        source, block,
-                    ))
+            match transformation:
+                case RenameColumns(mapping=mapping):
+                    protected_number_names = {mapping.get(name, name) for name in protected_number_names}
+                case ConvertType(target_type="datetime", columns=columns):
+                    incompatible = protected_number_names.intersection(columns)
+                    if incompatible:
+                        findings.append(self._block_finding(
+                            "rule_policy_type_conflict",
+                            "La política numérica no permite interpretar como fechas las columnas de abundancia: "
+                            + ", ".join(sorted(incompatible)) + ". Conservar sus valores y revisar la receta.",
+                            source, block,
+                        ))
         for policy in policies.observation_rows:
             if policy.sheet_name != source.name or block.role != "observations":
                 continue
@@ -323,36 +331,37 @@ class TabularRuleService:
                 protected[_normalized(name)] = name
         findings: list[dict[str, JsonValue]] = []
         for transformation in block.transformations:
-            if isinstance(transformation, RenameColumns):
-                changed = [old for old, new in transformation.mapping.items() if old != new]
-                if changed:
-                    findings.append(self._block_finding(
-                        "rule_profile_columns_changed",
-                        "El perfil cyanobacterial_alerts conserva los nombres de columnas "
-                        f"originales; la receta propone renombrar: {', '.join(changed)}.",
-                        source,
-                        block,
-                    ))
-                renamed = {
-                    _normalized(new): protected[_normalized(old)]
-                    for old, new in transformation.mapping.items() if _normalized(old) in protected
-                }
-                for old in transformation.mapping:
-                    protected.pop(_normalized(old), None)
-                protected.update(renamed)
-            elif isinstance(transformation, ConvertType):
-                for name in transformation.columns:
-                    original = protected.get(_normalized(name))
-                    if original is None:
-                        continue
-                    findings.append(self._block_finding(
-                        "rule_profile_categorical_conversion",
-                        f"El perfil cyanobacterial_alerts conserva {original} como código o "
-                        f"categoría original. Convertirlo a {transformation.target_type} requiere "
-                        "documentación del significado y revisión, aunque la conversión ejecute.",
-                        source,
-                        block,
-                    ))
+            match transformation:
+                case RenameColumns():
+                    changed = [old for old, new in transformation.mapping.items() if old != new]
+                    if changed:
+                        findings.append(self._block_finding(
+                            "rule_profile_columns_changed",
+                            "El perfil cyanobacterial_alerts conserva los nombres de columnas "
+                            f"originales; la receta propone renombrar: {', '.join(changed)}.",
+                            source,
+                            block,
+                        ))
+                    renamed = {
+                        _normalized(new): protected[_normalized(old)]
+                        for old, new in transformation.mapping.items() if _normalized(old) in protected
+                    }
+                    for old in transformation.mapping:
+                        protected.pop(_normalized(old), None)
+                    protected.update(renamed)
+                case ConvertType():
+                    for name in transformation.columns:
+                        original = protected.get(_normalized(name))
+                        if original is None:
+                            continue
+                        findings.append(self._block_finding(
+                            "rule_profile_categorical_conversion",
+                            f"El perfil cyanobacterial_alerts conserva {original} como código o "
+                            f"categoría original. Convertirlo a {transformation.target_type} requiere "
+                            "documentación del significado y revisión, aunque la conversión ejecute.",
+                            source,
+                            block,
+                        ))
         return findings
 
     @classmethod

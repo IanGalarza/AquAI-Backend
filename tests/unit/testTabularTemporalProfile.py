@@ -1,6 +1,6 @@
 import unittest
 
-from aquai.application.dtos.tabular import SheetSummary, StructuralSummary
+from aquai.application.contracts.tabular.structure import SheetSummary, StructuralSummary
 from aquai.application.services.tabularRules import TabularRuleService
 from aquai.infrastructure.providers.tabularRules import FileTabularRuleCatalog
 

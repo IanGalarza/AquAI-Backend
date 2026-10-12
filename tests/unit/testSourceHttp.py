@@ -9,6 +9,9 @@ from fastapi.testclient import TestClient
 from starlette.datastructures import UploadFile
 from starlette.routing import Match
 
+from aquai.application.dtos.requests.listSources import ListSourcesRequest
+from aquai.application.dtos.requests.reviewSource import SourceDecisionRequest
+from aquai.application.dtos.requests.uploadSource import UploadSourceRequest
 from aquai.application.errors import (
     FileTooLargeError,
     SourceConflictError,
@@ -79,7 +82,7 @@ class SourceHttpTests(unittest.TestCase):
         response = self.upload()
         self.assertEqual(response.status_code, 202, response.text)
         self.assertEqual(response.json(), dict(self.accepted, id=str(self.source_id)))
-        self.sources.upload.handle.assert_awaited_once_with("data.csv", b"name\nAna")
+        self.sources.upload.handle.assert_awaited_once_with(UploadSourceRequest("data.csv", b"name\nAna"))
 
     def test_listing_delegates_pagination_and_filters_and_excludes_file_bytes(self) -> None:
         self.sources.list.handle.return_value["items"][0] = dict(self.item, file_content=b"private")
@@ -89,9 +92,9 @@ class SourceHttpTests(unittest.TestCase):
             "processing_status": "review_required", "validation_status": "pending",
         })
         self.assertEqual(response.status_code, 200, response.text)
-        self.sources.list.handle.assert_awaited_once_with(
+        self.sources.list.handle.assert_awaited_once_with(ListSourcesRequest(
             page=2, page_size=10, name="data", processing_status="review_required", validation_status="pending",
-        )
+        ))
         result = response.json()
         self.assertEqual((result["page"], result["page_size"]), (2, 10))
         self.assertEqual(set(result["items"][0]), {
@@ -117,7 +120,9 @@ class SourceHttpTests(unittest.TestCase):
         response = self.decide()
         self.assertEqual(response.status_code, 202, response.text)
         self.sources.review.handle.assert_awaited_once_with(
-            self.source_id, "review-1", "correct_transformations", {"transformations": []},
+            self.source_id, "review-1", SourceDecisionRequest(
+                action="correct_transformations", values={"transformations": []},
+            ),
         )
         self.assertEqual(response.json(), dict(
             self.accepted, id=str(self.source_id), review_id="review-1", revision=1, duplicate=False,
@@ -171,7 +176,7 @@ class SourceHttpTests(unittest.TestCase):
         self.assertEqual(response.json(), {"detail": "El archivo supera el tamaño máximo permitido."})
         self.sources.upload.handle.assert_not_awaited()
         self.assertEqual(self.upload(b"12345").status_code, 202)
-        self.sources.upload.handle.assert_awaited_once_with("data.csv", b"12345")
+        self.sources.upload.handle.assert_awaited_once_with(UploadSourceRequest("data.csv", b"12345"))
 
     def test_multipart_files_close_after_success_rejection_and_handler_failure(self) -> None:
         closed = []
@@ -261,6 +266,15 @@ class SourceHttpTests(unittest.TestCase):
                     for media in documented.get("content", {}).values():
                         self.assertNotIn("example", media)
                         self.assertNotIn("examples", media)
+        for operation in (paths["/sources"]["get"], paths["/sources/{id}"]["get"]):
+            self.assertNotIn("requestBody", operation)
+        detail_model = schema["components"]["schemas"]["SourceDetailResponse"]
+        for field, model in (("blocks", "SourceBlock"), ("preview", "SourcePreview"),
+                             ("findings", "SourceFinding"), ("reviews", "SourceReview"),
+                             ("decisions", "SourceDecision"), ("technical_errors", "SourceTechnicalError")):
+            self.assertEqual(detail_model["properties"][field]["items"], {"$ref": f"#/components/schemas/{model}"})
+        review_model = schema["components"]["schemas"]["SourceReview"]
+        self.assertEqual(review_model["properties"]["options"]["items"], {"$ref": "#/components/schemas/SourceReviewOption"})
         upload = paths["/sources"]["post"]
         self.assertNotIn("parameters", upload)
         body = upload["requestBody"]["content"]["multipart/form-data"]["schema"]

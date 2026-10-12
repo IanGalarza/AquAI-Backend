@@ -7,14 +7,15 @@ from numbers import Number
 import pandas as pd
 from openpyxl.utils.cell import coordinate_to_tuple, get_column_letter
 
-from aquai.application.dtos.tabular import SheetRecipe, TabularFinding
-from aquai.application.dtos.tabularPolicies import (
+from aquai.application.contracts.tabular.recipe import SheetRecipe
+from aquai.application.contracts.tabular.results import TabularFinding
+from aquai.application.contracts.tabular.results import (
     AssociationDiagnostic,
     AuxiliaryFormulaEvidence,
     AuxiliaryRowTreatment,
     CellNormalization,
-    PreparationPolicies,
 )
+from aquai.application.contracts.tabular.policies import PreparationPolicies
 from aquai.infrastructure.processing.tabular.normalization import (
     parse_explicit_date,
     parse_mixed_decimal,

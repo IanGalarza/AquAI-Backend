@@ -7,26 +7,30 @@ from hashlib import sha256
 from pydantic import ValidationError
 from openpyxl import Workbook
 
-from aquai.application.dtos.tabular import (
+from aquai.application.contracts.tabular.results import (
     ExecutionResult,
-    FormulaSample,
     LLMResponse,
-    PreparationRecipe,
     SheetExecution,
+)
+from aquai.application.contracts.tabular.structure import (
+    FormulaSample,
     SheetSummary,
     StructuralRegion,
     StructuralSummary,
 )
-from aquai.application.dtos.tabularPolicies import (
+from aquai.application.contracts.tabular.recipe import PreparationRecipe
+from aquai.application.contracts.tabular.results import (
     AssociationDiagnostic,
-    AssociationPolicy,
     AuxiliaryFormulaEvidence,
     AuxiliaryRowTreatment,
+)
+from aquai.application.contracts.tabular.policies import (
+    AssociationPolicy,
     DateColumnPolicy,
     ObservationRowPolicy,
     PreparationPolicies,
-    SourceHeaderEvidence,
 )
+from aquai.application.contracts.tabular.structure import SourceHeaderEvidence
 from aquai.application.errors import TabularInputError
 from aquai.application.services.tabularRules import TabularRuleService
 from aquai.application.services.tabularValidation import TabularValidationService

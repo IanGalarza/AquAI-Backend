@@ -9,8 +9,8 @@ from zipfile import ZIP_DEFLATED, ZipFile
 
 from openpyxl import Workbook
 
-from aquai.application.dtos.tabular import PreparationRecipe
-from aquai.application.dtos.tabularPolicies import (
+from aquai.application.contracts.tabular.recipe import PreparationRecipe
+from aquai.application.contracts.tabular.policies import (
     AssociationPolicy,
     ConfirmedCellPolicy,
     DateColumnPolicy,

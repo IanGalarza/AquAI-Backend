@@ -3,7 +3,7 @@ import unittest
 from copy import deepcopy
 from hashlib import sha256
 
-from aquai.application.dtos.tabular import LLMResponse
+from aquai.application.contracts.tabular.results import LLMResponse
 from aquai.application.services.tabularRules import TabularRuleService
 from aquai.application.services.tabularEvaluation import TabularEvaluationService
 from aquai.domain.enums.tabular import EvaluationStatus
