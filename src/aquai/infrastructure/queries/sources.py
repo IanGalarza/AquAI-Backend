@@ -6,7 +6,7 @@ from copy import deepcopy
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, tuple_
 from sqlalchemy.orm import Session
 
 from aquai.application.errors import SourceNotFoundError
@@ -82,10 +82,12 @@ class SqlAlchemySourceQueries:
             items = deepcopy([dict(row) for row in rows])
         return {"items": items, "total": total, "page": page, "page_size": page_size}
 
-    def usable_dataset_ids(self, dataset_ids: list[UUID]) -> set[UUID]:
+    def usable_dataset_ids(self, dataset_ids: list[UUID], *,
+                           versions: dict[UUID, int] | None = None) -> set[UUID]:
         """PostgreSQL confirma disponibilidad aun cuando el índice tenga un payload antiguo."""
         if not dataset_ids:
             return set()
+        version_filter = [] if versions is None else [tuple_(Dataset.id, Dataset.version).in_(list(versions.items()))]
         with self._context.session() as session:
             return set(session.scalars(
                 select(Dataset.id).join(Source, Source.id == Dataset.source_id).where(
@@ -94,5 +96,6 @@ class SqlAlchemySourceQueries:
                     Source.processing_status.in_(
                         (ProcessingStatus.READY, ProcessingStatus.READY_WITH_WARNINGS)
                     ),
+                    *version_filter,
                 )
             ))

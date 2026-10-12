@@ -6,14 +6,14 @@ import math
 from copy import deepcopy
 from datetime import date, datetime
 from decimal import Decimal
-from typing import Any
+from typing import Any, Literal
 from weakref import WeakKeyDictionary
 
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from aquai.application.prompts.tabular import TABULAR_SEMANTIC_PROMPT
-from aquai.application.contracts.ingestion import PreparedTable, SemanticDescription
+from aquai.application.prompts.tabular import TABULAR_SEMANTIC_PROMPT, TABULAR_STRUCTURE_PROMPT
+from aquai.application.contracts.ingestion import PreparedTable, SemanticDescription, StructureSuggestion
 from aquai.application.errors import LLMProviderError
 from aquai.infrastructure.config.tabular import TabularSettings
 
@@ -43,6 +43,20 @@ class _Description(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     description: str = Field(min_length=1, max_length=4000)
     columns: list[_ColumnMeaning]
+
+
+class _StructureHint(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    region_id: str = Field(max_length=80)
+    orientation: Literal["rows", "columns"]
+    header_start: int = Field(ge=1)
+    header_depth: int = Field(ge=1, le=4)
+    data_start: int = Field(ge=2)
+
+
+class _StructureResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    suggestions: list[_StructureHint] = Field(max_length=3)
 
 
 class _OllamaClient:
@@ -79,6 +93,24 @@ class OllamaSemanticProvider:
         self._settings = settings
         self._client = _OllamaClient(settings, transport)
 
+    async def suggest_structure(self, candidates: list[dict]) -> list[StructureSuggestion]:
+        if not candidates or not self._settings.structure_assistance:
+            return []
+        if len(candidates) > 3:
+            raise LLMProviderError("La asistencia estructural admite como máximo tres regiones por archivo.")
+        region_ids = [candidate["region_id"] for candidate in candidates]
+        schema = _StructureResponse.model_json_schema()
+        schema["$defs"]["_StructureHint"]["properties"]["region_id"]["enum"] = region_ids
+        content = await self._chat(TABULAR_STRUCTURE_PROMPT, schema, {"regions": candidates})
+        try:
+            result = _StructureResponse.model_validate_json(content)
+        except ValidationError as exc:
+            raise LLMProviderError("La asistencia estructural no cumple el contrato JSON.") from exc
+        returned = [hint.region_id for hint in result.suggestions]
+        if len(returned) != len(set(returned)) or any(item not in region_ids for item in returned):
+            raise LLMProviderError("La asistencia alteró o repitió las regiones originales.")
+        return [StructureSuggestion(**hint.model_dump()) for hint in result.suggestions]
+
     async def describe(self, table: PreparedTable) -> SemanticDescription:
         names = [column["original_name"] for column in table.columns]
         if not names or len(names) > self._settings.max_columns:
@@ -92,29 +124,16 @@ class OllamaSemanticProvider:
             "source_locator": self._bounded_locator(table.source_locator),
             "warnings": [str(warning)[:500] for warning in table.warnings[:30]],
             "warnings_are_partial": len(table.warnings) > 30,
-            "columns": [{key: column[key] for key in ("original_name", "sql_type", "unit") if key in column}
+            "columns": [{key: column[key] for key in ("original_name", "sql_type", "unit", "header_missing",
+                                                     "derived_from", "representation", "excluded_count") if key in column}
                         for column in table.columns],
             "row_count": len(table.rows),
             "sample": sample,
             "sample_is_partial": len(table.rows) > len(sample),
         }
-        content = json.dumps(evidence, ensure_ascii=False, separators=(",", ":"))
-        if len(content) > 96_000:
-            raise LLMProviderError("Los metadatos exceden el límite de contexto de descripción.")
-        body = await self._client.post("/api/chat", {
-            "model": self._settings.default_model,
-            "stream": False,
-            "think": self._settings.llm_think,
-            "format": schema,
-            "options": {"temperature": 0, "num_ctx": self._settings.llm_num_ctx},
-            "messages": [{"role": "system", "content": TABULAR_SEMANTIC_PROMPT},
-                         {"role": "user", "content": content}],
-        }, self._settings.llm_timeout_seconds)
-        message = body.get("message")
-        if body.get("done") is not True or not isinstance(message, dict) or not isinstance(message.get("content"), str):
-            raise LLMProviderError("Ollama devolvió una descripción incompleta.")
+        content = await self._chat(TABULAR_SEMANTIC_PROMPT, schema, evidence)
         try:
-            result = _Description.model_validate_json(message["content"])
+            result = _Description.model_validate_json(content)
         except ValidationError as exc:
             raise LLMProviderError("Ollama devolvió una descripción que no cumple el contrato JSON.") from exc
         if [column.original_name for column in result.columns] != names:
@@ -125,6 +144,24 @@ class OllamaSemanticProvider:
         if not result.description.strip():
             raise LLMProviderError("Ollama devolvió una descripción vacía.")
         return SemanticDescription(description=result.description.strip(), columns=columns)
+
+    async def _chat(self, prompt: str, schema: dict, evidence: dict) -> str:
+        content = json.dumps(evidence, ensure_ascii=False, separators=(",", ":"))
+        if len(content) > 96_000:
+            raise LLMProviderError("Los metadatos exceden el límite de contexto de descripción.")
+        body = await self._client.post("/api/chat", {
+            "model": self._settings.default_model,
+            "stream": False,
+            "think": self._settings.llm_think,
+            "format": schema,
+            "options": {"temperature": 0, "num_ctx": self._settings.llm_num_ctx},
+            "messages": [{"role": "system", "content": prompt},
+                         {"role": "user", "content": content}],
+        }, self._settings.llm_timeout_seconds)
+        message = body.get("message")
+        if body.get("done") is not True or not isinstance(message, dict) or not isinstance(message.get("content"), str):
+            raise LLMProviderError("Ollama devolvió una descripción incompleta.")
+        return message["content"]
 
     @staticmethod
     def _bounded_locator(locator: dict[str, Any]) -> dict[str, Any]:

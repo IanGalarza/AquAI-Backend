@@ -14,7 +14,7 @@ from sqlalchemy.schema import CreateTable
 
 from aquai.application.contracts.ingestion import PreparedTable
 from aquai.domain.enums.sourceStatus import ProcessingStatus
-from aquai.domain.models import Source
+from aquai.domain.models import Conversation, Message, MessageSource, MessageStatus, Source
 from aquai.infrastructure.commands.sources import SqlAlchemySourceCommands
 from aquai.infrastructure.persistence.mapping import metadata
 from aquai.infrastructure.queries.sources import SqlAlchemySourceQueries
@@ -131,6 +131,31 @@ class SimplePersistenceTests(TestCase):
         self.commands.set_active(empty.id, True)
         self.assertEqual(self.queries.get(empty.id)["processing_status"], "failed")
         self.assertEqual(self.queries.get(empty.id)["datasets"], [])
+
+    def test_reprocess_rejects_lost_regions_and_sources_used_by_messages(self):
+        metadata.create_all(self.context.engine)
+        source = _upload()
+        self.commands.create_upload(source)
+        self.commands.save_prepared(source.id, [_prepared()], {})
+        dataset = self.queries.get(source.id)["datasets"][0]
+        with self.assertRaisesRegex(ValueError, "regiones existentes"):
+            self.commands.save_prepared(source.id, [], {}, replace_existing=True)
+        with self.assertRaisesRegex(ValueError, "reduciría registros"):
+            self.commands.save_prepared(source.id, [_prepared(1)], {}, replace_existing=True)
+        with self.context.session() as session:
+            conversation = Conversation(title="Consulta existente")
+            session.add_all([conversation, MessageStatus(id=1, name="done")])
+            session.flush()
+            message = Message(conversation_id=conversation.id, sequence_number=1, role="user", content="Datos", status_id=1)
+            session.add(message)
+            session.flush()
+            session.add(MessageSource(message_id=message.id, source_id=source.id,
+                                      dataset_id=dataset["id"], reference_order=1, details={}))
+            session.commit()
+        with self.assertRaisesRegex(ValueError, "referenciada"):
+            self.commands.save_prepared(source.id, [_prepared()], {}, replace_existing=True)
+        self.assertEqual(self.queries.get(source.id)["datasets"][0]["physical_table_name"], dataset["physical_table_name"])
+        self.assertEqual(len(self._rows(dataset)), 2)
 
     def test_failed_batch_rolls_back_catalog_and_physical_tables_and_schema_rejects_bad_state(self):
         source = _upload()

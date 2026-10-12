@@ -2,15 +2,19 @@
 import asyncio
 import unittest
 from uuid import UUID
-from sqlalchemy import MetaData, Table, select
+from datetime import date
+from io import BytesIO
+from openpyxl import Workbook
+from sqlalchemy import MetaData, Table, event, inspect, select
 
-from aquai.application.contracts.ingestion import SemanticDescription
+from aquai.application.contracts.ingestion import SemanticDescription, StructureSuggestion
 from aquai.application.dtos.requests.uploadSource import UploadSourceRequest
 from aquai.infrastructure.commands.sources import SqlAlchemySourceCommands
 from aquai.infrastructure.config.tabular import TabularSettings
 from aquai.infrastructure.processing.tabular.processor import SimpleTabularProcessor
 from aquai.infrastructure.providers.sources import build_source_runtime
 from aquai.infrastructure.queries.sources import SqlAlchemySourceQueries
+from aquai.infrastructure.persistence.mapping import metadata
 from tests.sourceDatabase import SourceTestDbContext
 
 
@@ -24,6 +28,11 @@ class DescriptionDouble:
         return SemanticDescription(
             description=table.description, columns=table.columns,
         )
+
+    async def suggest_structure(self, candidates):
+        if self.fail:
+            raise RuntimeError("offline")
+        return []
 
 
 class IndexDouble:
@@ -113,6 +122,80 @@ class SourceLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.commands.request_reindex(accepted.id)
         await self.runtime.worker.run_once()
         self.assertEqual(self.queries.get(accepted.id)["semantic_index_status"], "ready")
+
+    async def test_structural_assistance_is_bounded_and_fallback_keeps_normal_sql(self):
+        def content(value):
+            workbook = Workbook()
+            workbook.active.append(["codigo", "valor"])
+            workbook.active.append(["001", value])
+            matrix = workbook.create_sheet("matriz")
+            matrix.append(["variable", date(2024, 1, 1), date(2024, 1, 2)])
+            matrix.append(["sitio", "A", "B"])
+            matrix.append(["masa", 10, "nd"])
+            stream = BytesIO()
+            workbook.save(stream)
+            workbook.close()
+            return stream.getvalue()
+
+        class AssistedDescription(DescriptionDouble):
+            calls = 0
+
+            async def suggest_structure(self, candidates):
+                self.calls += 1
+                hint = candidates[0]
+                return [StructureSuggestion(hint["region_id"], "columns", 1, 1, 2)]
+
+        semantics = AssistedDescription()
+        self.runtime = self.build(semantics)
+        original = content(7)
+        accepted = await self.runtime.upload.handle(UploadSourceRequest(filename="multi.xlsx", content=original))
+        await self.runtime.worker.run_once()
+        state = self.queries.get(accepted.id, include_content=True)
+        self.assertEqual(semantics.calls, 1)
+        self.assertEqual(state["processing_report"]["structure_assistance"]["accepted"], 1)
+        self.assertEqual(sorted(dataset["row_count"] for dataset in state["datasets"]), [1, 2])
+        self.assertEqual(state["file_content"], original)
+        matrix = next(dataset for dataset in state["datasets"] if dataset["source_locator"].get("orientation") == "columns")
+        self.assertEqual([row["_aquai_source_column"] for row in self.physical_rows(matrix)], [2, 3])
+
+        self.runtime = self.build(DescriptionDouble(fail=True))
+        accepted = await self.runtime.upload.handle(UploadSourceRequest(filename="fallback.xlsx", content=content(8)))
+        await self.runtime.worker.run_once()
+        fallback = self.queries.get(accepted.id)
+        self.assertEqual([dataset["row_count"] for dataset in fallback["datasets"]], [1])
+        self.assertEqual(fallback["semantic_index_status"], "ready")
+        self.assertTrue(any("estructural no disponible" in warning for warning in fallback["processing_report"]["warnings"]))
+
+    async def test_reprocessing_keeps_ids_and_rolls_back_tables_on_failure(self):
+        metadata.create_all(self.context.engine)
+        accepted = await self.upload()
+        await self.runtime.worker.run_once()
+        before = self.queries.get(accepted.id)["datasets"][0]
+        await self.runtime.worker.reprocess(accepted.id)
+        after = self.queries.get(accepted.id)["datasets"][0]
+        self.assertEqual(after["id"], before["id"])
+        self.assertEqual(after["semantic_point_id"], before["semantic_point_id"])
+        self.assertEqual(after["version"], 2)
+        self.assertFalse(self.queries.usable_dataset_ids([after["id"]], versions={after["id"]: 1}))
+        self.assertEqual(self.queries.usable_dataset_ids([after["id"]], versions={after["id"]: 2}), {after["id"]})
+        self.assertEqual(len(self.physical_rows(after)), 3)
+        self.assertNotIn(before["physical_table_name"], inspect(self.context.engine).get_table_names())
+
+        def reject_drop(connection, cursor, statement, parameters, context, executemany):
+            if statement.lstrip().startswith("DROP TABLE") and "dataset_" in statement:
+                raise RuntimeError("Fallo después del reemplazo")
+
+        event.listen(self.context.engine, "after_cursor_execute", reject_drop)
+        try:
+            with self.assertRaisesRegex(RuntimeError, "reemplazo"):
+                await self.runtime.worker.reprocess(accepted.id)
+        finally:
+            event.remove(self.context.engine, "after_cursor_execute", reject_drop)
+        unchanged = self.queries.get(accepted.id)["datasets"][0]
+        self.assertEqual(unchanged["physical_table_name"], after["physical_table_name"])
+        self.assertEqual(unchanged["version"], 2)
+        self.assertEqual(len(self.physical_rows(unchanged)), 3)
+        self.assertEqual(sum(name.startswith("dataset_") for name in inspect(self.context.engine).get_table_names()), 1)
 
     async def test_activation_never_enables_unprepared_or_inactive_datasets(self):
         accepted = await self.upload()

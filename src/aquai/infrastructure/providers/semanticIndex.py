@@ -110,8 +110,13 @@ class QdrantSemanticIndex:
                 dataset_id = UUID(str(payload["dataset_id"]))
             except (KeyError, TypeError, ValueError):
                 continue
+            if type(payload.get("version")) is not int or payload["version"] < 1:
+                continue
             candidates.append((dataset_id, point, payload))
-        usable = await asyncio.to_thread(self._queries.usable_dataset_ids, [item[0] for item in candidates])
+        usable = await asyncio.to_thread(
+            self._queries.usable_dataset_ids, [item[0] for item in candidates],
+            versions={dataset_id: payload["version"] for dataset_id, _, payload in candidates},
+        )
         usable_ids = {str(dataset_id) for dataset_id in usable}
         result: list[dict[str, Any]] = []
         seen: set[UUID] = set()

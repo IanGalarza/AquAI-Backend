@@ -1,88 +1,117 @@
 # AquAI Backend
 
-Backend para cargar originales CSV/XLSX, preparar tablas conservadoramente y
-guardar todos sus registros en PostgreSQL. Qwen describe los conjuntos y Ollama
-genera embeddings con otro modelo; Qdrant guarda el índice semántico derivado.
+Backend de AquAI para cargar archivos CSV y XLSX, gestionar fuentes y almacenar
+sus conjuntos de datos. Ofrece una API HTTP con FastAPI y capacidades semánticas
+mediante modelos locales.
 
-La arquitectura mantiene Domain, Application, Infrastructure y Presentation.
-Las entidades de conversación siguen disponibles para una etapa posterior.
+## Arquitectura
 
-## Instalación local
+El proyecto sigue Clean Architecture y se organiza en cuatro capas:
 
-Requiere Python 3.11+, Docker con Compose y Ollama instalado en el host.
+| Capa | Responsabilidad |
+|---|---|
+| Domain | Entidades y estados del negocio. |
+| Application | Casos de uso, contratos, interfaces y DTOs. |
+| Infrastructure | Persistencia, migraciones e integración con servicios externos. |
+| Presentation | Controladores HTTP y manejo de solicitudes y errores de la API. |
+
+PostgreSQL almacena las fuentes y los datos. Ollama ejecuta los modelos de
+lenguaje y embeddings. Qdrant almacena el índice semántico.
+
+## Requisitos
+
+- Python 3.11 o superior.
+- Docker con Docker Compose.
+- Ollama instalado en el equipo.
+
+Los comandos siguientes están preparados para PowerShell y deben ejecutarse
+desde la raíz del repositorio.
+
+## Instalación
+
+### 1. Crear el entorno virtual e instalar las dependencias
 
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install -e .
-Copy-Item .env.example .env
 ```
 
-Configurar las credenciales de PostgreSQL en `.env`. `DATABASE_URL` debe
-corresponder al mismo servicio que las variables `POSTGRES_*`.
-Codificar los caracteres especiales del usuario/contraseña en la URL.
+### 2. Configurar las variables de entorno
+
+Crear `.env` a partir del ejemplo si todavía no existe:
+
+```powershell
+if (-not (Test-Path -LiteralPath .env)) {
+    Copy-Item .env.example .env
+}
+```
+
+Editar `.env` con las credenciales y conexiones del entorno. `DATABASE_URL` debe
+coincidir con las variables `POSTGRES_*`. Los caracteres especiales del usuario
+y la contraseña deben codificarse en la URL; por ejemplo, `@` como `%40`.
+
+El archivo también permite configurar Ollama, Qdrant y los límites de carga.
+
+### 3. Iniciar PostgreSQL y Qdrant
+
+Con Docker iniciado:
 
 ```powershell
 docker compose up -d postgres qdrant
-ollama pull qwen3.5:9b
-ollama pull nomic-embed-text
-ollama serve
 ```
 
-Si Ollama ya está ejecutándose, basta instalar los modelos.
-Desde otra terminal:
+### 4. Instalar los modelos de Ollama
+
+Ollama debe estar ejecutándose. Si no está iniciado, ejecutar `ollama serve`
+en otra terminal y dejarla abierta.
+
+Luego, instalar los modelos definidos en `.env`. Con la configuración predeterminada:
+
+```powershell
+ollama pull qwen3.5:9b
+ollama pull nomic-embed-text
+```
+
+### 5. Aplicar las migraciones
 
 ```powershell
 python -m alembic upgrade head
+```
+
+## Ejecución
+
+Con PostgreSQL, Qdrant y Ollama iniciados:
+
+```powershell
+.\.venv\Scripts\Activate.ps1
 python -m uvicorn aquai.main:app --reload
 ```
 
-La migración inicial consolidada corresponde a una base nueva o a la base local
-vacía reconstruida durante este refactor. No aplicar esta historia sobre una
-base anterior con registros: requiere una migración de datos específica.
+La API queda disponible en `http://localhost:8000`. Para consultar y probar los
+endpoints, abrir [Swagger UI](http://localhost:8000/docs), seleccionar una
+operación y usar **Try it out** y **Execute**.
 
-Documentación interactiva: [Swagger local](http://localhost:8000/docs).
+## Endpoints
 
-## API de fuentes
-
-| Método | Ruta | Función |
+| Método | Ruta | Descripción |
 |---|---|---|
-| POST | /sources | Multipart con un único campo file; guarda el original y responde 202. |
-| GET | /sources | Lista paginada; page, page_size, name y processing_status. |
-| GET | /sources/{id} | Estados, advertencias y datasets con columnas y conteos. |
-| PATCH | /sources/{id} | JSON con isActive booleano; cambia la activación. |
+| POST | `/sources` | Carga un CSV o XLSX mediante `multipart/form-data`, con el campo `file`. Responde con HTTP 202 y el identificador de la fuente. |
+| GET | `/sources` | Lista las fuentes con paginación y filtros. |
+| GET | `/sources/{id}` | Consulta el estado de una fuente y sus datasets, columnas y conteos. |
+| PATCH | `/sources/{id}` | Activa o desactiva una fuente. |
 
-SHA-256 identifica originales binariamente iguales: una carga repetida devuelve
-el mismo ID y `duplicate=true`. El detalle no incluye binarios ni filas completas.
-`queryable` exige un Dataset confirmado y una Source y Dataset activos; activar
-una carga fallida no la hace consultable.
+`GET /sources` acepta los parámetros opcionales `page` (predeterminado: 1),
+`page_size` (predeterminado: 20; máximo: 100), `name` y `processing_status`.
+El parámetro `{id}` de las rutas de detalle y activación es un UUID.
 
-La cola vive en PostgreSQL. El worker confirma SQL antes de llamar a Qwen.
-Un error semántico conserva las tablas y queda visible en el reporte.
-Un error de embeddings/Qdrant conserva SQL y marca el índice como fallido.
+Para activar una fuente, enviar este cuerpo JSON a `PATCH /sources/{id}`:
 
-## Reindexación y pruebas
-
-Reindexar desde las descripciones guardadas, sin volver a leer el original:
-
-```powershell
-python -m aquai.infrastructure.workers.reindexSources SOURCE_UUID
+```json
+{
+  "isActive": true
+}
 ```
 
-El backend debe estar iniciado para que el worker complete esa solicitud.
-Si se cambia de modelo de embeddings, configurar otra colección y reindexar.
-
-```powershell
-python -m unittest discover -s tests -v
-python -m alembic check
-git diff --check
-```
-
-La suite es offline: archivos sintéticos, SQLite, HTTP simulado y Qdrant en memoria.
-
-Los límites y URLs están centralizados en `TabularSettings` y `.env.example`.
-CSV conserva códigos, marcadores y valores ambiguos como texto. XLSX conserva
-fórmulas sin calcularlas y publica sólo regiones con evidencia tabular suficiente.
-
-Ver [overview técnico](docs/ingestionOverview.md) e
-[informe del refactor](simpleIngestionNotes.md).
+Usar `false` para desactivarla. Los esquemas de las solicitudes y respuestas
+están disponibles en Swagger UI.

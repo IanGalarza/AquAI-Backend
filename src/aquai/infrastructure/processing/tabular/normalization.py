@@ -9,7 +9,7 @@ from decimal import Decimal, InvalidOperation
 from aquai.infrastructure.processing.tabular.reader import LiteralText, is_empty
 
 
-RESERVED_COLUMNS = {"_aquai_row", "_aquai_source_row"}
+RESERVED_COLUMNS = {"_aquai_row", "_aquai_source_row", "_aquai_source_column"}
 INTEGER = re.compile(r"[+-]?(?:0|[1-9]\d*)\Z")
 NUMBER = re.compile(r"[+-]?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?\Z")
 ISO_DATE = re.compile(r"\d{4}-\d{2}-\d{2}\Z")
@@ -22,7 +22,7 @@ def column_names(originals: list[str]) -> list[str]:
     for index, original in enumerate(originals, 1):
         ascii_name = unicodedata.normalize("NFKD", original).encode("ascii", "ignore").decode()
         base = re.sub(r"[^a-z0-9_]+", "_", ascii_name.lower()).rstrip("_") or f"column_{index}"
-        if base[0].isdigit() or base in RESERVED_COLUMNS:
+        if base[0].isdigit() or base.startswith("_aquai_"):
             base = "column_" + base.lstrip("_")
         base = base[:63]
         name, count = base, 2
@@ -115,3 +115,21 @@ def infer_column(name: str, values: list[object]) -> tuple[str, list[object], st
                     or (isinstance(value, str) and re.match(r"^[+-]?\d", value)) for value in present)
     warning = f"La columna '{name}' permanece TEXT porque contiene valores mixtos o ambiguos." if uncertain else None
     return "TEXT", [text_value(value) for value in values], warning
+
+
+def numeric_projection(name: str, values: list[object]) -> tuple[list[Decimal | None], int] | None:
+    """Deriva números inequívocos sin reemplazar el texto ni interpretar marcadores."""
+    if re.search(r"(?:id|code|c[oó]digo|identificador|fecha|date|sitio|site|muestra)", name, re.IGNORECASE):
+        return None
+    if not header_unit(name) and not re.search(r"\b(?:abundancia|cantidad|recuento|valor|medida|concentraci[oó]n|value|amount|count|measurement)\b", name, re.IGNORECASE):
+        return None
+    present = [value for value in values if not is_empty(value)]
+    numeric = [_number(value) for value in present]
+    count = sum(value is not None for value in numeric)
+    if count < 2 or count == len(present) or count * 4 < len(present) * 3:
+        return None
+    markers = [value for value, number in zip(present, numeric) if number is None]
+    if any(not isinstance(value, str) or not re.fullmatch(r"[a-zA-Z .<>?-]{1,16}", value.strip())
+           for value in markers):
+        return None
+    return [None if is_empty(value) else _number(value) for value in values], len(present) - count

@@ -22,7 +22,7 @@ from sqlalchemy.orm import Session
 from aquai.application.contracts.ingestion import PreparedTable
 from aquai.application.errors import SourceNotFoundError
 from aquai.domain.enums.sourceStatus import ProcessingStatus, SemanticIndexStatus
-from aquai.domain.models import Dataset, Source
+from aquai.domain.models import Dataset, MessageSource, Source
 from aquai.infrastructure.persistence.dbContext import DbContext
 
 
@@ -77,7 +77,8 @@ def _validate_table(table: PreparedTable) -> None:
             raise ValueError("Una columna no numérica no puede habilitar cálculos numéricos.")
     if not table.rows:
         raise ValueError("Una tabla consultable debe contener registros.")
-    expected = set(names) | _PROVENANCE_COLUMNS
+    transposed = table.source_locator.get("orientation") == "columns"
+    expected = set(names) | _PROVENANCE_COLUMNS | ({"_aquai_source_column"} if transposed else set())
     for position, row in enumerate(table.rows, 1):
         if set(row) != expected:
             raise ValueError("Los registros no corresponden a las columnas declaradas.")
@@ -85,17 +86,25 @@ def _validate_table(table: PreparedTable) -> None:
             raise ValueError("El orden interno de registros debe ser consecutivo.")
         if type(row["_aquai_source_row"]) is not int or row["_aquai_source_row"] < 1:
             raise ValueError("La fila original debe tener procedencia válida.")
+        if transposed and (type(row["_aquai_source_column"]) is not int or row["_aquai_source_column"] < 1):
+            raise ValueError("La columna original debe tener procedencia válida.")
 
 
-def _physical_table(name: str, columns: list[dict[str, Any]]) -> Table:
+def _physical_table(name: str, columns: list[dict[str, Any]], *, transposed: bool = False) -> Table:
     return Table(
         name, MetaData(),
         Column("_aquai_row", BigInteger, primary_key=True, autoincrement=False),
         Column("_aquai_source_row", BigInteger, nullable=False),
+        *([Column("_aquai_source_column", BigInteger, nullable=False)] if transposed else []),
         *(Column(column["sql_name"], _SQL_TYPES[column["sql_type"]](), quote=True)
           for column in columns),
         quote=True,
     )
+
+
+def _region_key(locator: dict) -> str:
+    stable = {key: locator.get(key) for key in ("file_type", "sheet", "range")} if "range" in locator else locator
+    return json.dumps(stable, sort_keys=True)
 
 
 class SqlAlchemySourceCommands:
@@ -214,6 +223,7 @@ class SqlAlchemySourceCommands:
 
     def save_prepared(
         self, source_id: UUID, tables: list[PreparedTable], report: dict[str, Any],
+        *, replace_existing: bool = False,
     ) -> None:
         locators: set[str] = set()
         for table in tables:
@@ -228,10 +238,31 @@ class SqlAlchemySourceCommands:
         created_tables: list[Table] = []
         try:
             with self._write_session() as session:
+                if replace_existing and self._context.engine.dialect.name == "sqlite":
+                    # SQLite difiere BEGIN: iniciarlo explícitamente incluye también el DDL.
+                    session.connection().exec_driver_sql("BEGIN IMMEDIATE")
                 source = self._source(session, source_id)
-                if session.scalar(select(Dataset.id).where(Dataset.source_id == source_id).limit(1)):
+                existing = session.scalars(select(Dataset).where(Dataset.source_id == source_id).with_for_update()).all()
+                if existing and not replace_existing:
                     return
+                previous = {_region_key(dataset.source_locator): dataset for dataset in existing}
+                new_keys = {_region_key(table.source_locator) for table in tables}
+                if replace_existing:
+                    if source.processing_status == ProcessingStatus.PROCESSING:
+                        raise ValueError("La fuente está siendo procesada.")
+                    if session.scalar(select(MessageSource.id).where(MessageSource.source_id == source_id).limit(1)):
+                        raise ValueError("La fuente está referenciada por mensajes; se conserva su versión actual.")
+                    if not set(previous).issubset(new_keys) or len(new_keys) != len(tables):
+                        raise ValueError("El reprocesamiento perdería o combinaría regiones existentes; se conserva la versión actual.")
+                    for prepared in tables:
+                        prior = previous.get(_region_key(prepared.source_locator))
+                        if prior is not None and len(prepared.rows) < prior.row_count and (
+                            prior.source_locator.get("orientation", "rows") == prepared.source_locator.get("orientation", "rows")
+                        ):
+                            raise ValueError("El reprocesamiento reduciría registros existentes; se conserva la versión actual.")
                 final_report = deepcopy(report)
+                if replace_existing:
+                    final_report["reprocessed"] = True
                 warnings = _warnings(
                     final_report.get("warnings", []),
                     *(table.warnings for table in tables),
@@ -240,9 +271,11 @@ class SqlAlchemySourceCommands:
                 final_report["dataset_count"] = len(tables)
                 final_report["row_count"] = sum(len(table.rows) for table in tables)
                 for prepared in tables:
-                    dataset_id = uuid4()
-                    physical_name = f"dataset_{dataset_id.hex}"
-                    table = _physical_table(physical_name, prepared.columns)
+                    dataset = previous.get(_region_key(prepared.source_locator)) if replace_existing else None
+                    dataset_id = dataset.id if dataset is not None else uuid4()
+                    physical_name = f"dataset_{uuid4().hex if dataset is not None else dataset_id.hex}"
+                    table = _physical_table(physical_name, prepared.columns,
+                                            transposed=prepared.source_locator.get("orientation") == "columns")
                     table.create(session.connection())
                     created_tables.append(table)
                     for offset in range(0, len(prepared.rows), 1000):
@@ -250,13 +283,22 @@ class SqlAlchemySourceCommands:
                     count = session.scalar(select(func.count()).select_from(table))
                     if count != len(prepared.rows):
                         raise RuntimeError("No se confirmó la cantidad completa de registros.")
-                    session.add(Dataset(
-                        id=dataset_id, source_id=source_id, name=prepared.name,
-                        description=prepared.description, source_locator=deepcopy(prepared.source_locator),
-                        physical_table_name=physical_name, row_count=count,
-                        columns_metadata=deepcopy(prepared.columns), queryable=True,
-                        quality_warnings=_warnings(prepared.warnings), semantic_point_id=dataset_id,
-                    ))
+                    if dataset is None:
+                        dataset = Dataset(id=dataset_id, source_id=source_id, name=prepared.name,
+                                          source_locator={}, physical_table_name=physical_name, semantic_point_id=dataset_id)
+                        session.add(dataset)
+                    else:
+                        if not re.fullmatch(r"dataset_[0-9a-f]{32}", dataset.physical_table_name):
+                            raise ValueError("La tabla anterior no corresponde a un dataset administrado.")
+                        old_table = Table(dataset.physical_table_name, MetaData(), autoload_with=session.connection())
+                        old_table.drop(session.connection())
+                        dataset.version += 1
+                        dataset.updated_at = _now()
+                    dataset.name, dataset.description = prepared.name, prepared.description
+                    dataset.source_locator = deepcopy(prepared.source_locator)
+                    dataset.physical_table_name, dataset.row_count = physical_name, count
+                    dataset.columns_metadata, dataset.queryable = deepcopy(prepared.columns), True
+                    dataset.quality_warnings, dataset.semantic_description = _warnings(prepared.warnings), None
                 source.processing_report = final_report
                 source.processing_status = (
                     ProcessingStatus.READY_WITH_WARNINGS if warnings else ProcessingStatus.READY

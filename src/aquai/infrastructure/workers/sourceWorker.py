@@ -41,6 +41,12 @@ class SourceWorker:
     def wake(self) -> None:
         self._wake.set()
 
+    async def reprocess(self, source_id: UUID) -> None:
+        async with self._worker_lock() as acquired:
+            if not acquired:
+                raise RuntimeError("Otro worker está procesando; intentar nuevamente cuando termine.")
+            await self._processor.handle(source_id, reprocess=True)
+
     async def run(self) -> None:
         while not self._stopping:
             try:

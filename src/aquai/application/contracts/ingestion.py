@@ -1,7 +1,7 @@
 """Tablas preparadas y metadatos; nunca contienen instrucciones ejecutables."""
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
 
 @dataclass
@@ -18,6 +18,16 @@ class PreparedTable:
 class PreparationResult:
     tables: list[PreparedTable] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    structure_candidates: list[dict[str, Any]] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class StructureSuggestion:
+    region_id: str
+    orientation: Literal["rows", "columns"]
+    header_start: int
+    header_depth: int
+    data_start: int
 
 
 @dataclass

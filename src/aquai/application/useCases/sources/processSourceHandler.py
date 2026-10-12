@@ -1,4 +1,4 @@
-"""Prepara y confirma SQL antes de cualquier dependencia semántica externa."""
+"""Verifica la estructura y confirma SQL antes de describir e indexar datasets."""
 import asyncio
 from uuid import UUID
 from aquai.application.errors import SemanticIndexError
@@ -18,14 +18,29 @@ class ProcessSourceHandler:
         self._semantics = semantics
         self._index = index
 
-    async def handle(self, source_id: UUID) -> None:
+    async def handle(self, source_id: UUID, *, reprocess: bool = False) -> None:
         source = await asyncio.to_thread(self._queries.get, source_id, include_content=True)
-        if source["datasets"]:
+        if source["datasets"] and not reprocess:
             await self.reindex(source_id)
             return
         prepared = await asyncio.to_thread(
             self._processor.prepare, source["original_filename"], source["file_content"],
         )
+        structure_report = {"attempted": False, "suggestions": 0, "accepted": 0}
+        if prepared.structure_candidates:
+            structure_report["attempted"] = True
+            try:
+                suggestions = await self._semantics.suggest_structure(prepared.structure_candidates)
+                structure_report["suggestions"] = len(suggestions)
+                if suggestions:
+                    prepared = await asyncio.to_thread(
+                        self._processor.prepare, source["original_filename"], source["file_content"], suggestions,
+                    )
+                structure_report["accepted"] = sum("structure_assistance" in table.source_locator for table in prepared.tables)
+                if structure_report["accepted"] < len(prepared.structure_candidates):
+                    prepared.warnings.append("Persisten regiones cuya estructura no pudo verificarse; se conservan en el original.")
+            except Exception as error:
+                prepared.warnings.append(f"Asistencia estructural no disponible ({type(error).__name__}); se conserva la preparación determinística.")
         warnings = list(dict.fromkeys(
             prepared.warnings + [warning for table in prepared.tables for warning in table.warnings]
         ))
@@ -37,8 +52,12 @@ class ProcessSourceHandler:
             "dataset_count": len(prepared.tables),
             "row_count": sum(len(table.rows) for table in prepared.tables),
             "steps": ["original_saved", "tables_prepared", "sql_persisted"],
+            "structure_assistance": structure_report,
         }
-        await complete_write(self._commands.save_prepared, source_id, prepared.tables, report)
+        if reprocess:
+            await complete_write(self._commands.save_prepared, source_id, prepared.tables, report, replace_existing=True)
+        else:
+            await complete_write(self._commands.save_prepared, source_id, prepared.tables, report)
         if not prepared.tables:
             return
 

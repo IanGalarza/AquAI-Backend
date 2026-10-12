@@ -22,7 +22,8 @@ class TabularSettings(BaseSettings):
     max_expanded_bytes: int = Field(default=100 * 1024 * 1024, gt=0)
     sample_rows: int = Field(default=12, gt=0, le=100)
     max_datasets: int = Field(default=100, gt=0, le=1000)
-    max_columns: int = Field(default=256, gt=0, le=2048)
+    max_columns: int = Field(default=1024, gt=0, le=1500)
+    structure_assistance: bool = True
     embedding_model: str = Field(default="nomic-embed-text", min_length=1, max_length=200)
     embedding_timeout_seconds: float = Field(default=120, gt=0, allow_inf_nan=False)
     qdrant_url: str = "http://localhost:6333"

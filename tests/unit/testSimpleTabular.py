@@ -10,6 +10,7 @@ from openpyxl import Workbook
 from openpyxl.worksheet.table import Table
 
 from aquai.application.errors import FileTooLargeError, TabularInputError
+from aquai.application.contracts.ingestion import StructureSuggestion
 from aquai.infrastructure.config.tabular import TabularSettings
 from aquai.infrastructure.processing.tabular import SimpleTabularProcessor
 
@@ -75,6 +76,8 @@ class SimpleTabularTests(unittest.TestCase):
         unit_sheet.append(["lugar", "medida", "caudal", None])
         unit_sheet.append([None, "mg L-1", "L/s", "categoria"])
         unit_sheet.append(["A", 2, 3, "X"])
+        workbook.create_sheet("vacia")
+        workbook.create_sheet("documentacion").append(["Notas del experimento"])
         result = self.processor.prepare("sample.xlsx", workbook_bytes(workbook))
         self.assertEqual(len(result.tables), 4)
         self.assertEqual([len(table.rows) for table in result.tables], [2, 1, 1, 1])
@@ -85,6 +88,78 @@ class SimpleTabularTests(unittest.TestCase):
         self.assertEqual(result.tables[3].source_locator["header_rows"], [1, 2])
         self.assertEqual(result.tables[3].columns[1]["unit"], "mg L-1")
         self.assertEqual(result.tables[3].columns[3]["original_name"], "categoria")
+        self.assertTrue(any("vacía" in warning for warning in result.warnings))
+
+    def test_partial_headers_wide_tables_and_lateral_tables_keep_records(self) -> None:
+        workbook = Workbook()
+        wide = workbook.active
+        wide.append(["id", None] + [f"Variable {index}" for index in range(2, 300)])
+        wide.append(["001", "nd"] + list(range(2, 300)))
+        wide.append(["002", 5] + list(range(2, 300)))
+        lateral = workbook.create_sheet("independientes")
+        lateral.append(["id", "valor", None, "categoria", "cantidad"])
+        lateral.append(["A", 1, None, "X", 2])
+        lateral.append(["B", None, None, "Y", 3])
+        levels = workbook.create_sheet("niveles")
+        levels.append(["Sitio", "Mediciones", None, None])
+        levels.append([None, "Sensor A", None, "Sensor B"])
+        levels.append([None, "minimo", "maximo", None])
+        levels.append(["A", 1, 2, 3])
+        levels.merge_cells("A1:A3")
+        levels.merge_cells("B1:D1")
+        levels.merge_cells("B2:C2")
+        levels.merge_cells("D2:D3")
+        result = self.processor.prepare("general.xlsx", workbook_bytes(workbook))
+        self.assertEqual([len(table.rows) for table in result.tables], [2, 2, 2, 1])
+        self.assertEqual(len(result.tables[0].columns), 300)
+        unnamed = result.tables[0].columns[1]
+        self.assertTrue(unnamed["header_missing"])
+        self.assertEqual(unnamed["header_values"], [None])
+        self.assertEqual(unnamed["source_column"], 2)
+        self.assertEqual(result.tables[0].rows[0][unnamed["sql_name"]], "nd")
+        self.assertEqual(result.tables[-1].source_locator["header_rows"], [1, 2, 3])
+        self.assertEqual(result.tables[-1].columns[1]["original_name"], "Mediciones | Sensor A | minimo")
+
+    def test_numeric_projection_keeps_original_markers_and_excluded_count(self) -> None:
+        content = b"Fecha,Abundancia,codigo,periodo\n2024-03-12,120,001,03/04/2024\n2024-03-13,135,002,04/05/2024\n2024-03-14,nd,nd,05/06/2024\n2024-03-15,180,004,06/07/2024\n"
+        table = self.processor.prepare("markers.csv", content).tables[0]
+        original, auxiliary = table.columns[1], table.columns[-1]
+        self.assertEqual(original["sql_type"], "TEXT")
+        self.assertFalse(original["numeric_eligible"])
+        self.assertEqual([row[original["sql_name"]] for row in table.rows], ["120", "135", "nd", "180"])
+        self.assertEqual(auxiliary["derived_from"], original["sql_name"])
+        self.assertEqual(auxiliary["excluded_count"], 1)
+        self.assertEqual(auxiliary["nonempty_count"], 4)
+        self.assertEqual([row[auxiliary["sql_name"]] for row in table.rows], [Decimal(120), Decimal(135), None, Decimal(180)])
+        self.assertEqual(len(table.columns), 5)
+        self.assertTrue(any("excluidos" in warning for warning in table.warnings))
+
+    def test_structural_transpose_verifies_coordinates_and_rejects_record_loss(self) -> None:
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.append(["variable", date(2024, 1, 1), date(2024, 1, 2)])
+        sheet.append(["sitio", "A", "B"])
+        sheet.append(["masa [mg]", 10, "nd"])
+        sheet.append(["volumen [L]", 2, 4])
+        content = workbook_bytes(workbook)
+        initial = self.processor.prepare("matrix.xlsx", content)
+        self.assertFalse(initial.tables)
+        candidate = initial.structure_candidates[0]
+        hint = StructureSuggestion(candidate["region_id"], "columns", 1, 1, 2)
+        table = self.processor.prepare("matrix.xlsx", content, [hint]).tables[0]
+        self.assertEqual(len(table.rows), 2)
+        self.assertEqual(table.source_locator["orientation"], "columns")
+        self.assertEqual(table.source_locator["header_columns"], [1])
+        self.assertEqual([column["source_row"] for column in table.columns], [1, 2, 3, 4])
+        self.assertEqual([row["_aquai_source_column"] for row in table.rows], [2, 3])
+        self.assertEqual(table.rows[1]["masa_mg"], "nd")
+        corrected = self.processor.prepare("matrix.xlsx", content, [StructureSuggestion(candidate["region_id"], "columns", 1, 2, 3)]).tables[0]
+        self.assertEqual(len(corrected.rows), 2)
+        self.assertEqual(corrected.source_locator["structure_assistance"]["header_depth"], 1)
+        self.assertEqual(corrected.source_locator["structure_assistance"]["suggested_header_depth"], 2)
+        rejected = self.processor.prepare("matrix.xlsx", content, [StructureSuggestion(candidate["region_id"], "columns", 2, 1, 3)])
+        self.assertFalse(rejected.tables)
+        self.assertTrue(any("verificarse" in warning for warning in rejected.warnings))
 
     def test_excel_preserves_formulas_formatted_codes_and_partial_dates(self) -> None:
         workbook = Workbook()

@@ -17,13 +17,15 @@ from aquai.infrastructure.providers.semanticIndex import QdrantSemanticIndex, Se
 
 
 class _Queries:
-    def __init__(self, usable):
+    def __init__(self, usable, versions=None):
         self.usable = set(usable)
+        self.versions = versions or {}
         self.requested = []
 
-    def usable_dataset_ids(self, dataset_ids):
+    def usable_dataset_ids(self, dataset_ids, *, versions=None):
         self.requested = dataset_ids
-        return self.usable.intersection(dataset_ids)
+        return {dataset_id for dataset_id in self.usable.intersection(dataset_ids)
+                if versions is None or self.versions.get(dataset_id) == versions.get(dataset_id)}
 
 
 class SemanticProviderTests(unittest.IsolatedAsyncioTestCase):
@@ -55,6 +57,24 @@ class SemanticProviderTests(unittest.IsolatedAsyncioTestCase):
         provider = OllamaSemanticProvider(settings, transport=httpx.MockTransport(handle))
         result = await provider.describe(table)
         self.assertEqual(table, before)
+
+        semantic_response = response
+        response = {"suggestions": [{"region_id": "0:1:1:3:4", "orientation": "columns",
+                                     "header_start": 1, "header_depth": 1, "data_start": 2}]}
+        candidates = [{"region_id": "0:1:1:3:4", "shape": [4, 3], "sample": []}]
+        hints = await provider.suggest_structure(candidates)
+        self.assertEqual(hints[0].orientation, "columns")
+        self.assertEqual(hints[0].data_start, 2)
+        self.assertEqual(requests[-1]["options"], {"temperature": 0, "num_ctx": 32768})
+        self.assertFalse(requests[-1]["think"])
+        response["suggestions"][0]["region_id"] = "inventada"
+        with self.assertRaises(LLMProviderError):
+            await provider.suggest_structure(candidates)
+        response["suggestions"][0]["region_id"] = candidates[0]["region_id"]
+        response["suggestions"].append(dict(response["suggestions"][0]))
+        with self.assertRaises(LLMProviderError):
+            await provider.suggest_structure(candidates)
+        response = semantic_response
         self.assertEqual(result.description, "Cantidades por fecha.")
         self.assertEqual(result.columns[0]["unit"], "mg")
         self.assertEqual(result.columns[0]["sql_type"], "NUMERIC")
@@ -141,13 +161,17 @@ class SemanticIndexTests(unittest.IsolatedAsyncioTestCase):
              "rows": [{"codigo": "sentinel_sql_row_value"}]}
             for dataset_id in (first, second)
         ]}
-        queries = _Queries([first])
+        queries = _Queries([first], {first: 2, second: 2})
         index = QdrantSemanticIndex(self.settings, client=self.client, embeddings=self.embeddings, queries=queries)
         await index.index_source(source)
+        await index.index_source(source)
+        for dataset in source["datasets"]:
+            dataset["version"] = 2
         await index.index_source(source)
         self.assertEqual(self.client.count(self.settings.qdrant_collection).count, 2)
         self.assertNotIn("sentinel_sql_row_value", json.dumps(self.requests))
         points, _ = self.client.scroll(self.settings.qdrant_collection)
+        self.assertTrue(all(point.payload["version"] == 2 for point in points))
         self.assertEqual({point.id for point in points}, {str(first), str(second)})
         self.assertTrue(all(point.payload["content_type"] == "dataset_description" for point in points))
         self.assertTrue(all(point.payload["embedding_model"] == "nomic-embed-text:latest" for point in points))
@@ -156,6 +180,9 @@ class SemanticIndexTests(unittest.IsolatedAsyncioTestCase):
         results = await index.search("muestras")
         self.assertEqual([item["dataset_id"] for item in results], [str(first)])
         self.assertEqual(set(queries.requested), {first, second})
+        self.client.set_payload(self.settings.qdrant_collection, payload={"version": 1}, points=[str(first)])
+        self.assertEqual(await index.search("muestras"), [])
+        self.client.set_payload(self.settings.qdrant_collection, payload={"version": 2}, points=[str(first)])
         await index.set_source_active(source_id, False)
         self.assertEqual(await index.search("muestras"), [])
         await index.set_source_active(source_id, True)
