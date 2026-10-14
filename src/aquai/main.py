@@ -1,6 +1,7 @@
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
 from aquai.infrastructure.providers.sources import SourceRuntime, create_source_runtime
 from aquai.presentation.controllers.sources import router as sources_router
@@ -26,6 +27,12 @@ def create_app(*, sources: SourceRuntime | None = None) -> FastAPI:
         max_upload_bytes=lambda: (
             app.state.sources.upload.max_upload_bytes if app.state.sources else None
         ),
+    )
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
+        allow_methods=["GET", "POST", "PATCH"],
+        allow_headers=["Content-Type"],
     )
     register_exception_handlers(app)
     app.include_router(sources_router)
