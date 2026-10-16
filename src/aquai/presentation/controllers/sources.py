@@ -4,7 +4,7 @@ from uuid import UUID
 from fastapi import APIRouter, Query
 
 from aquai.application.dtos.requests.activateSource import ActivateSourceRequest
-from aquai.application.dtos.requests.listSources import ListSourcesRequest
+from aquai.application.dtos.requests.listSources import ListSourcesRequest, SourceSort
 from aquai.application.dtos.responses.getSource import SourceDetailResponse
 from aquai.application.dtos.responses.listSources import SourceListResponse
 from aquai.application.dtos.responses.uploadSource import SourceAcceptedResponse
@@ -35,9 +35,10 @@ async def list_sources(
     page_size: Annotated[int, Query(ge=1, le=100)] = 20,
     name: Annotated[str | None, Query(max_length=255)] = None,
     processing_status: Annotated[ProcessingStatus | None, Query()] = None,
+    sort: Annotated[SourceSort, Query(description="Orden del listado, aplicado antes de paginar.")] = SourceSort.NEWEST,
 ) -> SourceListResponse:
     return await handler.handle(ListSourcesRequest(
-        page=page, page_size=page_size, name=name, processing_status=processing_status,
+        page=page, page_size=page_size, name=name, processing_status=processing_status, sort=sort,
     ))
 
 

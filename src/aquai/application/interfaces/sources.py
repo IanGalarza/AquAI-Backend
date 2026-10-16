@@ -5,12 +5,13 @@ from typing import Protocol
 from uuid import UUID
 
 from aquai.application.contracts.ingestion import PreparedTable
+from aquai.application.dtos.requests.listSources import SourceSort
 from aquai.domain.models.source import Source
 
 
 class SourceQueries(Protocol):
     def list(self, *, page: int, page_size: int, search: str | None = None,
-             processing_status: str | None = None) -> dict: ...
+             processing_status: str | None = None, sort: SourceSort = SourceSort.NEWEST) -> dict: ...
     def get(self, source_id: UUID, *, include_content: bool = False) -> dict: ...
     def usable_dataset_ids(self, dataset_ids: list[UUID], *,
                            versions: dict[UUID, int] | None = None) -> set[UUID]: ...

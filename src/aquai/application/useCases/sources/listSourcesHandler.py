@@ -12,6 +12,6 @@ class ListSourcesHandler:
     async def handle(self, request: ListSourcesRequest) -> SourceListResponse:
         result = await asyncio.to_thread(
             self._queries.list, page=request.page, page_size=request.page_size,
-            search=request.name, processing_status=request.processing_status,
+            search=request.name, processing_status=request.processing_status, sort=request.sort,
         )
         return SourceListResponse.model_validate(result)

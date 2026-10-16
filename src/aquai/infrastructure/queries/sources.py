@@ -10,6 +10,7 @@ from sqlalchemy import func, select, tuple_
 from sqlalchemy.orm import Session
 
 from aquai.application.errors import SourceNotFoundError
+from aquai.application.dtos.requests.listSources import SourceSort
 from aquai.domain.enums.sourceStatus import ProcessingStatus
 from aquai.domain.models import Dataset, Source
 from aquai.infrastructure.persistence.dbContext import DbContext
@@ -59,7 +60,7 @@ class SqlAlchemySourceQueries:
 
     def list(
         self, *, page: int = 1, page_size: int = 20, search: str | None = None,
-        processing_status: str | None = None,
+        processing_status: str | None = None, sort: SourceSort = SourceSort.NEWEST,
     ) -> dict[str, Any]:
         if page < 1 or not 1 <= page_size <= 100:
             raise ValueError("La página debe ser positiva y el tamaño debe estar entre 1 y 100.")
@@ -68,6 +69,12 @@ class SqlAlchemySourceQueries:
             predicates.append(Source.name.icontains(search.strip(), autoescape=True))
         if processing_status:
             predicates.append(Source.processing_status == ProcessingStatus(processing_status))
+        ordering = {
+            SourceSort.NEWEST: (Source.created_at.desc(), Source.id.desc()),
+            SourceSort.OLDEST: (Source.created_at.asc(), Source.id.asc()),
+            SourceSort.NAME_ASC: (func.lower(Source.name).asc(), Source.created_at.desc(), Source.id.desc()),
+            SourceSort.NAME_DESC: (func.lower(Source.name).desc(), Source.created_at.desc(), Source.id.desc()),
+        }[SourceSort(sort)]
         dataset_count = (
             select(func.count(Dataset.id)).where(Dataset.source_id == Source.id)
             .correlate(Source).scalar_subquery().label("dataset_count")
@@ -76,7 +83,7 @@ class SqlAlchemySourceQueries:
             total = session.scalar(select(func.count(Source.id)).where(*predicates)) or 0
             rows = session.execute(
                 select(*_source_columns(), dataset_count).where(*predicates)
-                .order_by(Source.created_at.desc(), Source.id.desc())
+                .order_by(*ordering)
                 .offset((page - 1) * page_size).limit(page_size)
             ).mappings()
             items = deepcopy([dict(row) for row in rows])
