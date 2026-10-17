@@ -12,7 +12,7 @@ from openpyxl.utils.cell import get_column_letter
 from aquai.application.contracts.ingestion import PreparationResult, PreparedTable, StructureSuggestion
 from aquai.application.errors import FileTooLargeError
 from aquai.infrastructure.config.tabular import TabularSettings
-from aquai.infrastructure.processing.tabular.normalization import column_names, header_unit, infer_column, numeric_projection
+from aquai.infrastructure.processing.tabular.normalization import column_names, header_unit, infer_column, numeric_projection, text_value
 from aquai.infrastructure.processing.tabular.reader import LoadedFile, SheetData, TableReader, is_empty
 
 
@@ -98,7 +98,15 @@ def _header(sheet: SheetData, bounds: tuple[int, int, int, int], columns: list[i
                         grid[row - top][index] = sheet.frame.iat[min_row - 1, min_col - 1]
         values = [value for row in grid for value in row if not is_empty(value)]
         sparse_context = any(sum(not is_empty(value) for value in row) < len(columns) for row in grid[:-1])
-        if values and all(_header_text(value) for value in values) and (relevant_merges or sparse_context):
+        labelled_groups = bool(relevant_merges) and any(_header_text(value) for value in grid[-1]) and all(
+            is_empty(value) or _header_text(value) for value in grid[-1]
+        ) and all(
+            _header_text(value)
+            or isinstance(value, (int, float, Decimal, date)) and not isinstance(value, bool)
+            or isinstance(value, str) and re.fullmatch(r"[+-]?\d+(?:[.,]\d+)?", value.strip()) is not None
+            for row in grid[:-1] for value in row if not is_empty(value)
+        )
+        if values and (all(_header_text(value) for value in values) or labelled_groups) and (relevant_merges or sparse_context):
             names = [" | ".join(dict.fromkeys(str(row[index]) for row in grid if not is_empty(row[index])))
                      or f"Columna {get_column_letter(column + 1)}"
                      for index, column in enumerate(columns)]
@@ -370,7 +378,7 @@ class SimpleTabularProcessor:
             sql_type, values, warning = infer_column(original, [row[index] for row in rows])
             metadata = {"original_name": original, "sql_name": sql_name, "sql_type": sql_type,
                         "source_column": selected[index] + 1,
-                        "header_values": [sheet.frame.iat[row, selected[index]] for row in range(top + skipped - 1, start - 1)],
+                        "header_values": [text_value(sheet.frame.iat[row, selected[index]]) for row in range(top + skipped - 1, start - 1)],
                         "numeric_eligible": sql_type in {"BIGINT", "NUMERIC"}, "unit": None, "meaning": None}
             unit = header_unit(original)
             if unit:
