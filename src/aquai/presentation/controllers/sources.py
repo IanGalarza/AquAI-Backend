@@ -5,6 +5,7 @@ from fastapi import APIRouter, Query
 
 from aquai.application.dtos.requests.activateSource import ActivateSourceRequest
 from aquai.application.dtos.requests.listSources import ListSourcesRequest, SourceSort
+from aquai.application.dtos.responses.activateSource import SourceActivationResponse
 from aquai.application.dtos.responses.getSource import SourceDetailResponse
 from aquai.application.dtos.responses.listSources import SourceListResponse
 from aquai.application.dtos.responses.uploadSource import SourceAcceptedResponse
@@ -48,8 +49,8 @@ async def get_source(id: UUID, handler: GetSourceDependency) -> SourceDetailResp
     return await handler.handle(id)
 
 
-@router.patch("/{id}", response_model=SourceDetailResponse, summary="Activar o desactivar fuente",
+@router.patch("/{id}", response_model=SourceActivationResponse, summary="Activar o desactivar fuente",
               responses=ERROR_RESPONSES)
 async def activate_source(id: UUID, request: ActivateSourceRequest,
-                          handler: ActivateSourceDependency) -> SourceDetailResponse:
+                          handler: ActivateSourceDependency) -> SourceActivationResponse:
     return await handler.handle(id, request.is_active)

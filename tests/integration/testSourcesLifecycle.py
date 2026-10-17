@@ -207,7 +207,8 @@ class SourceLifecycleTests(unittest.IsolatedAsyncioTestCase):
         detail = await self.runtime.activate.handle(accepted.id, False)
         self.assertFalse(detail.queryable)
         self.assertFalse(self.queries.usable_dataset_ids([dataset_id]))
-        self.assertFalse(detail.datasets[0].queryable)
+        public_detail = await self.runtime.get.handle(accepted.id)
+        self.assertFalse(public_detail.datasets[0].queryable)
 
     async def test_cancelled_semantics_keeps_sql_and_recovers_pending_index(self):
         entered = asyncio.Event()
@@ -255,12 +256,19 @@ class SourceLifecycleTests(unittest.IsolatedAsyncioTestCase):
         with TestClient(app) as client:
             response = client.post("/sources", files={"file": ("safe.csv", b"id,value\n001,3\n")})
             self.assertEqual(response.status_code, 202)
+            self.assertEqual(set(response.json()), {"id", "duplicate"})
             source_id = response.json()["id"]
-            self.assertEqual(client.get("/sources").status_code, 200)
+            listing = client.get("/sources")
+            self.assertEqual(listing.status_code, 200)
+            self.assertNotIn("duplicate", listing.json()["items"][0])
             detail = client.get("/sources/" + source_id).json()
             self.assertNotIn("file_content", detail)
             self.assertNotIn("reviews", detail)
-            self.assertEqual(client.patch("/sources/" + source_id, json={"isActive": False}).status_code, 200)
+            self.assertTrue({"mime_type", "updated_at", "duplicate", "name"}.isdisjoint(detail))
+            activation = client.patch("/sources/" + source_id, json={"isActive": False})
+            self.assertEqual(activation.status_code, 200)
+            self.assertEqual(set(activation.json()), {"id", "isActive", "queryable", "processing_status", "semantic_index_status"})
+            self.assertFalse(activation.json()["isActive"])
             self.assertEqual(client.patch("/sources/" + source_id, json={"isActive": "yes"}).status_code, 422)
             self.assertEqual(client.post("/sources", files={"file": ("x.pdf", b"%PDF")}).status_code, 400)
             self.assertEqual(client.post("/sources", files={"file": ("x.csv", b"id\x00")}).status_code, 400)

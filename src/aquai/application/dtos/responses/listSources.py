@@ -1,10 +1,10 @@
 """Proyección paginada sin originales ni informes."""
 from datetime import datetime
 from pydantic import BaseModel, Field
-from aquai.application.dtos.responses.uploadSource import SourceAcceptedResponse
+from aquai.application.dtos.responses.sourceState import SourceStateResponse
 
 
-class SourceListItem(SourceAcceptedResponse):
+class SourceListItem(SourceStateResponse):
     name: str
     file_type: str
     file_size_bytes: int = Field(ge=0)

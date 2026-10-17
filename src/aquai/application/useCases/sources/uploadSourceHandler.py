@@ -5,17 +5,15 @@ from hashlib import sha256
 
 from aquai.application.dtos.requests.uploadSource import UploadSourceRequest
 from aquai.application.dtos.responses.uploadSource import SourceAcceptedResponse
-from aquai.application.interfaces.sources import SourceCommands, SourceQueries
+from aquai.application.interfaces.sources import SourceCommands
 from aquai.application.interfaces.tabular import TabularProcessor
 from aquai.domain.models.source import Source
 
 
 class UploadSourceHandler:
-    def __init__(self, commands: SourceCommands, queries: SourceQueries,
-                 processor: TabularProcessor, *, max_upload_bytes: int,
+    def __init__(self, commands: SourceCommands, processor: TabularProcessor, *, max_upload_bytes: int,
                  notify: Callable[[], None] | None = None) -> None:
         self._commands = commands
-        self._queries = queries
         self._processor = processor
         self._notify = notify
         self.max_upload_bytes = max_upload_bytes
@@ -35,5 +33,4 @@ class UploadSourceHandler:
         source_id, created = await asyncio.to_thread(self._commands.create_upload, source)
         if self._notify:
             self._notify()
-        state = await asyncio.to_thread(self._queries.get, source_id)
-        return SourceAcceptedResponse.model_validate(dict(state, duplicate=not created))
+        return SourceAcceptedResponse(id=source_id, duplicate=not created)

@@ -32,7 +32,7 @@ def build_source_runtime(commands: SourceCommands, queries: SourceQueries,
     worker = SourceWorker(commands, handler, poll_seconds=poll_seconds)
     return SourceRuntime(
         upload=UploadSourceHandler(
-            commands, queries, processor, max_upload_bytes=max_upload_bytes, notify=worker.wake,
+            commands, processor, max_upload_bytes=max_upload_bytes, notify=worker.wake,
         ),
         list=ListSourcesHandler(queries), get=GetSourceHandler(queries),
         activate=ActivateSourceHandler(commands, queries, notify=worker.wake),
