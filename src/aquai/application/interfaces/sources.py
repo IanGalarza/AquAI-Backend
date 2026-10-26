@@ -5,6 +5,7 @@ from typing import Protocol
 from uuid import UUID
 
 from aquai.application.contracts.ingestion import PreparedTable
+from aquai.application.contracts.retrieval import VerifiedDataset
 from aquai.application.dtos.requests.listSources import SourceSort
 from aquai.domain.models.source import Source
 
@@ -15,6 +16,8 @@ class SourceQueries(Protocol):
     def get(self, source_id: UUID, *, include_content: bool = False) -> dict: ...
     def usable_dataset_ids(self, dataset_ids: list[UUID], *,
                            versions: dict[UUID, int] | None = None) -> set[UUID]: ...
+    def verified_datasets(self, dataset_ids: list[UUID], *,
+                          versions: dict[UUID, int] | None = None) -> list[VerifiedDataset]: ...
 
 
 class SourceCommands(Protocol):

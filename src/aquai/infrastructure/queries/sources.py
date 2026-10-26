@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import re
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import func, select, tuple_
+from sqlalchemy import Column, MetaData, Table, func, inspect, select, tuple_
+from sqlalchemy.exc import DBAPIError, NoSuchTableError
 from sqlalchemy.orm import Session
 
+from aquai.application.contracts.retrieval import DatasetProvenance, VerifiedDataset
 from aquai.application.errors import SourceNotFoundError
 from aquai.application.dtos.requests.listSources import SourceSort
 from aquai.domain.enums.sourceStatus import ProcessingStatus
@@ -91,18 +94,77 @@ class SqlAlchemySourceQueries:
 
     def usable_dataset_ids(self, dataset_ids: list[UUID], *,
                            versions: dict[UUID, int] | None = None) -> set[UUID]:
-        """PostgreSQL confirma disponibilidad aun cuando el índice tenga un payload antiguo."""
+        """Comparte con la recuperación la validación del catálogo y tabla física."""
+        return {dataset.dataset_id for dataset in self.verified_datasets(dataset_ids, versions=versions)}
+
+    def verified_datasets(self, dataset_ids: list[UUID], *,
+                          versions: dict[UUID, int] | None = None) -> list[VerifiedDataset]:
+        """Sólo devuelve datasets vigentes, legibles y con esquema físico coherente."""
         if not dataset_ids:
-            return set()
+            return []
         version_filter = [] if versions is None else [tuple_(Dataset.id, Dataset.version).in_(list(versions.items()))]
         with self._context.session() as session:
-            return set(session.scalars(
-                select(Dataset.id).join(Source, Source.id == Dataset.source_id).where(
+            rows = session.execute(
+                select(
+                    Dataset, Source.name, Source.original_filename, Source.file_type,
+                    Source.content_hash, Source.processing_status,
+                    Source.semantic_index_status, Source.processing_report,
+                ).join(Source, Source.id == Dataset.source_id).where(
                     Dataset.id.in_(dataset_ids), Dataset.is_active.is_(True),
-                    Dataset.queryable.is_(True), Source.is_active.is_(True),
+                    Dataset.queryable.is_(True), Dataset.row_count > 0, Source.is_active.is_(True),
                     Source.processing_status.in_(
                         (ProcessingStatus.READY, ProcessingStatus.READY_WITH_WARNINGS)
                     ),
                     *version_filter,
                 )
-            ))
+            ).all()
+            result = []
+            for dataset, name, filename, file_type, digest, processing, index_status, report in rows:
+                if not self._physical_dataset_available(session, dataset):
+                    continue
+                result.append(VerifiedDataset(
+                    dataset_id=dataset.id, source_id=dataset.source_id,
+                    semantic_point_id=dataset.semantic_point_id,
+                    name=dataset.name,
+                    description=dataset.semantic_description or dataset.description,
+                    physical_table_name=dataset.physical_table_name,
+                    verified_version=dataset.version, row_count=dataset.row_count,
+                    columns_metadata=deepcopy(dataset.columns_metadata),
+                    provenance=DatasetProvenance(
+                        source_name=name, original_filename=filename, file_type=file_type,
+                        content_hash=digest, source_locator=deepcopy(dataset.source_locator),
+                        processing_status=processing, semantic_index_status=index_status,
+                    ),
+                    warnings=list(dict.fromkeys(dataset.quality_warnings + report.get("warnings", []))),
+                ))
+            return result
+
+    @staticmethod
+    def _physical_dataset_available(session: Session, dataset: Dataset) -> bool:
+        if not re.fullmatch(r"dataset_[0-9a-f]{32}", dataset.physical_table_name):
+            return False
+        expected = {column["sql_name"]: column["sql_type"] for column in dataset.columns_metadata}
+        expected.update({"_aquai_row": "BIGINT", "_aquai_source_row": "BIGINT"})
+        if dataset.source_locator.get("orientation") == "columns":
+            expected["_aquai_source_column"] = "BIGINT"
+        try:
+            with session.begin_nested():
+                connection = session.connection()
+                inspector = inspect(connection)
+                if not inspector.has_table(dataset.physical_table_name):
+                    return False
+                columns = inspector.get_columns(dataset.physical_table_name)
+                actual = {column["name"]: str(column["type"].compile(dialect=connection.dialect)) for column in columns}
+                if any(actual.get(name) != sql_type for name, sql_type in expected.items()):
+                    return False
+                table = Table(dataset.physical_table_name, MetaData(), *(
+                    Column(column["name"], column["type"], quote=True) for column in columns
+                ), quote=True)
+                probe = select(*(table.c[name].is_not(None) for name in expected)).limit(1)
+                return session.execute(probe).first() is not None
+        except NoSuchTableError:
+            return False
+        except DBAPIError as error:
+            if getattr(error.orig, "sqlstate", None) in {"42P01", "42703", "42501"}:
+                return False
+            raise

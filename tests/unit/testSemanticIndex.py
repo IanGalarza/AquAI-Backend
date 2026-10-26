@@ -184,8 +184,11 @@ class SemanticIndexTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await index.search("muestras"), [])
         self.client.set_payload(self.settings.qdrant_collection, payload={"version": 2}, points=[str(first)])
         await index.set_source_active(source_id, False)
+        # La actividad real proviene de SQL, incluso con payload obsoleto.
+        queries.usable.clear()
         self.assertEqual(await index.search("muestras"), [])
         await index.set_source_active(source_id, True)
+        queries.usable.add(first)
         self.assertEqual(len(await index.search("muestras")), 1)
         queries.usable.clear()
         self.assertEqual(await index.search("muestras"), [])

@@ -89,44 +89,52 @@ class QdrantSemanticIndex:
             return []
         vectors = await self._embeddings.embed([self._embedding_text(query.strip(), query=True)])
         await self._ensure_collection(self._validate_vectors(vectors, expected=1))
-        response = await self._call(
-            self._client.query_points,
-            collection_name=self._settings.qdrant_collection,
-            query=vectors[0],
-            using=self._vector_name,
-            query_filter=models.Filter(must=[
-                models.FieldCondition(key="is_active", match=models.MatchValue(value=True)),
-                models.FieldCondition(key="content_type", match=models.MatchValue(value="dataset_description")),
-                models.FieldCondition(key="embedding_model", match=models.MatchValue(value=self._embedding_model)),
-            ]),
-            limit=min(1000, limit * 4),
-            with_payload=True,
-            with_vectors=False,
-        )
-        candidates = []
-        for point in response.points:
-            payload = point.payload or {}
-            try:
-                dataset_id = UUID(str(payload["dataset_id"]))
-            except (KeyError, TypeError, ValueError):
-                continue
-            if type(payload.get("version")) is not int or payload["version"] < 1:
-                continue
-            candidates.append((dataset_id, point, payload))
-        usable = await asyncio.to_thread(
-            self._queries.usable_dataset_ids, [item[0] for item in candidates],
-            versions={dataset_id: payload["version"] for dataset_id, _, payload in candidates},
-        )
-        usable_ids = {str(dataset_id) for dataset_id in usable}
         result: list[dict[str, Any]] = []
         seen: set[UUID] = set()
-        for dataset_id, point, payload in candidates:
-            if str(dataset_id) not in usable_ids or dataset_id in seen:
-                continue
-            result.append({**payload, "semantic_point_id": str(point.id), "score": float(point.score)})
-            seen.add(dataset_id)
-            if len(result) == limit:
+        page_size, offset = limit * 4, 0
+        while len(result) < limit:
+            response = await self._call(
+                self._client.query_points,
+                collection_name=self._settings.qdrant_collection,
+                query=vectors[0],
+                using=self._vector_name,
+                query_filter=models.Filter(must=[
+                    models.FieldCondition(key="content_type", match=models.MatchValue(value="dataset_description")),
+                    models.FieldCondition(key="embedding_model", match=models.MatchValue(value=self._embedding_model)),
+                ]),
+                limit=page_size, offset=offset,
+                with_payload=True, with_vectors=False,
+            )
+            candidates = []
+            for point in response.points:
+                payload = point.payload or {}
+                try:
+                    dataset_id = UUID(str(payload["dataset_id"]))
+                    UUID(str(payload["source_id"]))
+                    UUID(str(point.id))
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if type(payload.get("version")) is not int or payload["version"] < 1 or not math.isfinite(point.score):
+                    continue
+                candidates.append((dataset_id, point, payload))
+            usable_pairs = set()
+            for version in {payload["version"] for _, _, payload in candidates}:
+                ids = [dataset_id for dataset_id, _, payload in candidates if payload["version"] == version]
+                usable = await asyncio.to_thread(
+                    self._queries.usable_dataset_ids, ids,
+                    versions={dataset_id: version for dataset_id in ids},
+                )
+                usable_pairs.update((dataset_id, version) for dataset_id in usable)
+            for dataset_id, point, payload in candidates:
+                if (dataset_id, payload["version"]) not in usable_pairs or dataset_id in seen:
+                    continue
+                result.append({**payload, "semantic_point_id": str(point.id), "score": float(point.score)})
+                seen.add(dataset_id)
+                if len(result) == limit:
+                    break
+            if len(response.points) < page_size:
                 break
+            offset += len(response.points)
         return result
 
     async def _ensure_collection(self, dimension: int) -> None:
