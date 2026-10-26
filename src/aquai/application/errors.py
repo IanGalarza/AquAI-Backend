@@ -24,3 +24,7 @@ class SourceConflictError(RuntimeError):
 
 class SourcesUnavailableError(RuntimeError):
     pass
+
+
+class PlannerValidationError(ValueError):
+    """La propuesta no respeta las referencias o la estructura del catálogo."""

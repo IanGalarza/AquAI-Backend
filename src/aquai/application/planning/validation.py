@@ -1,0 +1,184 @@
+"""Verificación del plan contra metadatos; no ejecuta sus operaciones."""
+
+from datetime import date, datetime
+from uuid import UUID
+
+from aquai.application.contracts.planning import (
+    ColumnRef, OutputField, PlannerDecision, SelectedDataset,
+    ValidatedStep, ValidationIssue,
+)
+from aquai.application.contracts.retrieval import VerifiedDataset
+from aquai.application.errors import PlannerValidationError
+
+
+def _require(condition: bool, message: str) -> None:
+    if not condition:
+        raise PlannerValidationError(message)
+
+
+def validate_selections(decision: PlannerDecision, catalog: list[VerifiedDataset]) -> list[SelectedDataset]:
+    available = {dataset.dataset_id: dataset for dataset in catalog}
+    result = []
+    seen = set()
+    for selection in decision.datasets:
+        _require(selection.dataset_id not in seen, "El modelo repitió un dataset.")
+        seen.add(selection.dataset_id)
+        dataset = available.get(selection.dataset_id)
+        _require(dataset is not None, "El modelo seleccionó un dataset fuera del contexto verificado.")
+        _require(selection.version == dataset.verified_version, "La versión propuesta no coincide con PostgreSQL.")
+        columns = {column.sql_name: column for column in dataset.columns_metadata}
+        _require(len(set(selection.columns)) == len(selection.columns), "La selección repite columnas.")
+        _require(set(selection.columns).issubset(columns), "El modelo seleccionó una columna inexistente.")
+        names = list(selection.columns)
+        for name in selection.columns:
+            origin = columns[name].derived_from
+            if origin:
+                _require(origin in columns, "La proyección numérica no tiene columna de origen verificable.")
+                if origin not in names:
+                    names.append(origin)
+        result.append(SelectedDataset(
+            **dataset.model_dump(exclude={"columns_metadata"}),
+            columns_metadata=[columns[name].model_copy(deep=True) for name in names],
+            selection_reason=selection.reason,
+        ))
+    return result
+
+
+def validate_operations(decision: PlannerDecision, selected: list[SelectedDataset]) -> tuple[list[ValidatedStep], list[ValidationIssue]]:
+    datasets = {dataset.dataset_id: dataset for dataset in selected}
+    requested = {item.dataset_id: set(item.columns) for item in decision.datasets}
+    steps = {}
+    outputs: dict[str, dict[str, OutputField]] = {}
+    used_datasets: set[UUID] = set()
+    limited_steps = set()
+    issues = []
+
+    def issue(code, message, step_id, severity="clarification"):
+        issues.append(ValidationIssue(code=code, message=message, step_id=step_id, severity=severity))
+
+    def raw_field(ref: ColumnRef) -> OutputField:
+        _require(ref.dataset_id in requested and ref.column in requested[ref.dataset_id], "Una operación usa una columna no seleccionada.")
+        column = next(column for column in datasets[ref.dataset_id].columns_metadata if column.sql_name == ref.column)
+        return OutputField(
+            name=column.sql_name, sql_type=column.sql_type, numeric_eligible=column.numeric_eligible is True,
+            unit=column.unit, unit_status="documented" if column.unit is not None else "unknown", sources=[ref],
+        )
+
+    for step in decision.steps:
+        _require(step.id not in steps, "Los identificadores de pasos deben ser únicos.")
+        _require(len(set(step.depends_on)) == len(step.depends_on), "Un paso repite dependencias.")
+        _require(all(dependency in steps for dependency in step.depends_on), "El plan contiene un ciclo o dependencia futura/inexistente.")
+
+        def resolve(ref):
+            if isinstance(ref, ColumnRef):
+                _require(step.operation == "read" and ref in step.columns, "Sólo read puede usar referencias directas, declaradas en columns.")
+                return raw_field(ref)
+            _require(ref.step_id in step.depends_on, "La referencia debe provenir de una dependencia directa.")
+            _require(ref.field in outputs[ref.step_id], "La operación refiere a un resultado inexistente.")
+            return outputs[ref.step_id][ref.field]
+
+        if step.operation in {"join", "append"}:
+            _require(len(step.depends_on) >= 2, "Combinar requiere al menos dos resultados previos.")
+            for key in step.join_on:
+                resolve(key.left)
+                resolve(key.right)
+            issue("unverified_observation_compatibility", "La combinación requiere confirmar claves, granularidad, cardinalidad y solapamientos; el catálogo actual no los garantiza.", step.id)
+            return [], issues
+
+        _require(not step.join_on, "Las claves de unión sólo corresponden a join.")
+        if step.operation == "read":
+            _require(step.tool == "sql" and not step.depends_on and bool(step.columns), "read requiere SQL, columnas y ninguna dependencia.")
+            _require(not step.group_by and not step.calculations, "read no puede ocultar agrupaciones ni cálculos.")
+            ids = {ref.dataset_id for ref in step.columns}
+            _require(len(ids) == 1, "Cada read debe leer un único dataset; las combinaciones deben ser explícitas.")
+            used_datasets.update(ids)
+            fields = [raw_field(ref) for ref in step.columns]
+        else:
+            _require(len(step.depends_on) == 1 and not step.columns, "La operación requiere un resultado previo; no columnas directas.")
+            source = step.depends_on[0]
+            if step.tool == "sql" and steps[source].tool == "python":
+                issue("materialization_required", "SQL no puede consumir resultados de Python sin una estrategia explícita de materialización.", step.id)
+            fields = list(outputs[source].values())
+            if step.operation != "sort":
+                _require(not step.order_by and step.limit is None, "Orden y límite requieren un paso sort explícito después del cálculo.")
+            if step.operation == "sort":
+                _require(not step.group_by and not step.calculations and bool(step.order_by), "sort sólo debe ordenar/filtrar/limitar un resultado previo.")
+            else:
+                _require(bool(step.calculations), "El paso debe declarar cálculos.")
+                if source in limited_steps:
+                    issue("limited_calculation_input", "El cálculo depende de una lectura limitada; hay que precisar si se pretende calcular sobre una muestra.", step.id)
+                fields = []
+                if step.operation == "calculate":
+                    _require(not step.group_by, "calculate no admite agrupaciones implícitas.")
+                    functions = {calculation.function for calculation in step.calculations}
+                    _require(not ("correlation" in functions and len(functions) > 1), "No mezclar una correlación escalar con cálculos por registro.")
+                for grouping in step.group_by:
+                    _require(step.operation == "aggregate", "Las agrupaciones pertenecen a aggregate.")
+                    field = resolve(grouping.field).model_copy(deep=True)
+                    if grouping.time_grain != "raw":
+                        if field.sql_type not in {"DATE", "TIMESTAMP"}:
+                            issue("ambiguous_date", "No se puede agrupar por calendario una columna TEXT o de fecha parcial sin una interpretación confirmada.", step.id)
+                        field.sql_type = "BIGINT" if grouping.time_grain == "year" else "DATE"
+                        field.numeric_eligible = False
+                        field.unit, field.unit_status = None, "dimensionless"
+                    field.name = grouping.output_name
+                    fields.append(field)
+                for calculation in step.calculations:
+                    function = calculation.function
+                    aggregate = function in {"count", "count_distinct", "sum", "mean", "min", "max"}
+                    _require(aggregate == (step.operation == "aggregate"), "La función no corresponde al tipo de operación.")
+                    operands = [resolve(ref) for ref in calculation.inputs]
+                    refs = [ref for operand in operands for ref in operand.sources]
+                    unit, unit_status, sql_type = None, "dimensionless", "BIGINT"
+                    if function not in {"count", "count_distinct"}:
+                        for operand in operands:
+                            temporal_extreme = function in {"min", "max"} and operand.sql_type in {"DATE", "TIMESTAMP"}
+                            if not temporal_extreme and not (operand.numeric_eligible and operand.sql_type in {"BIGINT", "NUMERIC"}):
+                                issue("ineligible_calculation", "El cálculo requiere una columna numérica elegible o una proyección numérica documentada; no se convierte TEXT automáticamente.", step.id)
+                        sql_type = operands[0].sql_type if function in {"min", "max"} else "NUMERIC"
+                        unit, unit_status = operands[0].unit, operands[0].unit_status
+                        if function in {"difference", "ratio"}:
+                            compatible = operands[0].unit is not None and operands[0].unit == operands[1].unit
+                            same_variable = operands[0].sources == operands[1].sources
+                            if not compatible and not same_variable:
+                                issue("unverified_units", "La operación necesita unidades comparables documentadas; no se infieren equivalencias ni conversiones.", step.id)
+                        if function in {"ratio", "correlation"}:
+                            unit, unit_status = None, "dimensionless"
+                        elif unit is None and sql_type in {"BIGINT", "NUMERIC"}:
+                            issue("undocumented_unit", "El resultado conserva una unidad desconocida; no se infiere a partir del nombre.", step.id, "warning")
+                    fields.append(OutputField(
+                        name=calculation.output_name, sql_type=sql_type,
+                        numeric_eligible=sql_type in {"BIGINT", "NUMERIC"}, unit=unit,
+                        unit_status=unit_status, sources=list({(ref.dataset_id, ref.column): ref for ref in refs}.values()),
+                    ))
+
+        for predicate in step.filters:
+            field = resolve(predicate.field)
+            if predicate.operator in {"lt", "le", "gt", "ge"} and field.sql_type == "TEXT":
+                issue("text_range", "Un rango sobre TEXT necesita confirmar si el orden es textual, numérico o temporal.", step.id)
+            for value in predicate.values:
+                if field.sql_type in {"BIGINT", "NUMERIC"}:
+                    _require(type(value) in {int, float}, "Un filtro numérico requiere constantes numéricas.")
+                elif field.sql_type == "BOOLEAN":
+                    _require(type(value) is bool, "Un filtro booleano requiere valores booleanos.")
+                else:
+                    _require(isinstance(value, str), "Un filtro de texto/fecha requiere constantes textuales.")
+                    if field.sql_type in {"DATE", "TIMESTAMP"}:
+                        try:
+                            (date.fromisoformat if field.sql_type == "DATE" else datetime.fromisoformat)(value)
+                        except ValueError as error:
+                            raise PlannerValidationError("El filtro temporal no usa una fecha ISO completa.") from error
+        for ordering in step.order_by:
+            resolve(ordering.field)
+        _require(len({field.name for field in fields}) == len(fields), "Las columnas de salida de un paso deben tener nombres únicos.")
+        validated = ValidatedStep(**step.model_dump(), output_fields=fields)
+        steps[step.id] = validated
+        outputs[step.id] = {field.name: field for field in fields}
+        if step.limit is not None or any(dependency in limited_steps for dependency in step.depends_on):
+            limited_steps.add(step.id)
+
+    if decision.status == "plannable":
+        _require(used_datasets == set(datasets), "Todo dataset seleccionado debe participar en el plan.")
+        _require(len(set(decision.output_steps)) == len(decision.output_steps), "Las salidas finales no deben repetirse.")
+        _require(all(step_id in steps for step_id in decision.output_steps), "Una salida final refiere a un paso inexistente.")
+    return list(steps.values()), issues
