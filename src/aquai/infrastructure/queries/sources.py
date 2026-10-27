@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from contextlib import contextmanager
 import re
 from typing import Any
 from uuid import UUID
@@ -51,8 +52,17 @@ def source_snapshot(
 
 
 class SqlAlchemySourceQueries:
-    def __init__(self, context: DbContext) -> None:
+    def __init__(self, context: DbContext, *, session: Session | None = None) -> None:
         self._context = context
+        self._verification_session = session
+
+    @contextmanager
+    def _verified_session(self):
+        if self._verification_session is not None:
+            yield self._verification_session
+        else:
+            with self._context.session() as session:
+                yield session
 
     def get(self, source_id: UUID, *, include_content: bool = False) -> dict[str, Any]:
         with self._context.session() as session:
@@ -103,7 +113,7 @@ class SqlAlchemySourceQueries:
         if not dataset_ids:
             return []
         version_filter = [] if versions is None else [tuple_(Dataset.id, Dataset.version).in_(list(versions.items()))]
-        with self._context.session() as session:
+        with self._verified_session() as session:
             rows = session.execute(
                 select(
                     Dataset, Source.name, Source.original_filename, Source.file_type,
