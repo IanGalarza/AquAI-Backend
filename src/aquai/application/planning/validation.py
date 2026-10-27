@@ -86,6 +86,7 @@ def validate_operations(decision: PlannerDecision, selected: list[SelectedDatase
             return [], issues
 
         _require(not step.join_on, "Las claves de unión sólo corresponden a join.")
+        _require((step.operation == "visualize") == (step.visualization is not None), "visualize requiere su especificación exclusiva de gráfico.")
         if step.operation == "read":
             _require(step.tool == "sql" and not step.depends_on and bool(step.columns), "read requiere SQL, columnas y ninguna dependencia.")
             _require(not step.group_by and not step.calculations, "read no puede ocultar agrupaciones ni cálculos.")
@@ -96,12 +97,31 @@ def validate_operations(decision: PlannerDecision, selected: list[SelectedDatase
         else:
             _require(len(step.depends_on) == 1 and not step.columns, "La operación requiere un resultado previo; no columnas directas.")
             source = step.depends_on[0]
+            _require(steps[source].operation != "visualize", "Un gráfico no es una tabla de entrada para cálculos.")
             if step.tool == "sql" and steps[source].tool == "python":
-                issue("materialization_required", "SQL no puede consumir resultados de Python sin una estrategia explícita de materialización.", step.id)
+                issue("materialization_required", "El paso SQL queda pendiente: consumir resultados Python requiere una estrategia de materialización todavía no implementada.", step.id, "warning")
             fields = list(outputs[source].values())
             if step.operation != "sort":
                 _require(not step.order_by and step.limit is None, "Orden y límite requieren un paso sort explícito después del cálculo.")
-            if step.operation == "sort":
+            if step.operation == "visualize":
+                _require(step.tool == "python" and not step.group_by and not step.calculations and not step.filters,
+                         "visualize requiere Python y una entrada explícita sin cálculos ni filtros ocultos.")
+                chart = step.visualization
+                x = resolve(chart.x)
+                y = resolve(chart.y) if chart.y is not None else None
+                if chart.series is not None:
+                    resolve(chart.series)
+                numeric = lambda field: field.numeric_eligible and field.sql_type in {"BIGINT", "NUMERIC"}
+                if chart.chart_type in {"scatter", "histogram"}:
+                    _require(numeric(x), "El eje x del gráfico requiere una variable numérica elegible.")
+                if chart.chart_type == "line":
+                    _require(numeric(x) or x.sql_type in {"DATE", "TIMESTAMP"}, "Una línea requiere un eje numérico o temporal verificado; no se interpretan fechas TEXT.")
+                if y is not None:
+                    _require(numeric(y), "El eje y del gráfico requiere una variable numérica elegible.")
+                if source in limited_steps:
+                    issue("explicitly_limited_chart", "El gráfico representa el límite explícito del plan, no todo el dataset.", step.id, "warning")
+                fields = []
+            elif step.operation == "sort":
                 _require(not step.group_by and not step.calculations and bool(step.order_by), "sort sólo debe ordenar/filtrar/limitar un resultado previo.")
             else:
                 _require(bool(step.calculations), "El paso debe declarar cálculos.")
@@ -125,8 +145,10 @@ def validate_operations(decision: PlannerDecision, selected: list[SelectedDatase
                     fields.append(field)
                 for calculation in step.calculations:
                     function = calculation.function
-                    aggregate = function in {"count", "count_distinct", "sum", "mean", "min", "max"}
+                    aggregate = function in {"count", "count_distinct", "sum", "mean", "min", "max", "median", "stddev", "quantile"}
                     _require(aggregate == (step.operation == "aggregate"), "La función no corresponde al tipo de operación.")
+                    if function in {"median", "stddev", "quantile"}:
+                        _require(step.tool == "python", "La nueva función estadística está habilitada exclusivamente en Python.")
                     operands = [resolve(ref) for ref in calculation.inputs]
                     refs = [ref for operand in operands for ref in operand.sources]
                     unit, unit_status, sql_type = None, "dimensionless", "BIGINT"

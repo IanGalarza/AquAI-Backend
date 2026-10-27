@@ -17,6 +17,7 @@ dependencies = [
     "qdrant-client>=1.19,<2",
     "langgraph>=1.2,<2",
     "pandas",
+    "plotly>=7.1,<8",
     "openpyxl",
     "pydantic>=2",
     "pydantic-settings",

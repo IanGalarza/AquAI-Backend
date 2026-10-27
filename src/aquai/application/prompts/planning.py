@@ -40,10 +40,35 @@ Gramática del plan:
   a resultados usan {kind:result,step_id:<dependencia directa>,field:<campo de salida>}.
   read expone los sql_name originales; aggregate expone los output_name de sus
   agrupaciones y cálculos. Cada alias debe ser único y técnico (ASCII minúscula).
-  Funciones: count (inputs=[] cuenta filas), count_distinct, sum, mean, min, max.
+  Funciones SQL preferidas: count (inputs=[] cuenta filas), count_distinct, sum, mean,
+  min, max. Para median, stddev o quantile usá tool=python. stddev usa ddof=1
+  (muestral) o ddof=0 (poblacional) según lo pedido. quantile requiere quantile
+  entre 0 y 1: percentil 90 es 0.9; interpolación lineal en (n-1)*quantile.
+  Estadísticas descriptivas se expresan como varios cálculos con alias diferentes.
+  null_policy=exclude omite nulos de cada cálculo; preserve devuelve null si falta
+  algún operando. Nunca sustituyas faltantes por cero.
 - calculate: difference, ratio o correlation sobre campos de un resultado previo.
   Usá python para análisis como correlation; SQL o Python para agregados según entrada.
 - sort: orden/filtros/límite sobre un resultado previo; campos de esa dependencia.
+- visualize: tool=python, depends_on=[paso de datos], visualization con chart_type
+  line|bar|scatter|histogram, title, x, y, x_label, y_label y series opcional. x/y/series
+  son referencias kind=result a campos reales de esa dependencia. histogram sólo
+  usa x numérica, bins entre 1 y 100 (default 10), sin y ni series. Otros gráficos
+  requieren y numérica. line requiere x numérica o DATE/TIMESTAMP; scatter ambos
+  ejes numéricos. bar necesita una fila por categoría/serie: agregá antes con SQL
+  si hay varias observaciones. Los gráficos no agregan ni unen registros implícitamente.
+  Un promedio agrupado y su gráfico requieren TRES pasos: read (columnas originales),
+  aggregate (depende del read; columns=[]; calcula mean y group_by) y visualize
+  (depende del aggregate; columns=[]; x/y refieren a los alias de ese aggregate).
+  No incluyas columns en aggregate/calculate/sort/visualize. No omitas el read ni
+  declares un promedio como una columna física. visualization sólo existe en visualize.
+  No uses campos de gráficos como entrada de cálculos. Para dibujar una media por
+  localidad: read SQL -> aggregate SQL -> visualize Python. Para distribuciones:
+  read SQL con sólo la variable necesaria -> visualize histogram Python.
+- Preferí reducir entradas Python mediante SQL cuando conserve la semántica.
+  Python exige entradas completas dentro de sus límites; un límite de filas no
+  convierte un análisis del dataset en uno correcto. SQL posterior a Python queda
+  pendiente sin materialización; organizá ramas independientes sin uniones implícitas.
 - Filtros: operator enum y values tipados; null usa is_null/is_not_null y values=[].
   Sin expresiones libres, casts ni nombres inventados. Orden/límite tras agregar se
   hace en sort. No limites una lectura que alimenta agregaciones del conjunto completo.

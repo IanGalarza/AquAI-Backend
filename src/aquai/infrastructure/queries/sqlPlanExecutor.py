@@ -13,6 +13,7 @@ from aquai.application.contracts.execution import (
 )
 from aquai.application.contracts.planning import PlanningResult
 from aquai.application.errors import PlannerValidationError
+from aquai.application.execution import plan_fingerprint
 from aquai.application.useCases.queries.executeSqlPlanHandler import validate_execution_plan
 from aquai.infrastructure.config.sqlExecution import SqlExecutionSettings
 from aquai.infrastructure.persistence.dbContext import DbContext
@@ -36,6 +37,7 @@ class SqlAlchemyPlanExecutor:
         started = perf_counter()
         now = datetime.now(timezone.utc)
         result = SqlExecutionResult(status="not_executed", started_at=now, finished_at=now,
+                                    plan_fingerprint=plan_fingerprint(plan),
                                     output_operations=list(plan.output_steps), warnings=list(plan.warnings))
         current = None
         try:
@@ -83,7 +85,7 @@ class SqlAlchemyPlanExecutor:
                         records[step.id] = record
                         if step.tool == "python":
                             record.status = "pending_python"
-                            record.warnings.append("El Python Agent todavía no está implementado.")
+                            record.warnings.append("La operación se delega al Python Agent con entradas completas y verificadas.")
                         elif any(parent not in compiled for parent in step.depends_on):
                             record.status = "blocked"
                             record.warnings.append("Falta ejecutar una dependencia Python o una operación no soportada.")

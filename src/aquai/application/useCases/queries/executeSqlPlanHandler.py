@@ -4,7 +4,7 @@ import asyncio
 from datetime import datetime, timezone
 
 from aquai.application.contracts.execution import ExecutionError, OperationExecution, SqlExecutionResult
-from aquai.application.contracts.planning import DatasetSelection, PlanStep, PlannableDecision, PlanningResult
+from aquai.application.contracts.planning import DatasetSelection, PlannableDecision, PlanningResult
 from aquai.application.contracts.retrieval import VerifiedDataset
 from aquai.application.errors import PlannerValidationError
 from aquai.application.interfaces.execution import SqlPlanExecutor
@@ -20,14 +20,14 @@ def validate_execution_plan(plan: PlanningResult, catalog: list[VerifiedDataset]
         datasets=[DatasetSelection(dataset_id=item.dataset_id, version=item.verified_version,
                   columns=[column.sql_name for column in item.columns_metadata], reason=item.selection_reason)
                   for item in plan.selected_datasets],
-        steps=[PlanStep.model_validate(step.model_dump(exclude={"output_fields"})) for step in plan.operations],
+        steps=[step.model_dump(exclude={"output_fields"}) for step in plan.operations],
         output_steps=plan.output_steps,
     )
     snapshots = [VerifiedDataset.model_validate(item.model_dump()) for item in catalog]
     selected = validate_selections(decision, snapshots)
     for proposed, actual in zip(plan.selected_datasets, selected, strict=True):
         if any(getattr(proposed, field) != getattr(actual, field) for field in (
-            "source_id", "semantic_point_id", "physical_table_name", "columns_metadata", "provenance",
+            "source_id", "semantic_point_id", "physical_table_name", "row_count", "columns_metadata", "provenance", "warnings",
         )):
             raise PlannerValidationError("Los metadatos autorizados cambiaron; hay que volver a planificar.")
     operations, issues = validate_operations(decision, selected)
