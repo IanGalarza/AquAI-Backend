@@ -1,14 +1,29 @@
 """Verificación de transferencias y resumen del plan, sin frameworks ni motores."""
 
 from hashlib import sha256
+from datetime import date, datetime
+from decimal import Decimal
+import re
 
 from aquai.application.contracts.execution import PythonExecutionResult, SqlExecutionResult
 from aquai.application.contracts.planning import PlanningResult
-from aquai.application.errors import PlannerValidationError
+from aquai.application.errors import AnalysisBlocked, PlannerValidationError
 
 
 def plan_fingerprint(plan: PlanningResult) -> str:
     return sha256(plan.model_dump_json().encode("utf-8")).hexdigest()
+
+
+def sql_result_fingerprint(sql: SqlExecutionResult | None) -> str:
+    return sha256((sql.model_dump_json() if sql is not None else "null").encode("utf-8")).hexdigest()
+
+
+def evidence_fingerprint(plan, sql, python) -> str:
+    digest = sha256()
+    for item in (plan, sql, python):
+        digest.update((item.model_dump_json() if item is not None else "null").encode("utf-8"))
+        digest.update(b"\x00")
+    return digest.hexdigest()
 
 
 def execution_fingerprint(plan: PlanningResult, sql: SqlExecutionResult | None, policy: str = "") -> str:
@@ -63,3 +78,53 @@ def summarize_execution(plan: PlanningResult | None, sql: SqlExecutionResult | N
     if completed:
         return "partial", pending, warnings
     return ("failed" if errors else "not_executed"), pending, warnings
+
+
+def decode_rows(record, fields, budget=None):
+    """Sólo rehidrata el tipo del esquema verificado, nunca interpreta un TEXT."""
+    rows = []
+    names = {field.name for field in fields}
+    for row in record.rows:
+        if budget is not None:
+            budget.check()
+        if set(row) != names:
+            raise AnalysisBlocked("invalid_schema", "Una fila no coincide con el esquema de su resultado autorizado.")
+        decoded = {}
+        for field in fields:
+            value = row[field.name]
+            if value is None:
+                decoded[field.name] = None
+                continue
+            if field.sql_type == "NUMERIC":
+                if type(value) is str:
+                    if len(value) > 1100 or not re.fullmatch(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?", value):
+                        raise AnalysisBlocked("invalid_numeric", "La representación NUMERIC no es decimal canónica.")
+                    value = Decimal(value)
+                elif type(value) is int:
+                    value = Decimal(value)
+                if not isinstance(value, Decimal) or not value.is_finite():
+                    raise AnalysisBlocked("invalid_numeric", "NUMERIC exige decimales finitos; no se convierte float silenciosamente.")
+                if len(value.as_tuple().digits) > 1000 or abs(value.as_tuple().exponent) > 1000:
+                    raise AnalysisBlocked("numeric_limit", "El número excede la precisión/tamaño de entrada permitidos.")
+            elif field.sql_type == "BIGINT":
+                if type(value) is not int or not -(2**63) <= value < 2**63:
+                    raise AnalysisBlocked("invalid_integer", "BIGINT exige enteros dentro de su rango original.")
+            elif field.sql_type == "DATE":
+                value = date.fromisoformat(value) if type(value) is str else value
+                if type(value) is not date:
+                    raise AnalysisBlocked("invalid_date", "La fecha no coincide con DATE.")
+            elif field.sql_type == "TIMESTAMP":
+                value = datetime.fromisoformat(value) if type(value) is str else value
+                if not isinstance(value, datetime) or value.tzinfo is not None:
+                    raise AnalysisBlocked("invalid_date", "TIMESTAMP requiere su fecha completa sin zona horaria implícita.")
+            elif field.sql_type == "BOOLEAN":
+                if type(value) is not bool:
+                    raise AnalysisBlocked("invalid_boolean", "La entrada no coincide con BOOLEAN.")
+            elif field.sql_type == "TEXT":
+                if type(value) is not str:
+                    raise AnalysisBlocked("invalid_text", "La entrada no coincide con TEXT.")
+            else:
+                raise AnalysisBlocked("unsupported_type", "El tipo de entrada no está habilitado para Python.")
+            decoded[field.name] = value
+        rows.append(decoded)
+    return rows

@@ -139,6 +139,8 @@ class VisualizationResult(BaseModel):
 
 class PythonExecutionResult(BaseModel):
     status: ExecutionStatus
+    plan_fingerprint: str | None = None
+    sql_input_fingerprint: str | None = None
     operations: list[OperationExecution] = Field(default_factory=list)
     datasets: list[ExecutionDataset] = Field(default_factory=list)
     visualizations: list[VisualizationResult] = Field(default_factory=list)

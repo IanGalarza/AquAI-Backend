@@ -10,7 +10,9 @@ from aquai.application.contracts.execution import (
     ExecutionDataset, ExecutionError, OperationExecution, PythonExecutionResult, SqlExecutionResult,
 )
 from aquai.application.contracts.planning import PlanningResult
-from aquai.application.execution import execution_fingerprint, summarize_execution, validate_sql_transfer
+from aquai.application.execution import (
+    execution_fingerprint, plan_fingerprint, sql_result_fingerprint, summarize_execution, validate_sql_transfer,
+)
 from aquai.application.errors import PlannerValidationError
 from aquai.application.useCases.queries.executeSqlPlanHandler import validate_execution_plan
 from aquai.infrastructure.analysis.operations import AnalysisBlocked, decode_rows, tabular_operation
@@ -47,6 +49,7 @@ class DeterministicPythonPlanExecutor:
         settings = self._settings
         budget = _Budget(settings, started)
         result = PythonExecutionResult(status="not_executed", started_at=now, finished_at=now,
+            plan_fingerprint=plan_fingerprint(plan), sql_input_fingerprint=sql_result_fingerprint(sql_result),
             output_operations=list(plan.output_steps), decimal_precision=settings.decimal_precision,
             warnings=list(dict.fromkeys([*plan.warnings,
                 f"Cálculos NUMERIC con Decimal y precisión de {settings.decimal_precision} dígitos significativos; no se convierten silenciosamente a float."])))

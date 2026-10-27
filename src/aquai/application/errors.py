@@ -28,3 +28,9 @@ class SourcesUnavailableError(RuntimeError):
 
 class PlannerValidationError(ValueError):
     """La propuesta no respeta las referencias o la estructura del catálogo."""
+
+
+class AnalysisBlocked(ValueError):
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
