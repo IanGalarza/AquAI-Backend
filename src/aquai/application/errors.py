@@ -34,3 +34,19 @@ class AnalysisBlocked(ValueError):
     def __init__(self, code: str, message: str):
         super().__init__(message)
         self.code = code
+
+
+class ConversationNotFoundError(LookupError):
+    pass
+
+
+class ConversationConflictError(RuntimeError):
+    pass
+
+
+class ConversationsUnavailableError(RuntimeError):
+    pass
+
+
+class ConversationStorageError(RuntimeError):
+    pass

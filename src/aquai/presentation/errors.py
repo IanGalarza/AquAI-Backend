@@ -12,6 +12,9 @@ from aquai.application.errors import (
     SourceNotFoundError,
     SourcesUnavailableError,
     TabularInputError,
+    ConversationConflictError,
+    ConversationNotFoundError,
+    ConversationsUnavailableError,
 )
 
 
@@ -29,6 +32,9 @@ _ERROR_STATUS_CODES = {
     SourceConflictError: 409,
     SourcesUnavailableError: 503,
     TabularInputError: 400,
+    ConversationNotFoundError: 404,
+    ConversationConflictError: 409,
+    ConversationsUnavailableError: 503,
 }
 
 

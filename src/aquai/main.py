@@ -5,11 +5,13 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from aquai.infrastructure.providers.sources import SourceRuntime, create_source_runtime
 from aquai.presentation.controllers.sources import router as sources_router
+from aquai.presentation.controllers.conversations import router as conversations_router
+from aquai.infrastructure.providers.conversations import ConversationRuntime
 from aquai.presentation.errors import register_exception_handlers
 from aquai.presentation.uploadLimit import SourceUploadSizeLimit
 
 
-def create_app(*, sources: SourceRuntime | None = None) -> FastAPI:
+def create_app(*, sources: SourceRuntime | None = None, conversations: ConversationRuntime | None = None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         runtime = sources or create_source_runtime()
@@ -22,6 +24,7 @@ def create_app(*, sources: SourceRuntime | None = None) -> FastAPI:
 
     app = FastAPI(title="AquAI Backend", version="0.1.0", lifespan=lifespan)
     app.state.sources = sources
+    app.state.conversations = conversations
     app.add_middleware(
         SourceUploadSizeLimit,
         max_upload_bytes=lambda: (
@@ -36,6 +39,7 @@ def create_app(*, sources: SourceRuntime | None = None) -> FastAPI:
     )
     register_exception_handlers(app)
     app.include_router(sources_router)
+    app.include_router(conversations_router)
     return app
 
 

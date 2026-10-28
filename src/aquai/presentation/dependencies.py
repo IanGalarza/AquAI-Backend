@@ -15,6 +15,8 @@ from aquai.application.useCases.sources import (
     UploadSourceHandler,
 )
 from aquai.infrastructure.providers.sources import SourceRuntime
+from aquai.application.useCases.conversations.handlers import ConversationHistoryHandler, SendMessageHandler
+from aquai.infrastructure.providers.conversations import create_conversation_runtime
 
 
 def _get_source_runtime(request: Request) -> SourceRuntime:
@@ -70,3 +72,23 @@ async def read_source_file(
 
 
 SourceFileDependency = Annotated[UploadSourceRequest, Depends(read_source_file)]
+
+
+def _get_conversation_runtime(request: Request):
+    runtime = getattr(request.app.state, "conversations", None)
+    if runtime is None:
+        runtime = create_conversation_runtime()
+        request.app.state.conversations = runtime
+    return runtime
+
+
+def get_conversation_history_handler(request: Request) -> ConversationHistoryHandler:
+    return _get_conversation_runtime(request).history
+
+
+def get_send_message_handler(request: Request) -> SendMessageHandler:
+    return _get_conversation_runtime(request).send
+
+
+ConversationHistoryDependency = Annotated[ConversationHistoryHandler, Depends(get_conversation_history_handler)]
+SendMessageDependency = Annotated[SendMessageHandler, Depends(get_send_message_handler)]
