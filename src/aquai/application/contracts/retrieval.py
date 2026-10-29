@@ -50,7 +50,8 @@ class DatasetCandidate(VerifiedDataset):
 
 class DatasetRetrievalResult(BaseModel):
     question: str
-    candidates: list[DatasetCandidate]
+    candidates: list[DatasetCandidate | VerifiedDataset]
+    retrieval_method: Literal["semantic", "explicit"] = "semantic"
     verified_at: datetime
     status: Literal["candidates_available", "no_available_candidates"]
     # La similitud coseno no confirma que las columnas permitan responder.

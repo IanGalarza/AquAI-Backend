@@ -1,15 +1,18 @@
 """Contratos HTTP e instantáneas persistentes, sin objetos de infraestructura."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Literal
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue
 
-from aquai.application.contracts.answering import ConversationMessage, GenerationRecord, Language, QueryResponse
+from aquai.application.contracts.answering import (
+    ConversationMessage, GenerationRecord, Language, QueryResponse,
+)
 from aquai.application.contracts.execution import ValueExclusion
 from aquai.application.contracts.planning import OutputField
+from aquai.application.contracts.routing import HistoryMessage
 
 
 class CreateConversationRequest(BaseModel):
@@ -107,7 +110,7 @@ class AssistantSnapshot(BaseModel):
     context_policy: dict[str, JsonValue]
     storage_warnings: list[str] = Field(default_factory=list)
     omitted_visualizations: list[dict[str, JsonValue]] = Field(default_factory=list)
-    validated_at: datetime
+    validated_at: datetime | None
 
 
 @dataclass(frozen=True)
@@ -118,6 +121,8 @@ class TurnReservation:
     history: list[ConversationMessage]
     history_message_ids: list[UUID]
     question: str
+    user_sequence_number: int = 0
+    structured_history: list[HistoryMessage] = field(default_factory=list)
 
 
 @dataclass(frozen=True)

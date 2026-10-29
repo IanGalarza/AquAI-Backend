@@ -6,9 +6,12 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue
 
-from aquai.application.contracts.execution import ExecutionError, QueryExecutionState, VisualizationResult
+from aquai.application.contracts.execution import (
+    ExecutionError, QueryExecutionState, VisualizationResult,
+)
 from aquai.application.contracts.planning import OutputField, PlanningInput
 from aquai.application.contracts.retrieval import DatasetProvenance
+from aquai.application.contracts.routing import HistoryMessage, RoutingResult
 
 
 AnswerStatus = Literal["validated", "partial", "needs_clarification", "insufficient_coverage", "failed"]
@@ -123,8 +126,9 @@ class ResponseResultReference(BaseModel):
 
 
 class QueryResponse(BaseModel):
-    status: AnswerStatus
-    validation_status: AnswerStatus
+    response_type: Literal["analytical", "general", "clarification", "historical"] = "analytical"
+    status: AnswerStatus | Literal["answered"]
+    validation_status: AnswerStatus | None
     answer: str
     language: Language
     sources: list[SourceReference] = Field(default_factory=list)
@@ -143,11 +147,14 @@ class QueryResponse(BaseModel):
     planner_model: str | None = None
     planner_input_tokens: int | None = None
     planner_output_tokens: int | None = None
+    routing: RoutingResult | None = None
+    historical_message_ids: list[UUID] = Field(default_factory=list)
 
 
 class QueryResponseInput(PlanningInput):
     conversation_context: list[ConversationMessage] = Field(default_factory=list, max_length=8)
     response_language: Language | None = None
+    conversation_history: list[HistoryMessage] = Field(default_factory=list, max_length=8)
 
 
 class QueryResponseState(QueryExecutionState):
@@ -156,3 +163,5 @@ class QueryResponseState(QueryExecutionState):
     validation: EvidenceValidationResult | None = None
     response: QueryResponse | None = None
     stage_durations_ms: dict[str, float] = Field(default_factory=dict)
+    conversation_history: list[HistoryMessage] = Field(default_factory=list, max_length=8)
+    routing: RoutingResult | None = None

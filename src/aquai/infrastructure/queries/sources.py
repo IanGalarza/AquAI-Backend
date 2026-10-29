@@ -8,11 +8,12 @@ import re
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import Column, MetaData, Table, func, inspect, select, tuple_
+from sqlalchemy import Column, MetaData, Table, func, inspect, or_, select, tuple_
 from sqlalchemy.exc import DBAPIError, NoSuchTableError
 from sqlalchemy.orm import Session
 
 from aquai.application.contracts.retrieval import DatasetProvenance, VerifiedDataset
+from aquai.application.contracts.routing import CatalogDataset
 from aquai.application.errors import SourceNotFoundError
 from aquai.application.dtos.requests.listSources import SourceSort
 from aquai.domain.enums.sourceStatus import ProcessingStatus
@@ -55,6 +56,55 @@ class SqlAlchemySourceQueries:
     def __init__(self, context: DbContext, *, session: Session | None = None) -> None:
         self._context = context
         self._verification_session = session
+
+    def matching_datasets(self, reference: str) -> list[CatalogDataset]:
+        """Coincidencias literales en metadatos; no decide relevancia científica."""
+        reference = reference.strip()
+        fields = (
+            Source.name, Source.original_filename, Source.description,
+            Dataset.name, Dataset.description, Dataset.semantic_description,
+        )
+        predicates = [field.icontains(reference, autoescape=True) for field in fields]
+        try:
+            identifier = UUID(reference)
+        except ValueError:
+            identifier = None
+        if identifier is not None:
+            predicates.extend([Source.id == identifier, Dataset.id == identifier])
+        statement = (
+            select(
+                Dataset.id, Dataset.source_id, Dataset.name, Dataset.version,
+                Dataset.is_active, Dataset.queryable, Dataset.row_count,
+                Source.name.label("source_name"), Source.original_filename,
+                Source.is_active.label("source_active"), Source.processing_status,
+            )
+            .join(Source, Source.id == Dataset.source_id)
+            .where(or_(*predicates)).order_by(Source.id, Dataset.id).limit(101)
+        )
+        with self._context.session() as session:
+            rows = session.execute(statement).mappings()
+            result = []
+            for row in rows:
+                exact_names = (
+                    row["source_name"], row["original_filename"], row["name"],
+                    str(row["id"]), str(row["source_id"]),
+                )
+                available = (
+                    row["is_active"] and row["queryable"] and row["row_count"] > 0
+                    and row["source_active"] and row["processing_status"] in {
+                        ProcessingStatus.READY, ProcessingStatus.READY_WITH_WARNINGS,
+                    }
+                )
+                result.append(CatalogDataset(
+                    dataset_id=row["id"], source_id=row["source_id"],
+                    dataset_name=row["name"], source_name=row["source_name"],
+                    version=row["version"], available=available,
+                    exact=any(name.casefold() == reference.casefold() for name in exact_names),
+                    name_match=any(
+                        reference.casefold() in name.casefold() for name in exact_names
+                    ),
+                ))
+            return result
 
     @contextmanager
     def _verified_session(self):

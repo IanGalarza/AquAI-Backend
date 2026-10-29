@@ -15,7 +15,9 @@ from aquai.application.useCases.sources import (
     UploadSourceHandler,
 )
 from aquai.infrastructure.providers.sources import SourceRuntime
-from aquai.application.useCases.conversations.handlers import ConversationHistoryHandler, SendMessageHandler
+from aquai.application.useCases.commands.createConversationHandler import CreateConversationHandler
+from aquai.application.useCases.commands.sendMessageHandler import SendMessageHandler
+from aquai.application.useCases.queries.conversationHistoryHandler import ConversationHistoryHandler
 from aquai.infrastructure.providers.conversations import create_conversation_runtime
 
 
@@ -90,5 +92,14 @@ def get_send_message_handler(request: Request) -> SendMessageHandler:
     return _get_conversation_runtime(request).send
 
 
-ConversationHistoryDependency = Annotated[ConversationHistoryHandler, Depends(get_conversation_history_handler)]
+def get_create_conversation_handler(request: Request) -> CreateConversationHandler:
+    return _get_conversation_runtime(request).create
+
+
+ConversationHistoryDependency = Annotated[
+    ConversationHistoryHandler, Depends(get_conversation_history_handler)
+]
 SendMessageDependency = Annotated[SendMessageHandler, Depends(get_send_message_handler)]
+CreateConversationDependency = Annotated[
+    CreateConversationHandler, Depends(get_create_conversation_handler)
+]
