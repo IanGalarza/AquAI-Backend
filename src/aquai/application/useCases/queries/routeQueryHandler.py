@@ -2,7 +2,9 @@
 
 import asyncio
 import logging
+import re
 from time import perf_counter
+from uuid import UUID
 
 from aquai.application.answering.context import response_language
 from aquai.application.contracts.routing import DatasetBinding, RoutingResult
@@ -43,6 +45,10 @@ class RouteQueryHandler:
             result.reason = decision.reason
             result.route = decision.route
             result.clarification_question = decision.clarification_question
+            if any(not value.text.strip() or value.text.casefold() not in state.question.casefold()
+                   for value in decision.data_mentions):
+                raise LLMProviderError("El Router inventó una variable o un valor ajeno a la pregunta.")
+            result.data_mentions = list({(item.text, item.kind): item for item in decision.data_mentions}.values())
             provided = {item.message_id: item for item in state.conversation_history}
             allowed = {item["message_id"] for item in context["history"]}
             if (
@@ -91,12 +97,11 @@ class RouteQueryHandler:
             result.request_history = requests
             result.question_contextualized = question != state.question
             explicit = self._explicit_mentions(
-                decision.source_mentions, state.question, messages
+                decision.source_mentions, state.question, messages, decision.data_mentions
             )
-            if explicit:
-                bindings = await self._resolve_sources(explicit, state.question)
-                result.source_mentions = explicit
-            else:
+            bindings, resolved = await self._resolve_sources(explicit, state.question)
+            result.source_mentions = resolved
+            if not resolved:
                 bindings = [
                     DatasetBinding(
                         dataset_id=source["dataset_id"], source_id=source["source_id"],
@@ -130,7 +135,7 @@ class RouteQueryHandler:
         return result
 
     @staticmethod
-    def _explicit_mentions(mentions, question, messages):
+    def _explicit_mentions(mentions, question, messages, data_mentions=()):
         names = [
             name.casefold()
             for message in messages if message.analysis
@@ -141,12 +146,14 @@ class RouteQueryHandler:
             )
         ]
         explicit = []
+        values = {value.text.strip().casefold() for value in data_mentions}
         for mention in dict.fromkeys(mentions):
             value = mention.strip().casefold()
             if not value:
                 raise LLMProviderError("La mención de fuente está vacía.")
             if value in question.casefold():
-                explicit.append(mention)
+                if value not in values or RouteQueryHandler._has_source_cue(mention, question):
+                    explicit.append(mention)
             elif not any(value in name for name in names):
                 raise LLMProviderError(
                     "La mención no aparece en la pregunta ni en sus referencias históricas."
@@ -155,15 +162,40 @@ class RouteQueryHandler:
             # se conserva el conjunto de identidades de los mensajes ya autorizados.
         return explicit
 
+    @staticmethod
+    def _has_source_cue(mention, question):
+        if re.search(r"\.(?:csv|xlsx)\b", mention, re.IGNORECASE):
+            return True
+        for match in re.finditer(re.escape(mention), question, re.IGNORECASE):
+            prefix = question[max(0, match.start() - 100):match.start()]
+            if re.search(r"\b(?:archivo|fuente|dataset|conjunto de datos|hoja|tabla|file|source|workbook|sheet|table)\s+"
+                         r"(?:(?:el|la|los|las|llamad[oa]|denominad[oa]|named|called)\s+)*[«\"“']?\s*$",
+                         prefix, re.IGNORECASE):
+                return True
+        return False
+
     async def _resolve_sources(self, mentions, question):
-        bindings = []
+        bindings, resolved = [], []
         for mention in dict.fromkeys(mentions):
             if not mention.strip() or mention.casefold() not in question.casefold():
                 raise LLMProviderError("La mención de fuente no aparece en la pregunta original.")
+            strict = self._has_source_cue(mention, question)
+            if not strict:
+                try:
+                    UUID(mention.strip())
+                except ValueError:
+                    # Un nombre sin señal explícita de archivo/dataset conserva
+                    # su significado en la pregunta para Retriever y Planner,
+                    # aunque coincida casualmente con un nombre del catálogo.
+                    continue
             matches = await asyncio.to_thread(self._sources.matching_datasets, mention)
             exact = [item for item in matches if item.exact]
             names = [item for item in matches if item.name_match]
-            matches = exact or names or matches
+            # Una conjetura del Router o una coincidencia temática no convierte
+            # un valor de columna en una restricción de identidad de datasets.
+            if not strict and not exact:
+                continue
+            matches = exact or names
             sources = {item.source_id for item in matches}
             if not matches:
                 raise ValueError(
@@ -184,7 +216,8 @@ class RouteQueryHandler:
                 DatasetBinding(dataset_id=item.dataset_id, source_id=item.source_id)
                 for item in matches
             )
-        return bindings
+            resolved.append(mention)
+        return bindings, resolved
 
     @staticmethod
     def _clarify(result, question, *, from_model=False):

@@ -1,13 +1,25 @@
 """Catálogo compacto completo por columnas, sin filas ni selección por score."""
 
 import json
+import re
 from hashlib import sha256
 
 from aquai.application.contracts.planning import PlanningContextRecord
 from aquai.application.contracts.retrieval import VerifiedDataset
 
 
-def build_planning_context(question: str, datasets: list[VerifiedDataset], budget_bytes: int) -> PlanningContextRecord:
+def latest_requested(question: str) -> bool:
+    # Distingue una última observación de intervalos como «el último año».
+    observation = r"(?:datos?|medici[oó]n|mediciones|registros?|observaci[oó]n|observaciones|valores?|lecturas?|muestras?|fechas?)"
+    english = r"(?:measurements?|observations?|records?|readings?|values?|data(?:\s+points?)?)"
+    return bool(re.search(
+        rf"\b(?:(?:[uú]ltim[oa]s?|m[aá]s\s+recientes?)\s+{observation}|"
+        rf"{observation}\s+m[aá]s\s+recientes?|(?:latest|most\s+recent|last)\s+{english})\b",
+        question, re.IGNORECASE))
+
+
+def build_planning_context(question: str, datasets: list[VerifiedDataset], budget_bytes: int,
+                           *, temporal_candidates_excluded=(), require_latest=False, query_mentions=()) -> PlanningContextRecord:
     column_fields = ["sql_name", "original_name", "sql_type", "unit", "numeric_eligible", "annotations"]
     warnings = list(dict.fromkeys(warning for dataset in datasets for warning in dataset.warnings))
     column_catalogs = {}
@@ -42,6 +54,14 @@ def build_planning_context(question: str, datasets: list[VerifiedDataset], budge
         "datasets": projected,
         "catalog_scope": "Sólo candidatos recuperados y revalidados en PostgreSQL; no es el catálogo completo. Sin registros ni evidencia de claves únicas o cardinalidad de joins.",
     }
+    if require_latest:
+        evidence["temporal_requirements"] = {
+            "operation": "latest", "date_types": ["DATE", "TIMESTAMP"], "keep_all_ties": True,
+            "exclude_null_measurements_before_latest": True,
+            "candidates_without_verified_dates": list(temporal_candidates_excluded),
+        }
+    if query_mentions:
+        evidence["query_mentions"] = [item.model_dump(mode="json") for item in query_mentions]
     compacted = []
 
     def serialized():

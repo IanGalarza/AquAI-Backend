@@ -29,9 +29,12 @@ class OllamaPlannerProvider:
         content = json.dumps(context.evidence, ensure_ascii=False, separators=(",", ":"))
         if len(content.encode("utf-8")) > self._budget:
             raise LLMProviderError("El catálogo excede el presupuesto de contexto del Planner.")
+        schema = self._output.json_schema()
+        if any(item["kind"] == "value" for item in context.evidence.get("query_mentions", [])):
+            schema["$defs"]["ReadPlanStep"]["properties"]["filters"]["minItems"] = 1
         body = await self._client.post("/api/chat", {
             "model": self._settings.default_model, "stream": False, "think": self._settings.llm_think,
-            "format": self._schema,
+            "format": schema,
             "options": {"temperature": 0, "num_ctx": self._settings.llm_num_ctx, "num_predict": self._output_tokens},
             "messages": [{"role": "system", "content": PLANNER_PROMPT}, {
                 "role": "user", "content": content,

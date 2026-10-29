@@ -29,13 +29,20 @@ class HistoryMessage(BaseModel):
     analysis: HistoricalAnalysis | None = None
 
 
+class DataMention(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    text: str = Field(min_length=1, max_length=200, description="Texto copiado literalmente de la pregunta actual.")
+    kind: Literal["variable", "value", "date"] = Field(description="variable: parámetro medido; value: valor de columna que acota registros, como una localidad o estación; date: fecha o período solicitado.")
+
+
 class RoutingDraft(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     route: Literal["general", "data", "historical", "needs_clarification"]
     language: Literal["es", "en"]
     context_required: bool
     history_message_ids: list[UUID] = Field(max_length=4)
-    source_mentions: list[str] = Field(max_length=4)
+    source_mentions: list[str] = Field(max_length=4, description="Referencias explícitas a archivos, datasets o sus identificadores; nunca localidades, estaciones, variables ni fechas.")
+    data_mentions: list[DataMention] = Field(max_length=12, description="Identificá las variables, valores de columnas y fechas de la consulta; en una pregunta sobre una medición de una localidad incluí la variable y la localidad. No son fuentes.")
     clarification_question: str | None = Field(max_length=500)
     reason: str = Field(min_length=1, max_length=400)
 
@@ -73,6 +80,7 @@ class RoutingResult(BaseModel):
     request_history: list[str] = Field(default_factory=list)
     dataset_bindings: list[DatasetBinding] = Field(default_factory=list)
     source_mentions: list[str] = Field(default_factory=list)
+    data_mentions: list[DataMention | str] = Field(default_factory=list)
     context_used: bool = False
     question_contextualized: bool = False
     clarification_question: str | None = None

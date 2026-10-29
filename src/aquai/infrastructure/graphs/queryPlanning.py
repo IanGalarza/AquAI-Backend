@@ -102,7 +102,9 @@ def build_query_planning_graph(
         if state.retrieval is None:
             raise ValueError("El nodo Planner requiere el resultado de recuperación.")
         started = perf_counter()
-        result = await planner.handle(analytical_state(state).question, state.retrieval)
+        result = await planner.handle(analytical_state(state).question, state.retrieval,
+                                      original_question=state.question,
+                                      data_mentions=[item for item in state.routing.data_mentions if not isinstance(item, str)])
         return {
             "planning": result, "status": result.status,
             "pending_operations": [step.id for step in result.operations],

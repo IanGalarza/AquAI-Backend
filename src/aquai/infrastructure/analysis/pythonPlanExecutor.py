@@ -91,7 +91,7 @@ class DeterministicPythonPlanExecutor:
             rows = None
             try:
                 budget.check()
-                if step.operation not in {"aggregate", "calculate", "sort", "visualize"}:
+                if step.operation not in {"aggregate", "calculate", "sort", "latest", "visualize"}:
                     raise AnalysisBlocked("unsupported_operation", "La operación todavía no está habilitada en Python.")
                 parents = [records.get(parent) for parent in step.depends_on]
                 if len(parents) != 1 or parents[0] is None:

@@ -39,6 +39,7 @@ def filter_rows(rows, filters, fields, budget):
                 return False
             return {
                 "eq": lambda: value == values[0], "ne": lambda: value != values[0],
+                "ieq": lambda: value.lower() == values[0].lower(),
                 "lt": lambda: value < values[0], "le": lambda: value <= values[0],
                 "gt": lambda: value > values[0], "ge": lambda: value >= values[0],
                 "in": lambda: value in values, "not_in": lambda: value not in values,
@@ -120,6 +121,12 @@ def tabular_operation(step, rows, parent_fields, settings, budget):
     if memory * 4 > settings.max_memory_bytes:
         raise AnalysisBlocked("memory_limit", "La tabla y sus copias de trabajo exceden el presupuesto de memoria.")
     warnings, exclusions = [], []
+    if step.operation == "latest":
+        name = step.order_by[0].field.field
+        dated = [row for row in filtered if row[name] is not None]
+        maximum = max((row[name] for row in dated), default=None)
+        output = [row for row in dated if row[name] == maximum]
+        return output, exclusions, warnings, len(rows) - len(output)
     if step.operation == "sort":
         for ordering in reversed(step.order_by):
             budget.check()

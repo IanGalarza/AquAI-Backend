@@ -63,6 +63,7 @@ def compile_step(step: ValidatedStep, compiled: dict[str, CompiledStep], tables:
             values.append(value)
         operators = {
             "eq": lambda: column == values[0], "ne": lambda: column != values[0],
+            "ieq": lambda: pg.lower(column) == values[0].lower(),
             "lt": lambda: column < values[0], "le": lambda: column <= values[0],
             "gt": lambda: column > values[0], "ge": lambda: column >= values[0],
             "in": lambda: column.in_(values), "not_in": lambda: column.not_in(values),
@@ -77,6 +78,15 @@ def compile_step(step: ValidatedStep, compiled: dict[str, CompiledStep], tables:
                    for calculation in step.calculations}
         if len(cohorts) > 1:
             raise UnsupportedSqlOperation("Los cálculos por fila con operandos o políticas de nulos diferentes deben planificarse por separado para no alterar sus cohortes.")
+    if step.operation == "latest":
+        # El máximo se calcula sobre el mismo alcance filtrado y se conservan
+        # todas sus filas, incluidos duplicados y mediciones con igual fecha.
+        cohort = select(*(source.c[column.name] for column in step.output_fields)).where(*predicates).subquery()
+        name = step.order_by[0].field.field
+        maximum = select(pg.max(cohort.c[name])).correlate(None).scalar_subquery()
+        statement = select(*(cohort.c[column.name] for column in step.output_fields)).where(
+            cohort.c[name] == maximum).order_by(cohort.c[name].desc())
+        return CompiledStep(statement, ancestors, dataset_ids, step.output_fields)
     if step.operation == "read":
         projections = [resolve(ref).label(ref.column) for ref in step.columns]
     elif step.operation == "sort":

@@ -178,7 +178,7 @@ class ValidateEvidenceHandler:
         requested_ancestors = {key for output in plan.output_steps for key in ancestors[output]}
         for step in plan.operations:
             if (step.id in complete and valid.get(step.id) and records[step.id].materialized
-                    and (step.id in plan.output_steps or (step.id in requested_ancestors and step.operation in {"aggregate", "calculate", "sort"}))):
+                    and (step.id in plan.output_steps or (step.id in requested_ancestors and step.operation in {"aggregate", "calculate", "sort", "latest"}))):
                 result.usable_evidence.append(EvidenceReference(evidence_id=f"e{len(result.usable_evidence) + 1}",
                     operation_id=step.id, tool=step.tool, kind="visualization" if step.operation == "visualize" else "table",
                     dataset_ids=sorted(ids[step.id], key=str), rows=records[step.id].rows_returned,

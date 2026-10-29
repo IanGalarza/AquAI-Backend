@@ -8,7 +8,7 @@ from aquai.application.contracts.planning import DatasetSelection, PlannableDeci
 from aquai.application.contracts.retrieval import VerifiedDataset
 from aquai.application.errors import PlannerValidationError
 from aquai.application.interfaces.execution import SqlPlanExecutor
-from aquai.application.planning.validation import validate_operations, validate_selections
+from aquai.application.planning.validation import validate_operations, validate_selections, validate_temporal_scope
 
 
 def validate_execution_plan(plan: PlanningResult, catalog: list[VerifiedDataset]):
@@ -31,6 +31,9 @@ def validate_execution_plan(plan: PlanningResult, catalog: list[VerifiedDataset]
         )):
             raise PlannerValidationError("Los metadatos autorizados cambiaron; hay que volver a planificar.")
     operations, issues = validate_operations(decision, selected)
+    issues.extend(validate_temporal_scope(operations, plan.output_steps,
+        require_latest=plan.context.evidence.get("temporal_requirements", {}).get("operation") == "latest",
+        requested_values=[item["text"] for item in plan.context.evidence.get("query_mentions", []) if item["kind"] == "value"]))
     if any(issue.severity == "clarification" for issue in issues):
         raise PlannerValidationError("La operación requiere resolver una aclaración antes de ejecutarse.")
     if any(old.output_fields != new.output_fields for old, new in zip(plan.operations, operations, strict=True)):

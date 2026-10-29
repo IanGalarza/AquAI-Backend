@@ -1,6 +1,7 @@
 """Contexto acotado y enunciados cuyos valores se toman de evidencia autorizada."""
 
 from datetime import date, datetime
+from collections import Counter
 from decimal import Decimal
 from hashlib import sha256
 import json
@@ -8,6 +9,8 @@ import re
 
 from aquai.application.contracts.answering import ResponseContextRecord
 from aquai.application.execution import decode_rows
+from aquai.application.answering.presentation import format_number
+from aquai.application.units import is_ph_name, presentation_unit_status
 
 
 def response_language(question, preferred=None):
@@ -19,14 +22,18 @@ def response_language(question, preferred=None):
     return "en" if english > spanish else "es"
 
 
-def _value(value):
+def _value(value, language="es", *, exact=False):
     if value is None:
         return "null"
     if isinstance(value, (date, datetime)):
         return value.isoformat()
     if type(value) is bool:
         return "true" if value else "false"
-    return str(value)  # Decimal conserva todos los dígitos; no se redondea.
+    if isinstance(value, (Decimal, int, float)):
+        if exact:
+            return str(value).replace(".", ",") if language == "es" else str(value)
+        return format_number(value, language)
+    return str(value)  
 
 
 def _label(field, sources):
@@ -37,14 +44,22 @@ def _label(field, sources):
             column = next((item for item in dataset.columns_metadata if item.sql_name == ref.column), None)
             if column:
                 label = " ".join(column.original_name.split())
+                if is_ph_name(label):
+                    return "pH"
+                if column.unit:
+                    for suffix in (f" [{column.unit}]", f" ({column.unit})"):
+                        if label.endswith(suffix):
+                            label = label[:-len(suffix)]
+                            break
                 return label if len(label) <= 200 else column.sql_name
     return field.name
 
 
 def _unit(field, language):
-    if field.unit_status == "documented":
+    status = presentation_unit_status(field)
+    if status == "documented" and field.unit:
         return f" {field.unit}"
-    if field.unit_status == "unknown" and field.sql_type in {"NUMERIC", "BIGINT"}:
+    if status == "unknown" and field.sql_type in {"NUMERIC", "BIGINT"}:
         return " (unidad no documentada)" if language == "es" else " (unit not documented)"
     return ""
 
@@ -61,6 +76,8 @@ def _calculation_label(calculation, field, sources, language):
     }
     if calculation is None:
         return variable
+    if variable == "pH" and calculation.function == "mean":
+        return "pH promedio" if language == "es" else "mean pH"
     if calculation.function == "count" and not calculation.inputs:
         return "cantidad de registros" if language == "es" else "number of rows"
     label = labels[language][calculation.function]
@@ -72,6 +89,52 @@ def _calculation_label(calculation, field, sources, language):
     elif calculation.function == "stddev":
         label += f" (ddof={calculation.ddof})"
     return f"{label} de {variable}" if language == "es" else f"{label} of {variable}"
+
+
+def _group_scope(grouping, fields, row, sources, language):
+    parts = []
+    places = {"localidad", "ciudad", "municipio", "partido", "provincia", "locality", "city"}
+    for name, spec in grouping.items():
+        label, value = _label(fields[name], sources), _value(row[name], language)
+        if spec.time_grain != "raw":
+            grain = {"es": {"year": "año", "month": "mes", "day": "día"},
+                     "en": {"year": "year", "month": "month", "day": "day"}}[language][spec.time_grain]
+            parts.append(f"en el {grain} {value}" if language == "es" else f"in {grain} {value}")
+        elif label.casefold() in places and isinstance(row[name], str):
+            if value.isupper():
+                words = value.title().split()
+                value = " ".join(word.lower() if index and word.lower() in {"de", "del", "la", "las", "los", "y"}
+                                 else word for index, word in enumerate(words))
+            parts.append(f"de {value}" if language == "es" else f"in {value}")
+        else:
+            parts.append(f"para {label} «{value}»" if language == "es" else f"for {label} '{value}'")
+    return " " + ", ".join(parts) if parts else ""
+
+
+def _source_intro(evidence, sources, language):
+    names = list(dict.fromkeys(sources[key].provenance.source_name for key in evidence.dataset_ids))
+    quoted = (" y " if language == "es" else " and ").join(f"«{name}»" for name in names)
+    return (f"Según los registros de {quoted}, " if language == "es" else f"According to the records in {quoted}, ") if names else ""
+
+
+def _latest_summary(rows, field, when, sources, language):
+    label = _label(field, sources)
+    if language == "es":
+        day = when.strftime("%d/%m/%Y")
+        if isinstance(when, datetime) and any((when.hour, when.minute, when.second, when.microsecond)):
+            day += " " + when.time().isoformat()
+    else:
+        day = when.isoformat()
+    counts = Counter(row[field.name] for row in rows)
+    parts = [(f"{count} sin dato" if language == "es" else f"{count} without a value") if value is None else
+             f"{count} {'con' if language == 'es' else 'with'} {_value(value, language)}{_unit(field, language)}"
+             for value, count in counts.items()]
+    values = (", ".join(parts[:-1]) + (" y " if language == "es" else " and ") + parts[-1]) if len(parts) > 1 else parts[0]
+    if language == "es":
+        noun = "registro" if len(rows) == 1 else "registros"
+        return f"La fecha más reciente en los datos consultados es el {day}, con {len(rows)} {noun} de {label}: {values}."
+    noun = "record" if len(rows) == 1 else "records"
+    return f"The most recent date in the queried data is {day}, with {len(rows)} {noun} for {label}: {values}."
 
 
 def build_response_context(state, budget_bytes, max_preview_rows=10, max_sentences=24):
@@ -87,6 +150,9 @@ def build_response_context(state, budget_bytes, max_preview_rows=10, max_sentenc
     body = {"question": state.question, "language": language, "status": validation.status,
         "conversation_context": [item.model_dump() for item in state.conversation_context],
         "history_is_not_evidence": True,
+        "number_presentation": {"max_decimal_places": 2, "small_value_significant_digits": 2,
+                                "decimal_separator": "," if language == "es" else ".",
+                                "exact_values": "Unchanged in the referenced execution results."},
         "scope": "Only validated operations of the retrieved candidates; never the entire catalog.",
         "sources": [{"dataset_id": str(item.dataset_id), "source_id": str(item.source_id), "name": item.dataset_name,
                      "version": item.version} for item in validation.sources],
@@ -118,12 +184,18 @@ def build_response_context(state, budget_bytes, max_preview_rows=10, max_sentenc
                      "en": {"bar": "bar", "line": "line", "scatter": "scatter", "histogram": "histogram"}}
             if language == "es":
                 noun = "fila" if chart.input_rows == 1 else "filas"
-                text = f"El gráfico de {names[language][chart.chart_type]} «{chart.title}» utiliza {chart.input_rows} {noun} del resultado verificado y documenta {chart.excluded_rows} exclusiones."
-                natural = f"Te adjunto el gráfico «{chart.title}», con {chart.input_rows} {noun} del resultado verificado y {chart.excluded_rows} exclusiones documentadas."
+                text = f"El gráfico de {names[language][chart.chart_type]} «{chart.title}» representa {chart.input_rows} {noun}."
+                natural = f"Podés ver el gráfico «{chart.title}», con {chart.input_rows} {noun}."
+                if chart.excluded_rows:
+                    text += f" Se excluyeron {chart.excluded_rows} filas."
+                    natural += f" Se excluyeron {chart.excluded_rows} filas."
             else:
                 noun = "row" if chart.input_rows == 1 else "rows"
-                text = f"The {names[language][chart.chart_type]} chart '{chart.title}' uses {chart.input_rows} {noun} of the verified result and records {chart.excluded_rows} exclusions."
-                natural = f"Here is the chart '{chart.title}', based on {chart.input_rows} {noun} of the verified result with {chart.excluded_rows} recorded exclusions."
+                text = f"The {names[language][chart.chart_type]} chart '{chart.title}' shows {chart.input_rows} {noun}."
+                natural = f"You can view the chart '{chart.title}', based on {chart.input_rows} {noun}."
+                if chart.excluded_rows:
+                    text += f" {chart.excluded_rows} rows were excluded."
+                    natural += f" {chart.excluded_rows} rows were excluded."
             add(evidence, text, natural, required=True)
         else:
             noun = ("fila" if evidence.rows == 1 else "filas") if language == "es" else ("row" if evidence.rows == 1 else "rows")
@@ -142,19 +214,30 @@ def build_response_context(state, budget_bytes, max_preview_rows=10, max_sentenc
             ancestor = visit.pop()
             chain.append(ancestor)
             visit.extend(steps[key] for key in ancestor.depends_on)
-        operators = {"es": {"eq": "=", "ne": "≠", "lt": "<", "le": "≤", "gt": ">", "ge": "≥", "in": "en",
-                            "not_in": "fuera de", "is_null": "es nulo", "is_not_null": "no es nulo"},
-                     "en": {"eq": "=", "ne": "≠", "lt": "<", "le": "≤", "gt": ">", "ge": "≥", "in": "in",
-                            "not_in": "not in", "is_null": "is null", "is_not_null": "is not null"}}
+        operators = {"es": {"eq": "igual a", "ieq": "igual a (sin distinguir mayúsculas)", "ne": "distinto de", "lt": "menor que", "le": "menor o igual que",
+                            "gt": "mayor que", "ge": "mayor o igual que", "in": "incluido en",
+                            "not_in": "fuera de", "is_null": "sin valor", "is_not_null": "con valor"},
+                     "en": {"eq": "equal to", "ieq": "equal to (case insensitive)", "ne": "different from", "lt": "less than", "le": "less than or equal to",
+                            "gt": "greater than", "ge": "greater than or equal to", "in": "included in",
+                            "not_in": "not in", "is_null": "missing", "is_not_null": "not missing"}}
         filters = []
         for ancestor in reversed(chain):
             for predicate in ancestor.filters:
                 name = predicate.field.column if predicate.field.kind == "column" else predicate.field.field
-                filters.append(name + " " + operators[language][predicate.operator] + " " + ", ".join(_value(value) for value in predicate.values))
+                parent = ancestor if predicate.field.kind == "column" else steps[predicate.field.step_id]
+                field = next((item for item in parent.output_fields if item.name == name), None)
+                label = _label(field, sources) if field else name
+                # Los umbrales definen el alcance exacto: no se redondean como
+                # un resultado de presentación (p. ej., > 7,149 no es > 7,15).
+                values = ", ".join(_value(value, language, exact=True) for value in predicate.values)
+                filters.append(f"{label} {operators[language][predicate.operator]} {values}".rstrip())
         if filters:
-            add(evidence, ("Alcance de los filtros: " if language == "es" else "Filter scope: ") + "; ".join(filters) + ".", required=True)
+            add(evidence, ("Se consideraron registros con " if language == "es" else "Records were selected with ") + "; ".join(filters) + ".", required=True)
         origin = step
-        while origin.operation == "sort":
+        latest = None
+        while origin.operation in {"sort", "latest"}:
+            if origin.operation == "latest":
+                latest = origin
             origin = steps[origin.depends_on[0]]
         calculations = {item.output_name: item for item in origin.calculations}
         grouping = {item.output_name: item for item in origin.group_by}
@@ -162,31 +245,38 @@ def build_response_context(state, budget_bytes, max_preview_rows=10, max_sentenc
         rows = decode_rows(record, record.columns)
         fields = {field.name: field for field in record.columns}
         represented = 0
-        for row in rows[:max_preview_rows]:
-            group_parts = [f"{_label(fields[name], sources)}={_value(row[name])}"
-                           + (f" ({spec.time_grain})" if spec.time_grain != "raw" else "") for name, spec in grouping.items()]
-            prefix = ("Para " if language == "es" else "For ") + ", ".join(group_parts) + ", " if group_parts else ""
+        numeric = [field for field in record.columns if field.numeric_eligible and field.sql_type in {"NUMERIC", "BIGINT"}]
+        if latest and rows and len(rows) <= max_preview_rows and len(numeric) == 1:
+            when = rows[0][latest.order_by[0].field.field]
+            text = _latest_summary(rows, numeric[0], when, sources, language)
+            if add(evidence, text, _source_intro(evidence, sources, language) + text[:1].lower() + text[1:]):
+                represented = len(rows)
+        for row in ([] if represented else rows[:max_preview_rows]):
+            scope = _group_scope(grouping, fields, row, sources, language)
             candidates = []
             for name, field in fields.items():
                 if name in grouping:
                     continue
                 label = _calculation_label(calculations.get(name), field, sources, language)
-                value = _value(row[name])
+                value = _value(row[name], language)
                 if row[name] is None:
-                    description = f"{label}: sin valor calculable (null)" if language == "es" else f"{label}: no computable value (null)"
+                    description = (f"no hay un valor calculable de {label}{scope}" if language == "es"
+                                   else f"there is no computable value for {label}{scope}")
                 else:
                     if language == "es":
                         calculation = calculations.get(name)
                         feminine = calculation and (calculation.function in {"sum", "median", "difference", "correlation"}
                                                      or (calculation.function == "count" and not calculation.inputs))
                         subject = ("la " if feminine else "el ") + label if calculation else "el valor de " + label
-                        description = f"{subject} es {value}{_unit(field, language)}"
+                        description = f"{subject}{scope} fue de {value}{_unit(field, language)}"
                     else:
-                        description = f"the {label} is {value}{_unit(field, language)}"
+                        description = f"the {label}{scope} was {value}{_unit(field, language)}"
                 candidates.append(description)
             # Una fila se incluye íntegra o se conserva sólo como referencia estructurada.
-            if add(evidence, prefix + "; ".join(candidates) + ".",
-                   prefix + ("en los datos analizados, " if language == "es" else "in the analyzed data, ") + "; ".join(candidates) + "."):
+            if not candidates:
+                candidates = [scope.strip()]
+            text = "; ".join(candidates) + "."
+            if add(evidence, text[:1].upper() + text[1:], _source_intro(evidence, sources, language) + text):
                 represented += 1
             else:
                 break
@@ -209,7 +299,7 @@ def build_response_context(state, budget_bytes, max_preview_rows=10, max_sentenc
             if key in seen or not (exclusion.null_rows or exclusion.zero_divisions):
                 continue
             seen.add(key)
-            group = ", ".join(f"{name}={_value(value)}" for name, value in exclusion.group.items())
+            group = ", ".join(f"{name}={_value(value, language)}" for name, value in exclusion.group.items())
             if language == "es":
                 text = f"{group + ': ' if group else ''}Se registraron {exclusion.valid_rows} entradas completas, {exclusion.null_rows} entradas nulas y {exclusion.zero_divisions} divisiones por cero, con política {exclusion.policy}."
             else:
@@ -223,5 +313,5 @@ def build_response_context(state, budget_bytes, max_preview_rows=10, max_sentenc
     while body["conversation_context"] and len(serialized()) > budget_bytes:
         body["conversation_context"].pop(0)
     content = serialized()
-    return ResponseContextRecord(evidence=body, sha256=sha256(content).hexdigest(), size_bytes=len(content),
+    return ResponseContextRecord(prompt_version="aquai-response-v2", evidence=body, sha256=sha256(content).hexdigest(), size_bytes=len(content),
         budget_bytes=budget_bytes, omitted_rows=omitted), language

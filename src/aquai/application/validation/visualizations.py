@@ -7,7 +7,9 @@ from html import escape
 from math import isfinite
 
 from aquai.application.contracts.planning import OutputField
+from aquai.application.answering.presentation import chart_axis_formats, chart_hover_templates
 from aquai.application.errors import PlannerValidationError
+from aquai.application.units import presentation_unit_status
 
 
 def _check(condition, message):
@@ -87,6 +89,8 @@ def validate_visualization(chart, step, parent, rows, sources):
         _check(trace.get("type") == ("bar" if request.chart_type in {"bar", "histogram"} else "scatter"),
                "La figura cambia el tipo de representación.")
         _check(isinstance(trace.get("marker", {}).get("color"), str), "La figura agrega una codificación de color no documentada.")
+        _check(trace.get("hovertemplate") == chart_hover_templates(series, histogram=request.chart_type == "histogram"),
+               "Las etiquetas del gráfico modifican los valores de presentación autorizados.")
         if request.chart_type == "histogram":
             nonconstant = any(item.lower != item.upper for item in series.bins)
             xv = [item.lower / 2 + item.upper / 2 for item in series.bins] if nonconstant else [format(item.lower, ".17g") for item in series.bins]
@@ -113,11 +117,16 @@ def validate_visualization(chart, step, parent, rows, sources):
     if request.chart_type == "histogram" and all(item.lower == item.upper for series in chart.series for item in series.bins):
         x_type = "category"
     _check(layout.get("xaxis", {}).get("type") == x_type, "La figura cambia la escala horizontal.")
+    _check(layout.get("separators") == ",.", "La figura modifica el separador decimal de presentación.")
+    for key, value in chart_axis_formats(chart).items():
+        if key != "xaxis" or x_type == "linear":
+            _check(layout.get(key, {}).get("tickformat") == value, "El eje modifica la precisión de presentación autorizada.")
     for key, axis in (("xaxis", chart.x_axis), ("yaxis", chart.y_axis)):
         label = escape(axis.label)
-        if axis.field.unit_status == "documented" and axis.field.unit is not None:
+        status = presentation_unit_status(axis.field)
+        if status == "documented" and axis.field.unit is not None:
             label += f" [{escape(axis.field.unit)}]"
-        elif axis.field.unit_status == "unknown" and axis.field.sql_type in {"BIGINT", "NUMERIC"}:
+        elif status == "unknown" and axis.field.sql_type in {"BIGINT", "NUMERIC"}:
             label += " (unidad no documentada)"
         _check(layout.get(key, {}).get("title", {}).get("text") == label, "El eje de la figura modifica las unidades documentadas.")
     for key, value in {

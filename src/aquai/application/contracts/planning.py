@@ -20,7 +20,7 @@ class PlanModel(BaseModel):
 class ColumnRef(PlanModel):
     kind: Literal["column"]
     dataset_id: UUID
-    column: str = Field(min_length=1, max_length=63)
+    column: str = Field(min_length=1, max_length=63, description="sql_name exacto de una columna incluida en datasets[].columns para este mismo dataset_id.")
 
 
 class ResultRef(PlanModel):
@@ -35,13 +35,13 @@ ValueRef = Annotated[ColumnRef | ResultRef, Field(discriminator="kind")]
 class DatasetSelection(PlanModel):
     dataset_id: UUID
     version: int = Field(ge=1)
-    columns: list[str] = Field(min_length=1, max_length=1024)
+    columns: list[str] = Field(min_length=1, max_length=1024, description="Todos los sql_name que usan los read de este dataset, incluidos los necesarios para filtros y orden temporal; nunca nombres originales ni alias.")
     reason: str = Field(min_length=1, max_length=1500)
 
 
 class FilterSpec(PlanModel):
     field: ValueRef
-    operator: Literal["eq", "ne", "lt", "le", "gt", "ge", "in", "not_in", "is_null", "is_not_null"]
+    operator: Literal["eq", "ieq", "ne", "lt", "le", "gt", "ge", "in", "not_in", "is_null", "is_not_null"]
     values: list[str | int | float | bool] = Field(default_factory=list, max_length=100)
 
     @model_validator(mode="after")
@@ -126,7 +126,7 @@ class OrderingSpec(PlanModel):
 class PlanStep(PlanModel):
     id: Identifier
     tool: Literal["sql", "python"]
-    operation: Literal["read", "aggregate", "calculate", "sort", "join", "append", "visualize"]
+    operation: Literal["read", "aggregate", "calculate", "sort", "latest", "join", "append", "visualize"]
     depends_on: list[Identifier] = Field(default_factory=list, max_length=12)
     columns: list[ColumnRef] = Field(default_factory=list, max_length=1024)
     filters: list[FilterSpec] = Field(default_factory=list, max_length=30)
@@ -144,6 +144,7 @@ class ReadPlanStep(PlanStep):
     tool: Literal["sql"]
     depends_on: list[Identifier] = Field(default_factory=list, max_length=0)
     columns: list[ColumnRef] = Field(min_length=1, max_length=1024)
+    filters: list[FilterSpec] = Field(max_length=30, description="Filtros explícitos del alcance solicitado. Si hay query_mentions de kind=value, usá sus textos como valores de filtros en las columnas verificadas correspondientes.")
     group_by: list[GroupingSpec] = Field(default_factory=list, max_length=0)
     calculations: list[CalculationSpec] = Field(default_factory=list, max_length=0)
     join_on: list[JoinKey] = Field(default_factory=list, max_length=0)
@@ -155,6 +156,19 @@ class DependentPlanStep(PlanStep):
     depends_on: list[Identifier] = Field(min_length=1, max_length=1)
     columns: list[ColumnRef] = Field(default_factory=list, max_length=0)
     visualization: None = None
+
+
+class LatestOrderingSpec(PlanModel):
+    field: ResultRef
+    direction: Literal["desc"] = "desc"
+
+
+class LatestPlanStep(DependentPlanStep):
+    operation: Literal["latest"]
+    order_by: list[LatestOrderingSpec] = Field(min_length=1, max_length=1)
+    group_by: list[GroupingSpec] = Field(default_factory=list, max_length=0)
+    calculations: list[CalculationSpec] = Field(default_factory=list, max_length=0)
+    limit: None = None
 
 
 class VisualizePlanStep(DependentPlanStep):
@@ -176,7 +190,7 @@ class CombinePlanStep(PlanStep):
     visualization: None = None
 
 
-ProposedStep = Annotated[ReadPlanStep | DependentPlanStep | VisualizePlanStep | CombinePlanStep,
+ProposedStep = Annotated[ReadPlanStep | DependentPlanStep | LatestPlanStep | VisualizePlanStep | CombinePlanStep,
                          Field(discriminator="operation")]
 
 
@@ -242,7 +256,7 @@ class PlannerReply(PlanModel):
 
 
 class PlanningContextRecord(BaseModel):
-    prompt_version: str = "aquai-planner-v2"
+    prompt_version: str = "aquai-planner-v3"
     evidence: dict[str, JsonValue]
     sha256: str
     size_bytes: int
@@ -275,6 +289,14 @@ class ValidatedStep(PlanStep):
     output_fields: list[OutputField]
 
 
+class FilterValueResolution(PlanModel):
+    dataset_id: UUID
+    column: str
+    requested: str
+    resolved: str
+    method: Literal["unique_case_insensitive"] = "unique_case_insensitive"
+
+
 class PlanningResult(BaseModel):
     status: PlanningStatus
     llm_status: PlanningStatus | None
@@ -288,6 +310,7 @@ class PlanningResult(BaseModel):
     clarification_question: str | None = None
     warnings: list[str] = Field(default_factory=list)
     validation_issues: list[ValidationIssue] = Field(default_factory=list)
+    filter_value_resolutions: list[FilterValueResolution] = Field(default_factory=list)
     context: PlanningContextRecord
     model: str | None = None
     input_tokens: int | None = None

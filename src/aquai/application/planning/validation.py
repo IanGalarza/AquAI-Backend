@@ -9,11 +9,46 @@ from aquai.application.contracts.planning import (
 )
 from aquai.application.contracts.retrieval import VerifiedDataset
 from aquai.application.errors import PlannerValidationError
+from aquai.application.units import presentation_unit_status
 
 
 def _require(condition: bool, message: str) -> None:
     if not condition:
         raise PlannerValidationError(message)
+
+
+def validate_temporal_scope(operations, output_steps, *, require_latest=False, requested_values=()):
+    """El alcance temporal se revalida también antes de ejecutar y publicar."""
+    steps = {step.id: step for step in operations}
+    relevant, visit = set(), list(output_steps)
+    while visit:
+        key = visit.pop()
+        if key in relevant or key not in steps:
+            continue
+        relevant.add(key)
+        visit.extend(steps[key].depends_on)
+    targets = [step for step in operations if step.id in relevant and step.operation == "latest"]
+    issues, scopes = [], []
+    if require_latest and not targets:
+        issues.append(ValidationIssue(code="missing_latest_selection", severity="clarification",
+            message="La consulta pide recencia, pero el plan no selecciona la fecha máxima conservando sus mediciones empatadas."))
+    for target in targets:
+        values, visit = set(), [target]
+        while visit:
+            step = visit.pop()
+            for predicate in step.filters:
+                if predicate.operator in {"eq", "ieq", "in"}:
+                    values.update(value.casefold() for value in predicate.values if isinstance(value, str))
+            visit.extend(steps[key] for key in step.depends_on)
+        scopes.append(values)
+        if requested_values and not any(value.casefold() in values for value in requested_values):
+            issues.append(ValidationIssue(code="missing_requested_filter", severity="clarification", step_id=target.id,
+                message="La selección temporal omite los valores de filtro solicitados por el usuario."))
+    for value in requested_values:
+        if targets and not any(value.casefold() in scope for scope in scopes):
+            issues.append(ValidationIssue(code="missing_requested_filter", severity="clarification",
+                message=f"La selección temporal no conserva el filtro solicitado para «{value}»."))
+    return issues
 
 
 def validate_selections(decision: PlannerDecision, catalog: list[VerifiedDataset]) -> list[SelectedDataset]:
@@ -101,7 +136,7 @@ def validate_operations(decision: PlannerDecision, selected: list[SelectedDatase
             if step.tool == "sql" and steps[source].tool == "python":
                 issue("materialization_required", "El paso SQL queda pendiente: consumir resultados Python requiere una estrategia de materialización todavía no implementada.", step.id, "warning")
             fields = list(outputs[source].values())
-            if step.operation != "sort":
+            if step.operation not in {"sort", "latest"}:
                 _require(not step.order_by and step.limit is None, "Orden y límite requieren un paso sort explícito después del cálculo.")
             if step.operation == "visualize":
                 _require(step.tool == "python" and not step.group_by and not step.calculations and not step.filters,
@@ -123,6 +158,15 @@ def validate_operations(decision: PlannerDecision, selected: list[SelectedDatase
                 fields = []
             elif step.operation == "sort":
                 _require(not step.group_by and not step.calculations and bool(step.order_by), "sort sólo debe ordenar/filtrar/limitar un resultado previo.")
+            elif step.operation == "latest":
+                _require(not step.group_by and not step.calculations and step.limit is None
+                         and len(step.order_by) == 1 and step.order_by[0].direction == "desc",
+                         "latest requiere una fecha descendente, sin agregaciones ni límites que corten empates.")
+                temporal = resolve(step.order_by[0].field)
+                _require(temporal.sql_type in {"DATE", "TIMESTAMP"},
+                         "latest requiere una fecha real DATE/TIMESTAMP; no ordena fechas TEXT ni números de fila.")
+                if source in limited_steps:
+                    issue("limited_latest_input", "La fecha más reciente requiere la entrada completa; no se calcula sobre una lectura limitada.", step.id)
             else:
                 _require(bool(step.calculations), "El paso debe declarar cálculos.")
                 if source in limited_steps:
@@ -166,7 +210,7 @@ def validate_operations(decision: PlannerDecision, selected: list[SelectedDatase
                                 issue("unverified_units", "La operación necesita unidades comparables documentadas; no se infieren equivalencias ni conversiones.", step.id)
                         if function in {"ratio", "correlation"}:
                             unit, unit_status = None, "dimensionless"
-                        elif unit is None and sql_type in {"BIGINT", "NUMERIC"}:
+                        elif presentation_unit_status(operands[0]) == "unknown" and sql_type in {"BIGINT", "NUMERIC"}:
                             issue("undocumented_unit", "El resultado conserva una unidad desconocida; no se infiere a partir del nombre.", step.id, "warning")
                     fields.append(OutputField(
                         name=calculation.output_name, sql_type=sql_type,
@@ -176,6 +220,8 @@ def validate_operations(decision: PlannerDecision, selected: list[SelectedDatase
 
         for predicate in step.filters:
             field = resolve(predicate.field)
+            _require(predicate.operator != "ieq" or field.sql_type == "TEXT",
+                     "ieq sólo admite igualdad literal de columnas TEXT sin distinguir mayúsculas.")
             if predicate.operator in {"lt", "le", "gt", "ge"} and field.sql_type == "TEXT":
                 issue("text_range", "Un rango sobre TEXT necesita confirmar si el orden es textual, numérico o temporal.", step.id)
             for value in predicate.values:
@@ -191,7 +237,15 @@ def validate_operations(decision: PlannerDecision, selected: list[SelectedDatase
                         except ValueError as error:
                             raise PlannerValidationError("El filtro temporal no usa una fecha ISO completa.") from error
         for ordering in step.order_by:
-            resolve(ordering.field)
+            field = resolve(ordering.field)
+            _require(not (step.limit == 1 and field.sql_type in {"DATE", "TIMESTAMP"}),
+                     "Un límite de una fila sobre fechas puede elegir arbitrariamente un empate; usá latest para conservar todas las mediciones.")
+        if step.limit is not None:
+            ancestors = list(step.depends_on)
+            while ancestors:
+                ancestor = steps[ancestors.pop()]
+                _require(ancestor.operation != "latest", "No se permite recortar con un límite las mediciones empatadas de latest.")
+                ancestors.extend(ancestor.depends_on)
         _require(len({field.name for field in fields}) == len(fields), "Las columnas de salida de un paso deben tener nombres únicos.")
         validated = ValidatedStep(**step.model_dump(), output_fields=fields)
         steps[step.id] = validated

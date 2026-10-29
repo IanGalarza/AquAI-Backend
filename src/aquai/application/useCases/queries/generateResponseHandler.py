@@ -90,7 +90,7 @@ class GenerateResponseHandler:
                         or any(key not in refs for key in sentence.evidence_ids)):
                     raise LLMProviderError("La redacción cita evidencia no autorizada.")
                 paragraphs.append(entry[sentence.variant] + " " + " ".join(f"[{key}]" for key in entry["evidence_ids"]))
-            response.answer = self._message(validation.status, language) + "\n\n" + "\n\n".join(paragraphs)
+            response.answer = "\n\n".join(filter(None, [self._message(validation.status, language), *paragraphs]))
             response.generation.status = "generated"
         except LLMProviderError as error:
             response.status = "failed"
@@ -121,18 +121,18 @@ class GenerateResponseHandler:
     @staticmethod
     def _message(status, language):
         messages = {
-            "es": {"validated": "Estos son los resultados obtenidos.",
-                   "partial": "Pude resolver sólo una parte de la consulta. Los resultados siguientes están verificados; quedan operaciones pendientes o con errores.",
+            "es": {"validated": "",
+                   "partial": "Pude responder parte de la consulta; quedan operaciones pendientes o con errores.",
                    "needs_clarification": "Necesito una aclaración para continuar.",
                    "insufficient_coverage": "No encontré evidencia suficiente entre los candidatos recuperados para responder esta pregunta; esto no demuestra que la información no exista en todo el catálogo.",
                    "failed": "No dispongo de resultados completos y verificables para responder de forma confiable.",
-                   "generation_failed": "No pude generar una explicación verificable con el modelo. Estos son los resultados disponibles, presentados de forma determinística."},
-            "en": {"validated": "Here are the results.",
-                   "partial": "I could resolve only part of the question. The following results are verified; some operations remain pending or failed.",
+                   "generation_failed": "No pude completar la redacción verificada. Los valores que siguen provienen de la evidencia validada."},
+            "en": {"validated": "",
+                   "partial": "I could answer part of the question; some operations remain pending or failed.",
                    "needs_clarification": "I need a clarification to continue.",
                    "insufficient_coverage": "There is insufficient evidence among the retrieved candidates to answer this question; this does not establish that the information is absent from the entire catalog.",
                    "failed": "I do not have complete, verifiable results to answer reliably.",
-                   "generation_failed": "The model did not produce a verifiable explanation. The available results are presented deterministically below."},
+                   "generation_failed": "I could not complete the verified wording. The values below come from validated evidence."},
         }
         return messages[language].get(status, messages[language]["failed"])
 

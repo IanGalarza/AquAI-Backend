@@ -23,8 +23,21 @@ Una pregunta autocontenida no debe heredar fuentes de turnos anteriores.
 source_mentions sólo incluye nombres o identificadores de fuentes/archivos/datasets
 explícitos, copiados LITERALMENTE de la pregunta actual. 'ABSA' puede ser una mención.
 Si el nombre aparece sólo en el historial, dejá source_mentions vacío y citá el mensaje.
-No extraigas variables o temas como nombres de archivo. 'esta fuente' requiere historial,
-no es un nombre de fuente. Python resolverá las menciones contra el catálogo real.
+data_mentions contiene objetos {text:<fragmento LITERAL>,kind:variable|value|date}:
+variable identifica el parámetro medido; value, la localidad, estación, sitio u otro
+valor que acota registros; date, una fecha o período solicitado. En una consulta de
+mediciones de una localidad incluí AMBAS menciones, la variable y la localidad.
+Estos valores no son fuentes aunque
+sean nombres propios o aparezcan después de 'de' o 'en'. No dupliques esas menciones
+en source_mentions. Una consulta de la última medición en una localidad es data;
+no requiere conocer de antemano el archivo ni pedir al usuario una fuente con el
+nombre de la localidad. Retriever y Planner identificarán datasets y filtros.
+'Último dato' y 'más reciente' piden una nueva consulta temporal, no recordar el
+último mensaje del chat. No elijas vos una medición ni una fecha.
+Una referencia como 'archivo <nombre>.xlsx' sí identifica explícitamente una fuente.
+'esta fuente' requiere historial; no es un nombre de fuente. Python resolverá las
+identidades contra nombres e identificadores reales del catálogo. Una mención
+temática sin identidad comprobada debe seguir por recuperación semántica.
 No inventes UUID, columnas, fuentes, unidades, valores ni una pregunta reescrita.
 No produzcas SQL ni Python. reason es un motivo breve, nunca razonamiento interno.
 language indica es o en según el idioma del usuario. Pedí aclaración en ese idioma.

@@ -164,7 +164,8 @@ class ConversationSnapshotBuilder:
                 "history_message_ids": [str(item) for item in turn.history_message_ids],
                 "history_messages": len(turn.history),
                 "history_used_by": "router,response_generator",
-                "followup_resolution": "structured_history", "evidence_reused": reused},
+                "followup_resolution": "structured_history", "evidence_reused": reused,
+                "filter_value_resolutions": [item.model_dump(mode="json") for item in state.planning.filter_value_resolutions] if state.planning else []},
             validated_at=validation.verified_at,
         )
 

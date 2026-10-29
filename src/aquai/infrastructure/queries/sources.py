@@ -8,7 +8,7 @@ import re
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import Column, MetaData, Table, func, inspect, or_, select, tuple_
+from sqlalchemy import Column, MetaData, Table, Text, func, inspect, or_, select, tuple_
 from sqlalchemy.exc import DBAPIError, NoSuchTableError
 from sqlalchemy.orm import Session
 
@@ -58,11 +58,10 @@ class SqlAlchemySourceQueries:
         self._verification_session = session
 
     def matching_datasets(self, reference: str) -> list[CatalogDataset]:
-        """Coincidencias literales en metadatos; no decide relevancia científica."""
+        """Resuelve identidades por nombres/UUID; las descripciones no son nombres."""
         reference = reference.strip()
         fields = (
-            Source.name, Source.original_filename, Source.description,
-            Dataset.name, Dataset.description, Dataset.semantic_description,
+            Source.name, Source.original_filename, Dataset.name,
         )
         predicates = [field.icontains(reference, autoescape=True) for field in fields]
         try:
@@ -113,6 +112,23 @@ class SqlAlchemySourceQueries:
         else:
             with self._context.session() as session:
                 yield session
+
+    def matching_column_values(self, dataset_id: UUID, version: int, column: str, value: str) -> list[str]:
+        """Consulta literales reales; nunca interpreta un valor como nombre de fuente."""
+        datasets = self.verified_datasets([dataset_id], versions={dataset_id: version})
+        if not datasets or not any(item.sql_name == column and item.sql_type == "TEXT"
+                                   for item in datasets[0].columns_metadata):
+            return []
+        table = Table(datasets[0].physical_table_name, MetaData(), Column(column, Text))
+        field = table.c[column]
+        with self._context.engine.connect() as connection, connection.begin():
+            connection.exec_driver_sql("SET TRANSACTION READ ONLY")
+            connection.execute(select(func.pg_catalog.set_config("statement_timeout", "2000", True)))
+            exact = connection.scalar(select(field).where(field == value).limit(1))
+            if exact is not None:
+                return [exact]
+            return list(connection.scalars(select(field).where(
+                func.pg_catalog.lower(field) == func.pg_catalog.lower(value)).distinct().limit(2)))
 
     def get(self, source_id: UUID, *, include_content: bool = False) -> dict[str, Any]:
         with self._context.session() as session:

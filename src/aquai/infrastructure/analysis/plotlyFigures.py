@@ -10,6 +10,8 @@ from plotly.io import to_json
 from plotly.offline import get_plotlyjs_version
 
 from aquai.application.contracts.execution import ChartAxis, PlotlyFigure, VisualizationResult
+from aquai.application.answering.presentation import chart_axis_formats, chart_hover_templates
+from aquai.application.units import presentation_unit_status
 from aquai.infrastructure.analysis.operations import AnalysisBlocked
 
 
@@ -19,9 +21,10 @@ _COLORS = ("#0072B2", "#D55E00", "#009E73", "#CC79A7", "#E69F00", "#56B4E9", "#0
 def _axis_title(axis: ChartAxis) -> str:
     label = escape(axis.label)
     field = axis.field
-    if field.unit_status == "documented" and field.unit is not None:
+    status = presentation_unit_status(field)
+    if status == "documented" and field.unit is not None:
         return f"{label} [{escape(field.unit)}]"
-    if field.unit_status == "unknown" and field.sql_type in {"BIGINT", "NUMERIC"}:
+    if status == "unknown" and field.sql_type in {"BIGINT", "NUMERIC"}:
         return f"{label} (unidad no documentada)"
     return label
 
@@ -58,7 +61,7 @@ def build_plotly_figure(chart: VisualizationResult) -> PlotlyFigure:
                                y=[item.count for item in series.bins])
             trace.update(customdata=[[
                 item.lower, item.upper, "]" if item.upper_inclusive else ")",
-            ] for item in series.bins], hovertemplate="[%{customdata[0]}, %{customdata[1]}%{customdata[2]}<br>Frecuencia: %{y}<extra></extra>")
+            ] for item in series.bins])
         elif chart.chart_type == "bar":
             trace = go.Bar(x=_x_values(chart, series), y=[point.y for point in series.points])
         else:
@@ -69,7 +72,8 @@ def build_plotly_figure(chart: VisualizationResult) -> PlotlyFigure:
             if chart.chart_type == "line":
                 trace.update(line={"shape": "linear", "width": 2,
                     "dash": ("solid", "dash", "dot", "dashdot")[index % 4]})
-        trace.update(name=name, marker_color=color)
+        trace.update(name=name, marker_color=color,
+                     hovertemplate=chart_hover_templates(series, histogram=chart.chart_type == "histogram"))
         figure.add_trace(trace)
 
     x_type = ("date" if chart.x_axis.field.sql_type in {"DATE", "TIMESTAMP"} else
@@ -96,8 +100,13 @@ def build_plotly_figure(chart: VisualizationResult) -> PlotlyFigure:
         else:
             y_axis.update(tickformat="d")
 
+    formats = chart_axis_formats(chart)
+    if x_type == "linear" and "xaxis" in formats:
+        x_axis["tickformat"] = formats["xaxis"]
+    if "yaxis" in formats:
+        y_axis["tickformat"] = formats["yaxis"]
     note = f"{chart.input_rows} filas de entrada; {chart.excluded_rows} excluidas."
-    if any(axis.field.unit_status == "unknown" and axis.field.sql_type in {"BIGINT", "NUMERIC"}
+    if any(presentation_unit_status(axis.field) == "unknown" and axis.field.sql_type in {"BIGINT", "NUMERIC"}
            for axis in (chart.x_axis, chart.y_axis)):
         note += " Hay unidades no documentadas."
     figure.update_layout(title={"text": escape(chart.title), "x": 0.5},
@@ -107,7 +116,7 @@ def build_plotly_figure(chart: VisualizationResult) -> PlotlyFigure:
         showlegend=len(chart.series) > 1 or chart.series_field is not None,
         legend={"title": {"text": escape(chart.series_field.name) if chart.series_field else ""}},
         barmode="group", bargap=0 if chart.chart_type == "histogram" and not constant_histogram else 0.2,
-        hovermode="closest", autosize=True,
+        hovermode="closest", autosize=True, separators=",.",
         annotations=[{"text": note, "xref": "paper", "yref": "paper", "x": 0, "y": -0.24,
                       "showarrow": False, "xanchor": "left", "font": {"size": 11, "color": "#555555"}}],
         meta={"operation_id": chart.operation_id, "chart_type": chart.chart_type,

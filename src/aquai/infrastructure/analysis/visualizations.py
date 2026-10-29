@@ -9,6 +9,7 @@ from aquai.application.contracts.execution import (
     ChartAxis, ChartPoint, ChartSeries, DatasetVersionReference, HistogramBin, VisualizationResult,
 )
 from aquai.application.contracts.planning import OutputField
+from aquai.application.units import presentation_unit_status
 from aquai.infrastructure.analysis.operations import AnalysisBlocked
 from aquai.infrastructure.analysis.plotlyFigures import build_plotly_figure
 
@@ -39,7 +40,7 @@ def create_visualization(step, rows, parent_fields, datasets, settings, budget, 
     warnings = [*(contextual_warnings or []), *(warning for item in datasets for warning in item.warnings),
                 "Los números del gráfico se convierten explícitamente a float64 sólo para presentación; los resultados analíticos conservan Decimal."]
     warnings.extend(f"La unidad de {field.name} no está documentada; se conserva como desconocida."
-                    for field in (x, y) if field.unit_status == "unknown" and field.sql_type in {"BIGINT", "NUMERIC"})
+                    for field in (x, y) if presentation_unit_status(field) == "unknown" and field.sql_type in {"BIGINT", "NUMERIC"})
     series = []
     excluded = 0
     if request.chart_type == "histogram":
