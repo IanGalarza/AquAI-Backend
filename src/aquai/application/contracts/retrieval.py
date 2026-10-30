@@ -48,9 +48,30 @@ class DatasetCandidate(VerifiedDataset):
     embedding_model: str
 
 
+class ValueMatch(BaseModel):
+    """Valores TEXT realmente almacenados que contienen la mención como palabras completas."""
+
+    column: str
+    values: list[str]
+    rows: int = Field(ge=0)
+
+
+class DatasetEvidence(BaseModel):
+    """Evidencia léxica y de registros; ordena candidatos sin decidir el plan."""
+
+    dataset_id: UUID
+    value_matches: dict[str, list[ValueMatch]] = Field(default_factory=dict)
+    variable_matches: dict[str, list[str]] = Field(default_factory=dict)
+    dimension_matches: dict[str, list[str]] = Field(default_factory=dict)
+
+
 class DatasetRetrievalResult(BaseModel):
     question: str
     candidates: list[DatasetCandidate | VerifiedDataset]
+    evidence: list[DatasetEvidence] = Field(default_factory=list)
+    unmatched_values: list[str] = Field(default_factory=list)
+    dimension_mentions: list[str] = Field(default_factory=list)
+    confirmed_values: list[str] = Field(default_factory=list)
     retrieval_method: Literal["semantic", "explicit"] = "semantic"
     verified_at: datetime
     status: Literal["candidates_available", "no_available_candidates"]

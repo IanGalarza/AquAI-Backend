@@ -19,7 +19,17 @@ def latest_requested(question: str) -> bool:
 
 
 def build_planning_context(question: str, datasets: list[VerifiedDataset], budget_bytes: int,
-                           *, temporal_candidates_excluded=(), require_latest=False, query_mentions=()) -> PlanningContextRecord:
+                           *, temporal_candidates_excluded=(), require_latest=False, query_mentions=(),
+                           temporal_text_columns=(), dataset_evidence=(), unmatched_values=(),
+                           source_mentions=()) -> PlanningContextRecord:
+    observed = [
+        {"dataset_id": str(item.dataset_id),
+         "values": {mention: [{"column": match.column, "stored_values": match.values[:30], "rows": match.rows}
+                              for match in matches] for mention, matches in item.value_matches.items()},
+         "variable_columns": item.variable_matches,
+         "requested_dimension_columns": item.dimension_matches}
+        for item in dataset_evidence
+    ]
     column_fields = ["sql_name", "original_name", "sql_type", "unit", "numeric_eligible", "annotations"]
     warnings = list(dict.fromkeys(warning for dataset in datasets for warning in dataset.warnings))
     column_catalogs = {}
@@ -60,8 +70,22 @@ def build_planning_context(question: str, datasets: list[VerifiedDataset], budge
             "exclude_null_measurements_before_latest": True,
             "candidates_without_verified_dates": list(temporal_candidates_excluded),
         }
+    if temporal_text_columns:
+        # Columnas TEXT cuyos valores distintos nombran períodos explícitos (12/2008, 2013-02-08).
+        evidence["text_period_columns"] = [
+            {"dataset_id": str(item.dataset_id), "column": item.column, "precisions": item.precisions}
+            for item in temporal_text_columns
+        ]
     if query_mentions:
         evidence["query_mentions"] = [item.model_dump(mode="json") for item in query_mentions]
+    if observed:
+        # Hechos observados en PostgreSQL: valores TEXT almacenados que contienen cada mención.
+        evidence["observed_evidence"] = observed
+    if unmatched_values:
+        evidence["values_not_found_in_candidates"] = list(unmatched_values)
+    if source_mentions:
+        # Nombres con los que el usuario eligió la fuente: ya definen los candidatos.
+        evidence["user_named_sources"] = list(source_mentions)
     compacted = []
 
     def serialized():

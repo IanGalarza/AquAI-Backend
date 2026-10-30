@@ -8,7 +8,7 @@ import re
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import Column, MetaData, Table, Text, func, inspect, or_, select, tuple_
+from sqlalchemy import Column, MetaData, Table, Text, func, inspect, literal, or_, select, tuple_, union_all
 from sqlalchemy.exc import DBAPIError, NoSuchTableError
 from sqlalchemy.orm import Session
 
@@ -105,6 +105,48 @@ class SqlAlchemySourceQueries:
                 ))
             return result
 
+    def catalog_overview(self) -> list[dict[str, Any]]:
+        """Inventario real de fuentes y datasets; nunca lee contenidos ni registros."""
+        with self._context.session() as session:
+            sources = session.execute(
+                select(
+                    Source.id, Source.name, Source.original_filename, Source.file_type,
+                    Source.is_active, Source.processing_status, Source.semantic_index_status,
+                    Source.created_at,
+                ).order_by(Source.created_at, Source.id)
+            ).mappings().all()
+            datasets = session.execute(
+                select(
+                    Dataset.id, Dataset.source_id, Dataset.name, Dataset.version,
+                    Dataset.row_count, Dataset.is_active, Dataset.queryable,
+                    Dataset.columns_metadata,
+                ).order_by(Dataset.created_at, Dataset.id)
+            ).mappings().all()
+        by_source: dict[UUID, list[dict[str, Any]]] = {}
+        for row in datasets:
+            by_source.setdefault(row["source_id"], []).append(row)
+        result = []
+        for source in sources:
+            ready = source["processing_status"] in {
+                ProcessingStatus.READY, ProcessingStatus.READY_WITH_WARNINGS,
+            }
+            result.append({
+                "source_id": source["id"], "name": source["name"],
+                "original_filename": source["original_filename"], "file_type": source["file_type"],
+                "is_active": source["is_active"], "processing_status": str(source["processing_status"]),
+                "semantic_index_status": str(source["semantic_index_status"]),
+                "created_at": source["created_at"],
+                "datasets": [{
+                    "dataset_id": row["id"], "name": row["name"], "version": row["version"],
+                    "row_count": row["row_count"], "is_active": row["is_active"],
+                    "available": bool(row["is_active"] and row["queryable"] and row["row_count"] > 0
+                                      and source["is_active"] and ready),
+                    "columns": [{key: column.get(key) for key in ("sql_name", "original_name", "sql_type", "unit")}
+                                for column in row["columns_metadata"]],
+                } for row in by_source.get(source["id"], [])],
+            })
+        return deepcopy(result)
+
     @contextmanager
     def _verified_session(self):
         if self._verification_session is not None:
@@ -129,6 +171,60 @@ class SqlAlchemySourceQueries:
                 return [exact]
             return list(connection.scalars(select(field).where(
                 func.pg_catalog.lower(field) == func.pg_catalog.lower(value)).distinct().limit(2)))
+
+    def find_text_values(self, datasets: list[VerifiedDataset], terms: list[str],
+                         *, per_column: int = 50) -> dict[UUID, dict[str, list[dict[str, Any]]]]:
+        """Valores TEXT reales que contienen cada término, sin distinguir mayúsculas ni acentos.
+
+        Devuelve candidatos amplios; la aplicación confirma la coincidencia por palabras.
+        """
+        accents, plain = "áàäâãéèëêíìïîóòöôõúùüûñç", "aaaaaeeeeiiiiooooouuuunc"
+        result: dict[UUID, dict[str, list[dict[str, Any]]]] = {}
+        patterns = {}
+        for term in terms:
+            words = re.findall(r"\w+", term.casefold().translate(str.maketrans(accents, plain)))
+            if words:
+                patterns[term] = "%" + "%".join(words) + "%"
+        if not patterns:
+            return result
+        with self._context.engine.connect() as connection, connection.begin():
+            connection.exec_driver_sql("SET TRANSACTION READ ONLY")
+            connection.execute(select(func.pg_catalog.set_config("statement_timeout", "3000", True)))
+            for dataset in datasets:
+                columns = [item.sql_name for item in dataset.columns_metadata if item.sql_type == "TEXT"]
+                if not columns or not re.fullmatch(r"dataset_[0-9a-f]{32}", dataset.physical_table_name):
+                    continue
+                table = Table(dataset.physical_table_name, MetaData(), *(Column(name, Text) for name in columns))
+                for term, pattern in patterns.items():
+                    parts = []
+                    for name in columns:
+                        field = table.c[name]
+                        normalized = func.pg_catalog.translate(func.pg_catalog.lower(field), accents, plain)
+                        parts.append(
+                            select(literal(name).label("column"), field.label("value"), func.count().label("rows"))
+                            .where(normalized.like(pattern)).group_by(field).limit(per_column)
+                        )
+                    for row in connection.execute(union_all(*parts)).mappings():
+                        result.setdefault(dataset.dataset_id, {}).setdefault(term, []).append(dict(row))
+        return result
+
+    def distinct_text_values(self, dataset: VerifiedDataset, columns: list[str],
+                             *, limit: int = 500) -> dict[str, list[str]]:
+        """Valores distintos acotados de columnas TEXT verificadas, para perfilar su formato."""
+        names = [item.sql_name for item in dataset.columns_metadata
+                 if item.sql_type == "TEXT" and item.sql_name in columns]
+        if not names or not re.fullmatch(r"dataset_[0-9a-f]{32}", dataset.physical_table_name):
+            return {}
+        table = Table(dataset.physical_table_name, MetaData(), *(Column(name, Text) for name in names))
+        result = {}
+        with self._context.engine.connect() as connection, connection.begin():
+            connection.exec_driver_sql("SET TRANSACTION READ ONLY")
+            connection.execute(select(func.pg_catalog.set_config("statement_timeout", "3000", True)))
+            for name in names:
+                field = table.c[name]
+                result[name] = list(connection.scalars(
+                    select(field).where(field.is_not(None)).distinct().limit(limit + 1)))
+        return result
 
     def get(self, source_id: UUID, *, include_content: bool = False) -> dict[str, Any]:
         with self._context.session() as session:

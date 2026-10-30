@@ -1,6 +1,7 @@
 """Router conversacional y coordinación finita de los casos de uso existentes."""
 
 import asyncio
+import logging
 from collections.abc import Callable
 from time import perf_counter
 
@@ -19,6 +20,9 @@ from aquai.application.useCases.queries.generateDirectResponseHandler import (
     GenerateDirectResponseHandler,
 )
 from aquai.application.useCases.queries.routeQueryHandler import RouteQueryHandler
+
+
+_logger = logging.getLogger(__name__)
 
 
 def analytical_state(state: QueryResponseState) -> QueryResponseState:
@@ -74,7 +78,9 @@ def build_query_planning_graph(
         }
 
     async def respond_directly(state: QueryResponseState):
-        return {"response": await direct_response.handle(state)}
+        response = await direct_response.handle(state)
+        _logger.info("Turno route=%s status=%s etapas_ms=%s", state.routing.route, response.status, response.timings_ms)
+        return {"response": response}
 
     async def retrieve(state: QueryResponseState):
         nonlocal retriever
@@ -86,6 +92,8 @@ def build_query_planning_graph(
         result = await retriever.handle(
             query.question, limit=state.candidate_limit,
             dataset_bindings=state.routing.dataset_bindings,
+            data_mentions=[item for item in state.routing.data_mentions if not isinstance(item, str)],
+            tentative_values=state.routing.tentative_values,
         )
         return {
             "retrieval": result, "planning": None, "status": None, "execution": None,
@@ -104,7 +112,9 @@ def build_query_planning_graph(
         started = perf_counter()
         result = await planner.handle(analytical_state(state).question, state.retrieval,
                                       original_question=state.question,
-                                      data_mentions=[item for item in state.routing.data_mentions if not isinstance(item, str)])
+                                      data_mentions=[item for item in state.routing.data_mentions if not isinstance(item, str)],
+                                      request_history=state.routing.request_history,
+                                      source_mentions=state.routing.source_mentions)
         return {
             "planning": result, "status": result.status,
             "pending_operations": [step.id for step in result.operations],
@@ -142,6 +152,7 @@ def build_query_planning_graph(
     async def respond(state: QueryResponseState):
         response = await response_generator.handle(analytical_state(state))
         response.routing = state.routing
+        _logger.info("Turno route=data status=%s etapas_ms=%s", response.status, response.timings_ms)
         return {"response": response}
 
     builder = StateGraph(QueryResponseState, input_schema=QueryResponseInput)

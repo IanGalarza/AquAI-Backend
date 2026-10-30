@@ -9,6 +9,7 @@ from aquai.application.contracts.planning import (
 )
 from aquai.application.contracts.retrieval import VerifiedDataset
 from aquai.application.errors import PlannerValidationError
+from aquai.application.matching import contains_phrase
 from aquai.application.units import presentation_unit_status
 
 
@@ -38,16 +39,50 @@ def validate_temporal_scope(operations, output_steps, *, require_latest=False, r
             step = visit.pop()
             for predicate in step.filters:
                 if predicate.operator in {"eq", "ieq", "in"}:
-                    values.update(value.casefold() for value in predicate.values if isinstance(value, str))
+                    values.update(value for value in predicate.values if isinstance(value, str))
             visit.extend(steps[key] for key in step.depends_on)
         scopes.append(values)
-        if requested_values and not any(value.casefold() in values for value in requested_values):
+
+    def kept(value, scope):
+        # Una resolución a valores almacenados («5Punta piedras») conserva la mención pedida.
+        return any(item.casefold() == value.casefold() or contains_phrase(item, value) for item in scope)
+
+    for target, scope in zip(targets, scopes):
+        if requested_values and not any(kept(value, scope) for value in requested_values):
             issues.append(ValidationIssue(code="missing_requested_filter", severity="clarification", step_id=target.id,
                 message="La selección temporal omite los valores de filtro solicitados por el usuario."))
     for value in requested_values:
-        if targets and not any(value.casefold() in scope for scope in scopes):
+        if targets and not any(kept(value, scope) for scope in scopes):
             issues.append(ValidationIssue(code="missing_requested_filter", severity="clarification",
                 message=f"La selección temporal no conserva el filtro solicitado para «{value}»."))
+    if not requested_values or targets:
+        return issues
+    # Sin recencia: cada salida publicada debe acotarse a alguno de los valores pedidos y
+    # cada valor pedido debe aparecer en alguna salida (p. ej., un sitio nuevo tras una aclaración).
+    outputs = []
+    for key in output_steps:
+        if key not in steps:
+            continue
+        values, visit, seen = set(), [steps[key]], set()
+        while visit:
+            step = visit.pop()
+            if step.id in seen:
+                continue
+            seen.add(step.id)
+            for predicate in step.filters:
+                if predicate.operator in {"eq", "ieq", "in"}:
+                    values.update(value for value in predicate.values if isinstance(value, str))
+            visit.extend(steps[parent] for parent in step.depends_on if parent in steps)
+        outputs.append((key, values))
+    for key, scope in outputs:
+        if not any(kept(value, scope) for value in requested_values):
+            issues.append(ValidationIssue(code="missing_requested_filter", severity="clarification", step_id=key,
+                message=f"La salida {key} no se acota a ninguno de los valores pedidos: "
+                        + ", ".join(f"«{value}»" for value in requested_values) + "."))
+    for value in requested_values:
+        if outputs and not any(kept(value, scope) for _, scope in outputs):
+            issues.append(ValidationIssue(code="missing_requested_filter", severity="clarification",
+                message=f"Ninguna salida filtra por «{value}», que la consulta pide."))
     return issues
 
 
@@ -79,8 +114,10 @@ def validate_selections(decision: PlannerDecision, catalog: list[VerifiedDataset
     return result
 
 
-def validate_operations(decision: PlannerDecision, selected: list[SelectedDataset]) -> tuple[list[ValidatedStep], list[ValidationIssue]]:
+def validate_operations(decision: PlannerDecision, selected: list[SelectedDataset],
+                        temporal_text=()) -> tuple[list[ValidatedStep], list[ValidationIssue]]:
     datasets = {dataset.dataset_id: dataset for dataset in selected}
+    periods = {(item.dataset_id, item.column) for item in temporal_text}
     requested = {item.dataset_id: set(item.columns) for item in decision.datasets}
     steps = {}
     outputs: dict[str, dict[str, OutputField]] = {}
@@ -102,14 +139,20 @@ def validate_operations(decision: PlannerDecision, selected: list[SelectedDatase
     for step in decision.steps:
         _require(step.id not in steps, "Los identificadores de pasos deben ser únicos.")
         _require(len(set(step.depends_on)) == len(step.depends_on), "Un paso repite dependencias.")
-        _require(all(dependency in steps for dependency in step.depends_on), "El plan contiene un ciclo o dependencia futura/inexistente.")
+        _require(all(dependency in steps for dependency in step.depends_on),
+                 f"El plan contiene un ciclo o dependencia futura/inexistente: el paso {step.id} depende de {step.depends_on}.")
 
         def resolve(ref):
             if isinstance(ref, ColumnRef):
-                _require(step.operation == "read" and ref in step.columns, "Sólo read puede usar referencias directas, declaradas en columns.")
+                _require(step.operation == "read" and ref in step.columns,
+                 f"Sólo read puede usar referencias directas, declaradas en columns: el paso {step.id} usa la columna {ref.column}.")
                 return raw_field(ref)
-            _require(ref.step_id in step.depends_on, "La referencia debe provenir de una dependencia directa.")
-            _require(ref.field in outputs[ref.step_id], "La operación refiere a un resultado inexistente.")
+            _require(ref.step_id in step.depends_on,
+                     f"La referencia debe provenir de una dependencia directa: el paso {step.id} usa "
+                     f"{ref.step_id}.{ref.field}, pero depende de {step.depends_on}.")
+            _require(ref.field in outputs[ref.step_id],
+                     f"La operación refiere a un resultado inexistente: {ref.step_id} no expone «{ref.field}»; "
+                     f"expone {sorted(outputs[ref.step_id])}.")
             return outputs[ref.step_id][ref.field]
 
         if step.operation in {"join", "append"}:
@@ -126,7 +169,10 @@ def validate_operations(decision: PlannerDecision, selected: list[SelectedDatase
             _require(step.tool == "sql" and not step.depends_on and bool(step.columns), "read requiere SQL, columnas y ninguna dependencia.")
             _require(not step.group_by and not step.calculations, "read no puede ocultar agrupaciones ni cálculos.")
             ids = {ref.dataset_id for ref in step.columns}
-            _require(len(ids) == 1, "Cada read debe leer un único dataset; las combinaciones deben ser explícitas.")
+            _require(len(ids) == 1,
+                     f"Cada read debe leer un único dataset: el paso {step.id} mezcla columnas de {len(ids)} datasets. "
+                     "Usá un read por dataset y una rama independiente para cada uno (read -> sort, aggregate o latest "
+                     "propios) y poné el último paso de cada rama en output_steps.")
             used_datasets.update(ids)
             fields = [raw_field(ref) for ref in step.columns]
         else:
@@ -163,12 +209,22 @@ def validate_operations(decision: PlannerDecision, selected: list[SelectedDatase
                          and len(step.order_by) == 1 and step.order_by[0].direction == "desc",
                          "latest requiere una fecha descendente, sin agregaciones ni límites que corten empates.")
                 temporal = resolve(step.order_by[0].field)
-                _require(temporal.sql_type in {"DATE", "TIMESTAMP"},
-                         "latest requiere una fecha real DATE/TIMESTAMP; no ordena fechas TEXT ni números de fila.")
+                # Un TEXT sólo ordena si su columna fue perfilada como períodos explícitos;
+                # Python interpreta cada valor con las mismas reglas y descarta los ambiguos.
+                period = (temporal.sql_type == "TEXT" and len(temporal.sources) == 1
+                          and (temporal.sources[0].dataset_id, temporal.sources[0].column) in periods)
+                _require(temporal.sql_type in {"DATE", "TIMESTAMP"} or (period and step.tool == "python"),
+                         "latest requiere una fecha real DATE/TIMESTAMP o períodos TEXT verificados; no ordena textos libres ni números de fila.")
                 if source in limited_steps:
                     issue("limited_latest_input", "La fecha más reciente requiere la entrada completa; no se calcula sobre una lectura limitada.", step.id)
             else:
-                _require(bool(step.calculations), "El paso debe declarar cálculos.")
+                _require(bool(step.calculations), f"El paso {step.id} ({step.operation}) debe declarar cálculos.")
+                if (step.operation == "aggregate" and steps[source].operation == "aggregate"
+                        and not steps[source].group_by):
+                    # Agregar una única fila ya agregada (contarla, promediarla) no responde nada.
+                    issue("degenerate_aggregate", f"El paso {step.id} vuelve a agregar el resultado de {source}, que ya es "
+                          f"una única fila sin agrupación; publicá {source} en output_steps en lugar de agregarlo otra vez.",
+                          step.id)
                 if source in limited_steps:
                     issue("limited_calculation_input", "El cálculo depende de una lectura limitada; hay que precisar si se pretende calcular sobre una muestra.", step.id)
                 fields = []
@@ -218,6 +274,16 @@ def validate_operations(decision: PlannerDecision, selected: list[SelectedDatase
                         unit_status=unit_status, sources=list({(ref.dataset_id, ref.column): ref for ref in refs}.values()),
                     ))
 
+        equalities = {}
+        for predicate in step.filters:
+            if predicate.operator in {"eq", "ieq", "in"}:
+                key = predicate.field.model_dump_json()
+                values = {str(value).casefold() for value in predicate.values}
+                if key in equalities and not equalities[key] & values:
+                    issue("contradictory_filters", f"El paso {step.id} exige valores incompatibles en el mismo campo "
+                          f"({sorted(equalities[key])} y {sorted(values)}); ninguna fila puede cumplir ambos. "
+                          "Para varios valores usá in o ramas separadas.", step.id)
+                equalities[key] = equalities.get(key, values) & values or values
         for predicate in step.filters:
             field = resolve(predicate.field)
             _require(predicate.operator != "ieq" or field.sql_type == "TEXT",

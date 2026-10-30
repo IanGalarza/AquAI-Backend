@@ -141,9 +141,11 @@ def compile_step(step: ValidatedStep, compiled: dict[str, CompiledStep], tables:
         statement = statement.group_by(*grouping)
     if step.order_by:
         statement = statement.order_by(*(
-            resolve(order.field).asc() if order.direction == "asc" else resolve(order.field).desc()
+            # Un faltante no es un extremo: PostgreSQL pondría NULL primero en un orden descendente.
+            (resolve(order.field).asc() if order.direction == "asc" else resolve(order.field).desc()).nulls_last()
             for order in step.order_by
         ))
     if step.limit is not None:
-        statement = statement.limit(step.limit)
+        # Un límite sobre un orden nunca corta empates: el extremo pedido puede repetirse.
+        statement = statement.fetch(step.limit, with_ties=True) if step.order_by else statement.limit(step.limit)
     return CompiledStep(statement, ancestors, dataset_ids, step.output_fields, warnings)

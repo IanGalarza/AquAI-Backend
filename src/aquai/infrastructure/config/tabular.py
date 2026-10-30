@@ -16,6 +16,8 @@ class TabularSettings(BaseSettings):
     llm_timeout_seconds: float = Field(default=600, gt=0, allow_inf_nan=False)
     llm_num_ctx: int = Field(default=32768, ge=1024)
     llm_think: bool = False
+    # Tiempo que Ollama conserva los modelos cargados; sin valor rige su predeterminado (5m).
+    llm_keep_alive: str | None = Field(default=None, pattern=r"^-?\d+(?:\.\d+)?(?:ms|s|m|h)?$")
     max_upload_bytes: int = Field(default=10 * 1024 * 1024, gt=0)
     max_cells: int = Field(default=2_000_000, gt=0)
     max_sheets: int = Field(default=30, gt=0, le=30)

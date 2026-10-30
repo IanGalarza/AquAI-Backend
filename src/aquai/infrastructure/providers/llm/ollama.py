@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import logging
 import math
 from copy import deepcopy
 from datetime import date, datetime
@@ -65,6 +66,8 @@ class _OllamaClient:
         self._transport = transport
 
     async def post(self, path: str, payload: dict, timeout: float) -> dict:
+        if self._settings.llm_keep_alive is not None:
+            payload = {**payload, "keep_alive": self._settings.llm_keep_alive}
         try:
             async with _inference_lock():
                 async with httpx.AsyncClient(timeout=timeout, transport=self._transport) as client:
@@ -225,3 +228,17 @@ class OllamaEmbeddingProvider:
                 raise LLMProviderError("Ollama devolvió embeddings con dimensiones diferentes.")
             dimension = len(vector)
         return [[float(value) for value in vector] for vector in vectors]
+
+
+async def warm_up_models(settings: TabularSettings) -> None:
+    """Carga los modelos al iniciar para que la primera consulta no pague la carga."""
+    client = _OllamaClient(settings, None)
+    try:
+        # Mismo num_ctx que las consultas: otro tamaño obligaría a Ollama a recargar el modelo.
+        await client.post("/api/chat", {"model": settings.default_model, "messages": [],
+                                        "options": {"num_ctx": settings.llm_num_ctx}},
+                          settings.llm_timeout_seconds)
+        await client.post("/api/embed", {"model": settings.embedding_model, "input": ["warm-up"]},
+                          settings.embedding_timeout_seconds)
+    except LLMProviderError as error:
+        logging.getLogger(__name__).warning("No se pudieron precargar los modelos de Ollama: %s", error)

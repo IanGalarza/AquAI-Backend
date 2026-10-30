@@ -14,6 +14,7 @@ from aquai.application.execution import (
     execution_fingerprint, plan_fingerprint, sql_result_fingerprint, summarize_execution, validate_sql_transfer,
 )
 from aquai.application.errors import PlannerValidationError
+from aquai.application.planning.temporalText import period_bounds
 from aquai.application.useCases.queries.executeSqlPlanHandler import validate_execution_plan
 from aquai.infrastructure.analysis.operations import AnalysisBlocked, decode_rows, tabular_operation
 from aquai.infrastructure.analysis.visualizations import create_visualization
@@ -145,7 +146,8 @@ class DeterministicPythonPlanExecutor:
                     record.warnings.extend(chart.warnings)
                     record.rows = []
                 else:
-                    record.rows, record.exclusions, messages, filtered = tabular_operation(step, rows, parent.columns, settings, budget)
+                    record.rows, record.exclusions, messages, filtered = tabular_operation(
+                        step, rows, parent.columns, settings, budget, period_key=self._period_key(plan, step, parent.columns))
                     record.rows_filtered = filtered
                     record.warnings.extend(messages)
                     if filtered:
@@ -188,6 +190,25 @@ class DeterministicPythonPlanExecutor:
                 record.duration_ms = round((perf_counter() - operation_started) * 1000, 3)
                 rows = None  # No conserva tablas de trabajo entre pasos.
         return self._finish(result, plan, sql_result, started)
+
+    @staticmethod
+    def _period_key(plan, step, fields):
+        """Clave temporal de un latest sobre períodos TEXT autorizados por el plan."""
+        if step.operation != "latest":
+            return None
+        field = next((item for item in fields if item.name == step.order_by[0].field.field), None)
+        if field is None or field.sql_type != "TEXT" or len(field.sources) != 1:
+            return None
+        source = field.sources[0]
+        column = next((item for item in plan.temporal_text_columns
+                       if (item.dataset_id, item.column) == (source.dataset_id, source.column)), None)
+        if column is None:
+            return None
+
+        def key(value):
+            bounds = period_bounds(value, column.day_first)
+            return bounds[1] if bounds else None
+        return key
 
     def _output_budget(self, result):
         settings = self._settings

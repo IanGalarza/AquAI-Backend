@@ -7,7 +7,7 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field, JsonValue
 
 
-QueryRoute = Literal["general", "data", "historical", "needs_clarification", "failed"]
+QueryRoute = Literal["general", "catalog", "data", "historical", "needs_clarification", "failed"]
 
 
 class HistoricalAnalysis(BaseModel):
@@ -27,22 +27,28 @@ class HistoryMessage(BaseModel):
     text_complete: bool = True
     scientific: bool = False
     analysis: HistoricalAnalysis | None = None
+    # Una aclaración pendiente conserva la solicitud original y su contexto citado.
+    clarification: bool = False
+    pending_requests: list[str] = Field(default_factory=list, max_length=8)
+    context_message_ids: list[UUID] = Field(default_factory=list, max_length=4)
+    # Variables ya interpretadas en ese turno; un seguimiento sin variable nueva las conserva.
+    variables: list[str] = Field(default_factory=list, max_length=12)
 
 
 class DataMention(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
-    text: str = Field(min_length=1, max_length=200, description="Texto copiado literalmente de la pregunta actual.")
+    text: str = Field(min_length=1, max_length=200, description="Texto copiado literalmente de la pregunta actual o de una solicitud pendiente.")
     kind: Literal["variable", "value", "date"] = Field(description="variable: parámetro medido; value: valor de columna que acota registros, como una localidad o estación; date: fecha o período solicitado.")
 
 
 class RoutingDraft(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
-    route: Literal["general", "data", "historical", "needs_clarification"]
+    route: Literal["general", "catalog", "data", "historical", "needs_clarification"]
     language: Literal["es", "en"]
     context_required: bool
     history_message_ids: list[UUID] = Field(max_length=4)
-    source_mentions: list[str] = Field(max_length=4, description="Referencias explícitas a archivos, datasets o sus identificadores; nunca localidades, estaciones, variables ni fechas.")
-    data_mentions: list[DataMention] = Field(max_length=12, description="Identificá las variables, valores de columnas y fechas de la consulta; en una pregunta sobre una medición de una localidad incluí la variable y la localidad. No son fuentes.")
+    source_mentions: list[str] = Field(max_length=4, description="Nombres de archivos, fuentes o datasets copiados literalmente de la pregunta actual; nunca localidades, sitios, estaciones, variables ni fechas.")
+    data_mentions: list[DataMention] = Field(max_length=12, description="Variables, valores de columnas y fechas como menciones separadas: en 'pH de Punta Lara' son 'pH' (variable) y 'Punta Lara' (value). No son fuentes.")
     clarification_question: str | None = Field(max_length=500)
     reason: str = Field(min_length=1, max_length=400)
 
@@ -67,6 +73,7 @@ class CatalogDataset(BaseModel):
     source_name: str
     version: int
     available: bool
+    original_filename: str = ""
     exact: bool = False
     name_match: bool = False
 
@@ -81,6 +88,8 @@ class RoutingResult(BaseModel):
     dataset_bindings: list[DatasetBinding] = Field(default_factory=list)
     source_mentions: list[str] = Field(default_factory=list)
     data_mentions: list[DataMention | str] = Field(default_factory=list)
+    # Respuesta breve a una aclaración sin menciones: sólo cuenta si existe en los registros.
+    tentative_values: list[str] = Field(default_factory=list)
     context_used: bool = False
     question_contextualized: bool = False
     clarification_question: str | None = None

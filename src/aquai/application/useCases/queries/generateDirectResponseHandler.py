@@ -1,18 +1,28 @@
 """Respuestas generales y aclaraciones; no usa evidencia científica nueva."""
 
+import asyncio
+import re
 from time import perf_counter
 
+from aquai.application.answering.catalog import catalog_answer
 from aquai.application.contracts.answering import (
     GenerationRecord, QueryResponse, ResponseOperationReference, SourceReference,
 )
 from aquai.application.contracts.execution import ExecutionError
 from aquai.application.errors import LLMProviderError
 from aquai.application.interfaces.routing import GeneralResponseProvider
+from aquai.application.interfaces.sources import SourceQueries
+
+
+# Bloques o firmas de código: AquAI explica en palabras y no entrega programas.
+_CODE = re.compile(r"```|^\s*(?:def|class|import|from\s+\S+\s+import|SELECT|function|public\s+class)\b",
+                   re.IGNORECASE | re.MULTILINE)
 
 
 class GenerateDirectResponseHandler:
-    def __init__(self, provider: GeneralResponseProvider):
+    def __init__(self, provider: GeneralResponseProvider, catalog: SourceQueries | None = None):
         self._provider = provider
+        self._catalog = catalog
 
     async def handle(self, state):
         routing = state.routing
@@ -32,6 +42,8 @@ class GenerateDirectResponseHandler:
             return response
         if routing.route == "failed":
             return self._failure(response, "routing_failed", routing.error)
+        if routing.route == "catalog":
+            return await self._catalog_response(response, routing)
         messages = {
             item.message_id: item for item in state.conversation_history
         }
@@ -75,6 +87,15 @@ class GenerateDirectResponseHandler:
             if reply.draft.language != routing.language or not reply.draft.answer.strip():
                 raise LLMProviderError("La respuesta general no respeta el idioma solicitado.")
             response.answer = reply.draft.answer.strip()
+            if _CODE.search(response.answer):
+                response.answer = (
+                    "AquAI no genera código de programación. Puedo explicarte el concepto en palabras "
+                    "o ayudarte a analizar los datos que ya cargaste: promedios, máximos, últimas "
+                    "mediciones o gráficos." if routing.language == "es" else
+                    "AquAI does not write programming code. I can explain the concept in words or help "
+                    "you analyze the loaded data: averages, maxima, latest measurements or charts."
+                )
+                response.limitations.append("Se omitió código generado por el modelo.")
             response.generation.model = reply.model
             response.generation.status = "generated"
         except LLMProviderError as error:
@@ -85,6 +106,27 @@ class GenerateDirectResponseHandler:
             self._failure(response, "general_generation_failed", None)
         response.generation.duration_ms = round((perf_counter() - started) * 1000, 3)
         response.timings_ms["general"] = response.generation.duration_ms
+        return response
+
+    async def _catalog_response(self, response, routing):
+        """El inventario proviene de PostgreSQL en este turno, nunca del conocimiento del LLM."""
+        response.response_type = "catalog"
+        if self._catalog is None:
+            return self._failure(response, "catalog_unavailable", "El catálogo no está disponible.")
+        started = perf_counter()
+        try:
+            catalog = await asyncio.to_thread(self._catalog.catalog_overview)
+        except Exception:
+            return self._failure(response, "catalog_unavailable", "No se pudo consultar el catálogo de fuentes.")
+        response.answer = catalog_answer(
+            catalog, [item.dataset_id for item in routing.dataset_bindings], routing.language
+        )
+        response.limitations.append(
+            "Inventario consultado en PostgreSQL durante esta respuesta; no se leyeron registros de los datasets."
+            if routing.language == "es" else
+            "Inventory read from PostgreSQL for this answer; no dataset records were read."
+        )
+        response.timings_ms["catalog"] = round((perf_counter() - started) * 1000, 3)
         return response
 
     @staticmethod

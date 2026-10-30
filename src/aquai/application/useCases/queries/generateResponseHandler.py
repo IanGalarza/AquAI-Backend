@@ -13,8 +13,9 @@ from aquai.application.interfaces.answering import ResponseProvider
 
 
 class GenerateResponseHandler:
-    def __init__(self, provider: ResponseProvider, *, max_preview_rows=10):
+    def __init__(self, provider: ResponseProvider, *, max_preview_rows=10, deterministic_sentences=24):
         self._provider, self._max_preview_rows = provider, max_preview_rows
+        self._deterministic_sentences = deterministic_sentences
 
     async def handle(self, state: QueryResponseState) -> QueryResponse:
         started = perf_counter()
@@ -51,8 +52,10 @@ class GenerateResponseHandler:
                 response.answer += (" Información faltante: " if language == "es" else " Missing information: ") + "; ".join(validation.missing_information)
             return self._finish(response, started)
 
-        refs = {item.evidence_id: item for item in validation.usable_evidence}
         steps = {step.id: step for step in plan.operations}
+        # Los resultados derivados (promedio, máximo, último) responden; las filas leídas los respaldan.
+        refs = {item.evidence_id: item for item in sorted(
+            validation.usable_evidence, key=lambda item: steps[item.operation_id].operation == "read")}
         response.sources = list(validation.sources)
         response.operation_references = [ResponseOperationReference(evidence_id=item.evidence_id,
             operation_id=item.operation_id, tool=item.tool, dataset_ids=item.dataset_ids,
@@ -68,7 +71,19 @@ class GenerateResponseHandler:
         catalog = {item["sentence_id"]: item for item in context.evidence["sentence_catalog"]}
         if validation.status == "partial":
             response.answer = self._message("partial", language) + "\n\n" + "\n\n".join(
-                item["direct"] + " " + " ".join(f"[{key}]" for key in item["evidence_ids"]) for item in catalog.values())
+                item["direct"] + " " + " ".join(f"[{key}]" for key in item["evidence_ids"]) for item in self._ordered_entries(catalog, refs))
+            self._add_preview_note(response, context, language)
+            return self._finish(response, started)
+        if len(catalog) <= self._deterministic_sentences:
+            # El orden (resultado, alcance, detalles) y la variante (fuente en el primer resultado)
+            # ya están determinados; el modelo sólo elegía entre textos verificados y demoraba
+            # entre 4 y 24 s. Un umbral menor reactiva la redacción con el proveedor.
+            first = next((item["sentence_id"] for item in self._ordered_entries(catalog, refs)
+                          if item.get("kind") == "result"), None)
+            response.answer = "\n\n".join(filter(None, [self._message(validation.status, language), *(
+                item["conversational" if item["sentence_id"] == first else "direct"] + " "
+                + " ".join(f"[{key}]" for key in item["evidence_ids"])
+                for item in self._ordered_entries(catalog, refs))]))
             self._add_preview_note(response, context, language)
             return self._finish(response, started)
         response.generation.model = self._provider.model
@@ -84,7 +99,7 @@ class GenerateResponseHandler:
             if len(selected) != len(set(selected)) or set(selected) != set(catalog):
                 raise LLMProviderError("El modelo omitió, repitió o inventó enunciados de evidencia.")
             paragraphs = []
-            for sentence in reply.draft.sentences:
+            for sentence in self._ordered(reply.draft.sentences, catalog, refs):
                 entry = catalog[sentence.sentence_id]
                 if (sentence.evidence_ids != entry["evidence_ids"]
                         or any(key not in refs for key in sentence.evidence_ids)):
@@ -105,10 +120,26 @@ class GenerateResponseHandler:
             response.errors.append(response.generation.error)
             # El reemplazo seguro no publica texto del LLM y deja explícito el fallo.
             response.answer = self._message("generation_failed", language) + "\n\n" + "\n\n".join(
-                item["direct"] + " " + " ".join(f"[{key}]" for key in item["evidence_ids"]) for item in catalog.values())
+                item["direct"] + " " + " ".join(f"[{key}]" for key in item["evidence_ids"]) for item in self._ordered_entries(catalog, refs))
         response.generation.duration_ms = round((perf_counter() - model_started) * 1000, 3)
         self._add_preview_note(response, context, language)
         return self._finish(response, started)
+
+    @classmethod
+    def _ordered_entries(cls, catalog, refs):
+        rank = {"result": 0, "summary": 1, "chart": 2, "scope": 3, "detail": 4}
+        order = {key: index for index, key in enumerate(refs)}
+        return sorted(catalog.values(), key=lambda item: (
+            order.get(item["evidence_ids"][0], len(order)), rank.get(item.get("kind"), 4)))
+
+    @staticmethod
+    def _ordered(sentences, catalog, refs):
+        """Cada evidencia presenta primero su resultado y después su alcance y detalles."""
+        order = {key: index for index, key in enumerate(refs)}
+        rank = {"result": 0, "summary": 1, "chart": 2, "scope": 3, "detail": 4}
+        return sorted(sentences, key=lambda item: (
+            order.get(catalog[item.sentence_id]["evidence_ids"][0], len(order)),
+            rank.get(catalog[item.sentence_id].get("kind"), 4)))
 
     @staticmethod
     def _add_preview_note(response, context, language):
@@ -125,13 +156,13 @@ class GenerateResponseHandler:
                    "partial": "Pude responder parte de la consulta; quedan operaciones pendientes o con errores.",
                    "needs_clarification": "Necesito una aclaración para continuar.",
                    "insufficient_coverage": "No encontré evidencia suficiente entre los candidatos recuperados para responder esta pregunta; esto no demuestra que la información no exista en todo el catálogo.",
-                   "failed": "No dispongo de resultados completos y verificables para responder de forma confiable.",
+                   "failed": "No pude construir un análisis verificable para esta pregunta con los datos disponibles. Podés reformularla indicando la variable, el sitio o la fuente que querés usar.",
                    "generation_failed": "No pude completar la redacción verificada. Los valores que siguen provienen de la evidencia validada."},
             "en": {"validated": "",
                    "partial": "I could answer part of the question; some operations remain pending or failed.",
                    "needs_clarification": "I need a clarification to continue.",
                    "insufficient_coverage": "There is insufficient evidence among the retrieved candidates to answer this question; this does not establish that the information is absent from the entire catalog.",
-                   "failed": "I do not have complete, verifiable results to answer reliably.",
+                   "failed": "I could not build a verifiable analysis for this question with the available data. You can rephrase it with the variable, site or source you want to use.",
                    "generation_failed": "I could not complete the verified wording. The values below come from validated evidence."},
         }
         return messages[language].get(status, messages[language]["failed"])

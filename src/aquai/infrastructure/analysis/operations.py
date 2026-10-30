@@ -113,7 +113,7 @@ def _statistic(rows, calculation, precision, budget):
         return value, exclusion, warnings
 
 
-def tabular_operation(step, rows, parent_fields, settings, budget):
+def tabular_operation(step, rows, parent_fields, settings, budget, period_key=None):
     filtered = filter_rows(rows, step.filters, parent_fields, budget)
     frame = pd.DataFrame(filtered, columns=[field.name for field in parent_fields], dtype=object)
     # Incluye margen para claves, ordenamientos y copias temporales acotadas.
@@ -123,19 +123,31 @@ def tabular_operation(step, rows, parent_fields, settings, budget):
     warnings, exclusions = [], []
     if step.operation == "latest":
         name = step.order_by[0].field.field
-        dated = [row for row in filtered if row[name] is not None]
-        maximum = max((row[name] for row in dated), default=None)
-        output = [row for row in dated if row[name] == maximum]
+        # Un período TEXT se ordena por su fin explícito; los textos no interpretables se excluyen.
+        key = period_key or (lambda value: value)
+        dated = [(row, key(row[name])) for row in filtered if row[name] is not None]
+        if period_key is not None:
+            ignored = sum(1 for _, value in dated if value is None)
+            dated = [(row, value) for row, value in dated if value is not None]
+            if ignored:
+                warnings.append(f"Se excluyeron {ignored} registros cuya fecha no nombra un período interpretable.")
+        maximum = max((value for _, value in dated), default=None)
+        output = [row for row, value in dated if value == maximum]
         return output, exclusions, warnings, len(rows) - len(output)
     if step.operation == "sort":
         for ordering in reversed(step.order_by):
             budget.check()
             ascending = ordering.direction == "asc"
             frame = frame.sort_values(ordering.field.field, ascending=ascending, kind="stable",
-                                      na_position="last" if ascending else "first")
-        if step.limit is not None:
-            frame = frame.head(step.limit)
-        return frame.to_dict("records"), exclusions, warnings, len(rows) - len(filtered)
+                                      na_position="last")  # Igual que SQL: los faltantes no son extremos.
+        records = frame.to_dict("records")
+        if step.limit is not None and len(records) > step.limit:
+            # Igual que en SQL: el límite conserva las filas empatadas con la última incluida.
+            keys = [ordering.field.field for ordering in step.order_by]
+            last = [records[step.limit - 1][key] for key in keys]
+            records = records[:step.limit] + [row for row in records[step.limit:]
+                                              if [row[key] for key in keys] == last]
+        return records, exclusions, warnings, len(rows) - len(filtered)
     if step.operation == "calculate" and step.calculations[0].function != "correlation":
         cohorts = {(calc.null_policy, frozenset(ref.field for ref in calc.inputs)) for calc in step.calculations}
         if len(cohorts) != 1:

@@ -30,7 +30,7 @@ def validate_execution_plan(plan: PlanningResult, catalog: list[VerifiedDataset]
             "source_id", "semantic_point_id", "physical_table_name", "row_count", "columns_metadata", "provenance", "warnings",
         )):
             raise PlannerValidationError("Los metadatos autorizados cambiaron; hay que volver a planificar.")
-    operations, issues = validate_operations(decision, selected)
+    operations, issues = validate_operations(decision, selected, plan.temporal_text_columns)
     issues.extend(validate_temporal_scope(operations, plan.output_steps,
         require_latest=plan.context.evidence.get("temporal_requirements", {}).get("operation") == "latest",
         requested_values=[item["text"] for item in plan.context.evidence.get("query_mentions", []) if item["kind"] == "value"]))

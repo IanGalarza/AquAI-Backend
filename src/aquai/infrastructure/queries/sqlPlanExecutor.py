@@ -120,8 +120,11 @@ class SqlAlchemyPlanExecutor:
                             continue
                         self._configure(connection, started)
                         item = compiled[step.id]
+                        ties = step.limit is not None and bool(step.order_by)
                         fetch_limit = min(step.limit, remaining + 1) if step.limit is not None else remaining + 1
-                        base = item.statement.limit(fetch_limit).subquery()
+                        # Con empates el paso ya acota sus filas (FETCH ... WITH TIES); el presupuesto
+                        # total se aplica afuera para no recortar un empate.
+                        base = (item.statement if ties else item.statement.limit(fetch_limit)).subquery()
                         columns = [base.c[column.name] for column in step.output_fields]
                         size = sum(func.coalesce(func.pg_catalog.octet_length(cast(column, Text)), 0) for column in columns)
                         guard = size <= min(settings.max_row_bytes, settings.max_result_bytes)
@@ -134,7 +137,9 @@ class SqlAlchemyPlanExecutor:
                         for ordering in step.order_by:
                             name = ordering.field.column if hasattr(ordering.field, "column") else ordering.field.field
                             expression = base.c[name]
-                            query = query.order_by(expression.asc() if ordering.direction == "asc" else expression.desc())
+                            query = query.order_by((expression.asc() if ordering.direction == "asc" else expression.desc()).nulls_last())
+                        if ties:
+                            query = query.limit(remaining + 1)
                         with connection.execute(query.execution_options(stream_results=True, yield_per=50)) as cursor:
                             for mapping in cursor.mappings():
                                 if (perf_counter() - started) * 1000 > settings.max_duration_ms:

@@ -219,7 +219,7 @@ class ConversationSnapshotBuilder:
     def _direct(self, state, turn):
         response, routing = state.response, state.routing
         expected_type = {
-            "general": "general", "historical": "historical",
+            "general": "general", "catalog": "catalog", "historical": "historical",
             "needs_clarification": "clarification", "failed": "general",
         }[routing.route]
         if (

@@ -126,7 +126,7 @@ class ResponseResultReference(BaseModel):
 
 
 class QueryResponse(BaseModel):
-    response_type: Literal["analytical", "general", "clarification", "historical"] = "analytical"
+    response_type: Literal["analytical", "general", "catalog", "clarification", "historical"] = "analytical"
     status: AnswerStatus | Literal["answered"]
     validation_status: AnswerStatus | None
     answer: str

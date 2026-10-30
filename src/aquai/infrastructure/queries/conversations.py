@@ -78,6 +78,8 @@ class SqlAlchemyConversationQueries:
                     data["response"]["sources"].label("sources"),
                     data["response"]["operation_references"].label("references"),
                     data["response"]["routing"]["request_history"].label("requests"),
+                    data["response"]["routing"]["history_message_ids"].label("context_ids"),
+                    data["response"]["routing"]["data_mentions"].label("mentions"),
                     data["operations"].label("operations"),
                     data["validated_at"].label("verified_at"),
                 )

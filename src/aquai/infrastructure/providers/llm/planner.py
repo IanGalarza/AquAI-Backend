@@ -11,6 +11,21 @@ from aquai.infrastructure.config.tabular import TabularSettings
 from aquai.infrastructure.providers.llm.ollama import _OllamaClient
 
 
+def _cap_free_text(schema):
+    """Los textos explicativos no se ejecutan: acotarlos reduce la generación sin cambiar el plan."""
+    limits = {"reason": 400, "purpose": 160}
+    stack = [schema]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, dict):
+            for key, value in node.get("properties", {}).items():
+                if key in limits and isinstance(value, dict) and "maxLength" in value:
+                    value["maxLength"] = min(value["maxLength"], limits[key])
+            stack.extend(node.values())
+        elif isinstance(node, list):
+            stack.extend(node)
+
+
 class OllamaPlannerProvider:
     def __init__(self, settings: TabularSettings) -> None:
         self._settings = settings
@@ -30,6 +45,7 @@ class OllamaPlannerProvider:
         if len(content.encode("utf-8")) > self._budget:
             raise LLMProviderError("El catálogo excede el presupuesto de contexto del Planner.")
         schema = self._output.json_schema()
+        _cap_free_text(schema)
         if any(item["kind"] == "value" for item in context.evidence.get("query_mentions", [])):
             schema["$defs"]["ReadPlanStep"]["properties"]["filters"]["minItems"] = 1
         body = await self._client.post("/api/chat", {
@@ -48,6 +64,10 @@ class OllamaPlannerProvider:
         try:
             decision = self._output.validate_json(message["content"])
         except ValidationError as error:
-            raise LLMProviderError("La planificación de Ollama no cumple el contrato JSON.") from error
+            first = error.errors()[0] if error.errors() else {}
+            where = ".".join(str(part) for part in first.get("loc", ()))
+            raise LLMProviderError(
+                f"La planificación de Ollama no cumple el contrato JSON ({where}: {first.get('msg', 'inválido')})."
+            ) from error
         return PlannerReply(decision=decision, model=body["model"],
                             input_tokens=body.get("prompt_eval_count"), output_tokens=body.get("eval_count"))

@@ -26,7 +26,7 @@ def create_query_planning_graph() -> CompiledStateGraph:
     sources = SqlAlchemySourceQueries(get_db_context())
     planner = PlanQueryHandler(OllamaPlannerProvider(settings), sources)
     router = RouteQueryHandler(OllamaRoutingProvider(settings), sources)
-    direct = GenerateDirectResponseHandler(OllamaGeneralResponseProvider(settings))
+    direct = GenerateDirectResponseHandler(OllamaGeneralResponseProvider(settings), sources)
     return build_query_planning_graph(
         create_dataset_retriever, planner, create_sql_agent(), create_python_agent(),
         create_evidence_validator(), create_response_generator(), router, direct,

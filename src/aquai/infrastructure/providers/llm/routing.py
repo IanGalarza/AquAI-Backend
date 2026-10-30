@@ -68,6 +68,7 @@ class OllamaRoutingProvider(_StructuredConversationProvider):
 
     async def interpret(self, context):
         schema = RoutingDraft.model_json_schema()
+        schema["properties"]["reason"]["maxLength"] = 240  # Un motivo breve acorta la generación.
         ids = [item["message_id"] for item in context["history"]]
         if ids:
             schema["properties"]["history_message_ids"]["items"]["enum"] = ids

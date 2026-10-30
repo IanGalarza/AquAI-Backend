@@ -10,6 +10,8 @@ from aquai.application.contracts.retrieval import DatasetRetrievalResult, Verifi
 
 
 PlanningStatus = Literal["plannable", "needs_clarification", "insufficient_coverage"]
+# "failed": el modelo no produjo un plan verificable tras reintentar; no es una pregunta al usuario.
+PlanningOutcome = Literal["plannable", "needs_clarification", "insufficient_coverage", "failed"]
 Identifier = Annotated[str, Field(pattern=r"^[a-z_][a-z0-9_]{0,62}$")]
 
 
@@ -76,8 +78,8 @@ class CalculationSpec(PlanModel):
     def valid_arity(self):
         if (self.function == "quantile") != (self.quantile is not None):
             raise ValueError("quantile requiere una probabilidad explícita entre 0 y 1, exclusiva de esa función.")
-        if self.function != "stddev" and self.ddof != 1:
-            raise ValueError("ddof sólo corresponde a stddev.")
+        if self.function != "stddev":
+            self.ddof = 1  # ddof no interviene en otras funciones; se normaliza sin cambiar el cálculo.
         expected = 2 if self.function in {"difference", "ratio", "correlation"} else 1
         if self.function == "count" and not self.inputs:
             return self
@@ -158,6 +160,20 @@ class DependentPlanStep(PlanStep):
     visualization: None = None
 
 
+class AggregatePlanStep(DependentPlanStep):
+    """aggregate/calculate sin cálculos no responde nada: la gramática lo impide."""
+
+    operation: Literal["aggregate", "calculate"]
+    calculations: list[CalculationSpec] = Field(min_length=1, max_length=20)
+
+
+class SortPlanStep(DependentPlanStep):
+    operation: Literal["sort"]
+    order_by: list[OrderingSpec] = Field(min_length=1, max_length=20)
+    group_by: list[GroupingSpec] = Field(default_factory=list, max_length=0)
+    calculations: list[CalculationSpec] = Field(default_factory=list, max_length=0)
+
+
 class LatestOrderingSpec(PlanModel):
     field: ResultRef
     direction: Literal["desc"] = "desc"
@@ -190,8 +206,8 @@ class CombinePlanStep(PlanStep):
     visualization: None = None
 
 
-ProposedStep = Annotated[ReadPlanStep | DependentPlanStep | LatestPlanStep | VisualizePlanStep | CombinePlanStep,
-                         Field(discriminator="operation")]
+ProposedStep = Annotated[ReadPlanStep | AggregatePlanStep | SortPlanStep | LatestPlanStep | VisualizePlanStep
+                         | CombinePlanStep, Field(discriminator="operation")]
 
 
 class PlannerDecision(PlanModel):
@@ -293,12 +309,23 @@ class FilterValueResolution(PlanModel):
     dataset_id: UUID
     column: str
     requested: str
-    resolved: str
-    method: Literal["unique_case_insensitive"] = "unique_case_insensitive"
+    resolved: str | list[str]
+    method: Literal["unique_case_insensitive", "contains_words"] = "unique_case_insensitive"
+
+
+class TemporalTextColumn(PlanModel):
+    """Columna TEXT cuyos valores distintos nombran períodos explícitos verificados."""
+
+    dataset_id: UUID
+    column: str
+    day_first: bool | None = None
+    interpreted_values: int = Field(ge=0)
+    uninterpreted_values: list[str] = Field(default_factory=list, max_length=10)
+    precisions: list[str] = Field(default_factory=list)
 
 
 class PlanningResult(BaseModel):
-    status: PlanningStatus
+    status: PlanningOutcome
     llm_status: PlanningStatus | None
     reason: str
     llm_reason: str | None = None
@@ -311,6 +338,8 @@ class PlanningResult(BaseModel):
     warnings: list[str] = Field(default_factory=list)
     validation_issues: list[ValidationIssue] = Field(default_factory=list)
     filter_value_resolutions: list[FilterValueResolution] = Field(default_factory=list)
+    temporal_text_columns: list[TemporalTextColumn] = Field(default_factory=list)
+    attempts: int = 1
     context: PlanningContextRecord
     model: str | None = None
     input_tokens: int | None = None
@@ -326,4 +355,4 @@ class PlanningInput(PlanModel):
 class QueryPlanningState(PlanningInput):
     retrieval: DatasetRetrievalResult | None = None
     planning: PlanningResult | None = None
-    status: PlanningStatus | None = None
+    status: PlanningOutcome | None = None
