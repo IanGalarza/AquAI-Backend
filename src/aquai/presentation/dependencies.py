@@ -16,6 +16,8 @@ from aquai.application.useCases.sources import (
 )
 from aquai.infrastructure.providers.sources import SourceRuntime
 from aquai.application.useCases.commands.createConversationHandler import CreateConversationHandler
+from aquai.application.useCases.commands.deleteConversationHandler import DeleteConversationHandler
+from aquai.application.useCases.commands.renameConversationHandler import RenameConversationHandler
 from aquai.application.useCases.commands.sendMessageHandler import SendMessageHandler
 from aquai.application.useCases.queries.conversationHistoryHandler import ConversationHistoryHandler
 from aquai.infrastructure.providers.conversations import create_conversation_runtime
@@ -96,10 +98,24 @@ def get_create_conversation_handler(request: Request) -> CreateConversationHandl
     return _get_conversation_runtime(request).create
 
 
+def get_rename_conversation_handler(request: Request) -> RenameConversationHandler:
+    return _get_conversation_runtime(request).rename
+
+
+def get_delete_conversation_handler(request: Request) -> DeleteConversationHandler:
+    return _get_conversation_runtime(request).delete
+
+
 ConversationHistoryDependency = Annotated[
     ConversationHistoryHandler, Depends(get_conversation_history_handler)
 ]
 SendMessageDependency = Annotated[SendMessageHandler, Depends(get_send_message_handler)]
 CreateConversationDependency = Annotated[
     CreateConversationHandler, Depends(get_create_conversation_handler)
+]
+RenameConversationDependency = Annotated[
+    RenameConversationHandler, Depends(get_rename_conversation_handler)
+]
+DeleteConversationDependency = Annotated[
+    DeleteConversationHandler, Depends(get_delete_conversation_handler)
 ]

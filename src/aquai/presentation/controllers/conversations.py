@@ -7,10 +7,11 @@ from fastapi import APIRouter, Query, Response
 
 from aquai.application.contracts.conversations import (
     ConversationPage, ConversationView, CreateConversationRequest,
-    MessagePage, MessageView, SendMessageRequest,
+    MessagePage, MessageView, RenameConversationRequest, SendMessageRequest,
 )
 from aquai.presentation.dependencies import (
-    ConversationHistoryDependency, CreateConversationDependency, SendMessageDependency,
+    ConversationHistoryDependency, CreateConversationDependency, DeleteConversationDependency,
+    RenameConversationDependency, SendMessageDependency,
 )
 
 
@@ -39,6 +40,21 @@ async def list_conversations(handler: ConversationHistoryDependency,
 @router.get("/{id}", response_model=ConversationView, responses=_ERRORS, summary="Obtener conversación")
 async def get_conversation(id: UUID, handler: ConversationHistoryDependency):
     return await handler.get(id)
+
+
+@router.patch("/{id}", response_model=ConversationView, responses=_ERRORS, summary="Renombrar conversación")
+async def rename_conversation(
+    id: UUID, request: RenameConversationRequest, handler: RenameConversationDependency,
+):
+    return await handler.handle(id, request)
+
+
+@router.delete(
+    "/{id}", status_code=204, responses=_ERRORS, summary="Eliminar conversación",
+    description="Elimina la conversación con sus mensajes. Se rechaza mientras se genera una respuesta.",
+)
+async def delete_conversation(id: UUID, handler: DeleteConversationDependency):
+    await handler.handle(id)
 
 
 @router.get("/{id}/messages", response_model=MessagePage, responses=_ERRORS, summary="Obtener historial")

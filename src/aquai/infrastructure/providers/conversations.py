@@ -5,6 +5,8 @@ from functools import lru_cache
 
 from aquai.application.conversations.snapshot import ConversationSnapshotBuilder
 from aquai.application.useCases.commands.createConversationHandler import CreateConversationHandler
+from aquai.application.useCases.commands.deleteConversationHandler import DeleteConversationHandler
+from aquai.application.useCases.commands.renameConversationHandler import RenameConversationHandler
 from aquai.application.useCases.commands.sendMessageHandler import SendMessageHandler
 from aquai.application.useCases.queries.conversationHistoryHandler import ConversationHistoryHandler
 from aquai.bootstrap import initialize_application
@@ -18,6 +20,8 @@ from aquai.infrastructure.queries.conversations import SqlAlchemyConversationQue
 @dataclass(frozen=True)
 class ConversationRuntime:
     create: CreateConversationHandler
+    rename: RenameConversationHandler
+    delete: DeleteConversationHandler
     history: ConversationHistoryHandler
     send: SendMessageHandler
 
@@ -41,6 +45,8 @@ def create_conversation_runtime() -> ConversationRuntime:
     )
     return ConversationRuntime(
         create=CreateConversationHandler(commands),
+        rename=RenameConversationHandler(commands),
+        delete=DeleteConversationHandler(commands),
         history=ConversationHistoryHandler(queries),
         send=SendMessageHandler(
             commands, queries, LangGraphConversationRunner(), snapshots,

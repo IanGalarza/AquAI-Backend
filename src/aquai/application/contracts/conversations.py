@@ -20,6 +20,12 @@ class CreateConversationRequest(BaseModel):
     title: str | None = Field(default=None, min_length=1, max_length=200)
 
 
+class RenameConversationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+    # Título de una sola línea: sin caracteres de control (C0, C1) ni separadores de línea Unicode.
+    title: str = Field(min_length=1, max_length=200, pattern=r"^[^\p{Cc}]+$")
+
+
 class SendMessageRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
     content: str = Field(min_length=1, max_length=6000)

@@ -2,7 +2,7 @@
 
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 
 from aquai.application.contracts.conversations import TurnReservation
 from aquai.application.errors import ConversationConflictError, ConversationNotFoundError
@@ -22,6 +22,20 @@ def _locked_conversation(session, conversation_id):
     return conversation
 
 
+def _generations(session, conversation_id, names):
+    return session.scalars(select(Message).where(
+        Message.conversation_id == conversation_id,
+        Message.role == "assistant",
+        Message.status_id.in_([names["pending"], names["processing"]]),
+    ))
+
+
+def _leased(message, now):
+    """Una generación sin plazo o con plazo vigente sigue en curso."""
+    deadline = message.content_data.get("lease_expires_at")
+    return deadline is None or datetime.fromisoformat(deadline) > now
+
+
 class SqlAlchemyConversationCommands:
     def __init__(self, context, settings):
         self._context = context
@@ -34,19 +48,37 @@ class SqlAlchemyConversationCommands:
             session.commit()
             return conversation_view(item)
 
+    def rename(self, conversation_id, title):
+        with conversation_session(self._context, self._settings) as session:
+            conversation = _locked_conversation(session, conversation_id)
+            conversation.title = title
+            conversation.updated_at = datetime.now(timezone.utc)
+            session.commit()
+            return conversation_view(conversation)
+
+    def delete(self, conversation_id):
+        with conversation_session(self._context, self._settings) as session:
+            conversation = _locked_conversation(session, conversation_id)
+            now = datetime.now(timezone.utc)
+            generations = _generations(session, conversation_id, message_statuses(session))
+            if any(_leased(message, now) for message in generations):
+                raise ConversationConflictError(
+                    "La conversación tiene una respuesta en generación; esperá a que finalice."
+                )
+            # Las claves foráneas restringen el borrado: primero las referencias y los mensajes.
+            messages = select(Message.id).where(Message.conversation_id == conversation_id)
+            session.execute(delete(MessageSource).where(MessageSource.message_id.in_(messages)))
+            session.execute(delete(Message).where(Message.conversation_id == conversation_id))
+            session.delete(conversation)
+            session.commit()
+
     def begin_turn(self, conversation_id, content, language):
         with conversation_session(self._context, self._settings) as session:
             conversation = _locked_conversation(session, conversation_id)
             names = message_statuses(session)
             now = datetime.now(timezone.utc)
-            statement = select(Message).where(
-                Message.conversation_id == conversation_id,
-                Message.role == "assistant",
-                Message.status_id.in_([names["pending"], names["processing"]]),
-            )
-            for message in session.scalars(statement):
-                deadline = message.content_data.get("lease_expires_at")
-                if deadline is None or datetime.fromisoformat(deadline) > now:
+            for message in _generations(session, conversation_id, names):
+                if _leased(message, now):
                     raise ConversationConflictError(
                         "La conversación ya tiene una respuesta en generación."
                     )

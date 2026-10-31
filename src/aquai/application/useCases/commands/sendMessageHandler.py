@@ -9,7 +9,9 @@ from aquai.application.contracts.answering import ConversationMessage, QueryResp
 from aquai.application.contracts.conversations import SendMessageOutcome
 from aquai.application.conversations.context import build_history
 from aquai.application.conversations.snapshot import ConversationSnapshotBuilder, failure_record
-from aquai.application.errors import ConversationConflictError, ConversationStorageError
+from aquai.application.errors import (
+    ConversationConflictError, ConversationNotFoundError, ConversationStorageError,
+)
 from aquai.application.interfaces.conversations import (
     ConversationCommands, ConversationQueries, ConversationQueryRunner,
 )
@@ -105,5 +107,5 @@ class SendMessageHandler:
                 turn, "generation_cancelled", "La generación fue cancelada.", cancelled=True
             )
             await asyncio.shield(asyncio.to_thread(self._commands.finish_turn, turn, record))
-        except ConversationConflictError:
-            pass  # Una recuperación de la reserva ya cerró el turno.
+        except (ConversationConflictError, ConversationNotFoundError):
+            pass  # Una recuperación de la reserva ya cerró el turno, o la conversación se eliminó.
