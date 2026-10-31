@@ -80,6 +80,15 @@ def summarize_execution(plan: PlanningResult | None, sql: SqlExecutionResult | N
     return ("failed" if errors else "not_executed"), pending, warnings
 
 
+def execution_records(state):
+    """Registros de SQL y Python por operación; Python prevalece si ambos informan la misma."""
+    records = {}
+    for batch in (state.execution, state.python_execution):
+        if batch is not None:
+            records.update({item.operation_id: item for item in batch.operations})
+    return records
+
+
 def decode_rows(record, fields, budget=None):
     """Sólo rehidrata el tipo del esquema verificado, nunca interpreta un TEXT."""
     rows = []

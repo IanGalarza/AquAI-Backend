@@ -40,6 +40,9 @@ son suficientes para la última medición de una variable en una localidad.
 query_mentions describe la intención literal del usuario, no valores observados
 ni nombres de fuentes. Cada mención kind=value debe aparecer en los filtros del
 alcance que alimenta latest; usá sus textos literales y columnas verificadas.
+Una mención kind=limit es la cantidad de filas que el usuario quiere ver: ese número
+es el limit del sort que publica el resultado o alimenta el gráfico ('los 5 sitios con
+mayor promedio' es read -> aggregate por sitio -> sort desc con limit 5).
 
 Estados:
 - plannable: todas las partes de la pregunta tienen cobertura verificable en los
@@ -79,6 +82,14 @@ Reglas semánticas:
 - Para el sitio o registro con el mayor (o menor) valor de una variable: read con el
   sitio, la fecha y la variable, filtro is_not_null de la variable -> sort por la variable
   desc (asc para el menor) con limit 5, para mostrar el extremo y detectar empates.
+- category_values lista, para la columna donde aparece un valor mencionado, valores de esa
+  misma columna ordenados por cantidad de registros con la variable. Si se piden varias
+  categorías (por ejemplo, 'el pH promedio de 3 sitios distintos incluyendo Punta Lara'),
+  usá UN dataset que tenga la variable y esa columna, nunca varios datasets como si fueran
+  sitios: elegí el valor mencionado y completá con los primeros valores de category_values
+  hasta la cantidad pedida; read con filtro in sobre esos valores exactos -> aggregate con
+  group_by por esa columna y el cálculo pedido -> visualize con x=la columna agrupada e y=el
+  cálculo.
 - Si varios candidatos contienen la variable y el valor pedidos y no son copias, calculá
   cada uno en una rama independiente (read y aggregate por dataset) y publicá todas las
   salidas; no los combines ni elijas uno arbitrariamente.
@@ -123,8 +134,11 @@ Gramática del plan:
   son referencias kind=result a campos reales de esa dependencia. histogram sólo
   usa x numérica, bins entre 1 y 100 (default 10), sin y ni series. Otros gráficos
   requieren y numérica. line requiere x numérica o DATE/TIMESTAMP; scatter ambos
-  ejes numéricos. bar necesita una fila por categoría/serie: agregá antes con SQL
-  si hay varias observaciones. Los gráficos no agregan ni unen registros implícitamente.
+  ejes numéricos. bar necesita una fila por categoría/serie: si la pregunta pide una
+  estadística por categoría (promedio, máximo, total), calculala antes con aggregate.
+  Para graficar registros ya elegidos (un ranking, los primeros N) el visualize depende
+  del sort que los elige, sin aggregate: no inventes un promedio que nadie pidió.
+  Los gráficos no agregan ni unen registros implícitamente.
   Un promedio agrupado y su gráfico requieren TRES pasos: read (columnas originales),
   aggregate (depende del read; columns=[]; calcula mean y group_by) y visualize
   (depende del aggregate; columns=[]; x/y refieren a los alias de ese aggregate).

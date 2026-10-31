@@ -63,6 +63,8 @@ class DatasetEvidence(BaseModel):
     value_matches: dict[str, list[ValueMatch]] = Field(default_factory=dict)
     variable_matches: dict[str, list[str]] = Field(default_factory=dict)
     dimension_matches: dict[str, list[str]] = Field(default_factory=dict)
+    # Otros valores de la columna donde está un valor mencionado, de más a menos registros con la variable.
+    category_values: dict[str, list[str]] = Field(default_factory=dict)
 
 
 class DatasetRetrievalResult(BaseModel):

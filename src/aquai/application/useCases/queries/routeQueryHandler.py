@@ -12,7 +12,7 @@ from aquai.application.conversations.context import contextual_question, routing
 from aquai.application.errors import LLMProviderError
 from aquai.application.interfaces.routing import RoutingProvider
 from aquai.application.interfaces.sources import SourceQueries
-from aquai.application.matching import contains_phrase, normalize_name
+from aquai.application.matching import contains_phrase, normalize_name, normalize_text
 
 
 _logger = logging.getLogger(__name__)
@@ -87,11 +87,17 @@ class RouteQueryHandler:
                         item.kind == "variable" for item in decision.data_mentions):
                     # Una consulta autocontenida sobre una variable no requiere conocer la fuente.
                     route = "data"
-            if decision.context_required and not messages and route != "needs_clarification":
+            asked = [item for item in decision.data_mentions if self._literal(item.text, state.question)]
+            if route == "historical" and self._changes(asked, decision.source_mentions, state.question, messages):
+                route = "data"  # Otro sitio, variable, fuente o cantidad cambia el resultado: no es repetir el anterior.
+            # Sin variable, valor, fecha ni fuente propios no hay nada que recuperar («Ahora mostrame todos»):
+            # la consulta sólo puede continuar el último resultado, aunque el modelo no lo haya marcado.
+            bare = route == "data" and not decision.source_mentions and all(item.kind == "limit" for item in asked)
+            if (decision.context_required or bare) and not messages and route != "needs_clarification":
                 if last is not None and (last.analysis is not None or last.clarification):
                     # Sin una cita explícita, el seguimiento refiere al último resultado o aclaración.
                     messages = self._with_context([last], provided)
-                elif route == "data" and not decision.data_mentions:
+                elif decision.context_required and route == "data" and not decision.data_mentions:
                     return self._clarify(result, "¿A qué resultado o consulta anterior te referís?")
             result.history_message_ids = [item.message_id for item in messages]
             result.context_used = bool(messages)
@@ -132,9 +138,10 @@ class RouteQueryHandler:
                                                        partial=route == "catalog")
             # El texto literal que nombró la fuente («ABSA») también viaja al Planner.
             result.source_mentions = list(dict.fromkeys([*resolved, *(aliases if resolved else [])]))
-            # Un nombre de fuente identificado nunca es, además, un valor para filtrar registros.
+            # Un nombre de fuente identificado, o el alias con que el usuario la nombró («la base FQ»),
+            # nunca es, además, un valor para filtrar registros.
             result.data_mentions = [item for item in result.data_mentions if not any(
-                contains_phrase(name, item.text) or contains_phrase(item.text, name) for name in resolved)]
+                contains_phrase(name, item.text) or contains_phrase(item.text, name) for name in result.source_mentions)]
             if route == "catalog":
                 result.dataset_bindings = list({item.dataset_id: item for item in bindings}.values())
                 result.history_message_ids = []
@@ -222,16 +229,34 @@ class RouteQueryHandler:
 
     @staticmethod
     def _literal_mentions(mentions, question, messages, result):
-        """Sólo conserva fragmentos literales de la pregunta o de sus solicitudes citadas."""
+        """Sólo conserva fragmentos literales de la pregunta o de sus solicitudes citadas.
+
+        Una cantidad sólo vale si se pide ahora o en la solicitud que esperaba una aclaración:
+        la de un resultado ya respondido la conserva su plan, y repetirla anularía un cambio («todos»)."""
         texts = [question, *RouteQueryHandler._requests(messages, question)]
+        current = [question, *(request for item in messages if item.clarification for request in item.pending_requests)]
         kept = {}
         for item in mentions:
             text = item.text.strip()
-            if text and any(text.casefold() in value.casefold() for value in texts):
+            if text and any(RouteQueryHandler._literal(text, value) for value in (current if item.kind == "limit" else texts)):
                 kept.setdefault((text.casefold(), item.kind), item.model_copy(update={"text": text}))
             else:
                 result.warnings.append("Se descartó una mención del Router que no aparece en la conversación.")
         return list(kept.values())
+
+    @staticmethod
+    def _changes(mentions, sources, question, messages):
+        """Menciones de la pregunta actual que no estaban en las solicitudes citadas («¿Y en Toma Agua?»)."""
+        cited = RouteQueryHandler._requests(messages, question)[:-1]
+        texts = [*(item.text for item in mentions),
+                 *(text for text in sources if RouteQueryHandler._literal(text, question))]
+        return [text for text in texts if not any(RouteQueryHandler._literal(text, request) for request in cited)]
+
+    @staticmethod
+    def _literal(mention, text):
+        """La mención aparece en el texto aunque el modelo omita acentos o cambie mayúsculas y puntuación."""
+        target = normalize_text(mention)
+        return bool(target) and target in normalize_text(text)
 
     @staticmethod
     def _explicit_mentions(mentions, question, data_mentions, result):
@@ -255,12 +280,14 @@ class RouteQueryHandler:
             # Nombres de una sola palabra son demasiado genéricos para reconocerlos sin una señal.
             if len(name.split()) >= 2 and name not in known and contains_phrase(question, name):
                 found.append(source["name"])
-        # Un «valor» ausente de los registros que aparece en el nombre de una única fuente la nombra.
+        # Un «valor» ausente de los registros que aparece en el nombre de una única fuente, o de una de
+        # sus hojas («la base FQ»), la nombra.
         for item in mentions:
             if item.kind != "value" or any(contains_phrase(name, item.text) for name in [*explicit, *found]):
                 continue
             owners = {source["source_id"]: source for source in catalog
-                      if contains_phrase(normalize_name(source["name"]), item.text)}
+                      if any(contains_phrase(normalize_name(name), item.text) for name in
+                             [source["name"], *(_sheet(dataset["name"]) for dataset in source["datasets"])])}
             if len(owners) == 1 and not await self._stored_anywhere(item.text, catalog):
                 found.append(next(iter(owners.values()))["name"])
                 aliases.append(item.text)
@@ -315,18 +342,18 @@ class RouteQueryHandler:
                 if strict or identifier is not None:
                     names = "; ".join(source["name"] for source in catalog[:8])
                     raise ValueError(
-                        f"No encontré una fuente llamada «{mention}» entre las cargadas"
+                        f"No encontré una fuente llamada {mention} entre las cargadas"
                         + (f" ({names})" if names else "") + ". ¿Cuál querés usar?"
                     )
                 continue  # Sin identidad comprobada, la mención sigue como texto para recuperar.
             sources = {source["source_id"] for source, _ in matches}
             if len(sources) != 1:
                 names = "; ".join(sorted({source["name"] for source, _ in matches})[:8])
-                raise ValueError(f"«{mention}» coincide con varias fuentes: {names}. ¿Cuál querés usar?")
+                raise ValueError(f"{mention} coincide con varias fuentes: {names}. ¿Cuál querés usar?")
             available = [(s, d) for s, d in matches if d["available"]]
             if not available:
                 raise ValueError(
-                    f"La fuente «{matches[0][0]['name']}» está inactiva o todavía no se puede consultar. "
+                    f"La fuente {matches[0][0]['name']} está inactiva o todavía no se puede consultar. "
                     "¿Querés usar otra fuente?"
                 )
             bindings.extend(

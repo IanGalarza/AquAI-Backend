@@ -1,7 +1,17 @@
-"""Formato de números tipados para lectura, sin alterar la evidencia exacta."""
+"""Formato de números y unidades para lectura, sin alterar la evidencia exacta."""
 
 from decimal import Decimal, ROUND_HALF_UP, localcontext
 from html import escape
+import re
+
+
+_SUPERSCRIPTS = str.maketrans("0123456789", "⁰¹²³⁴⁵⁶⁷⁸⁹")
+# Sólo exponentes negativos tras un símbolo (mL-1): PO4 o N-NO3 son fórmulas, no potencias.
+_NEGATIVE_EXPONENT = re.compile(r"(?<=[A-Za-zµμ])-(\d{1,2})(?![\d.,])")
+
+
+def format_unit(unit: str) -> str:
+    return _NEGATIVE_EXPONENT.sub(lambda match: "⁻" + match.group(1).translate(_SUPERSCRIPTS), unit)
 
 
 def format_number(value: Decimal | int | float, language="es") -> str:
@@ -22,8 +32,12 @@ def format_number(value: Decimal | int | float, language="es") -> str:
     mantissa, *exponent = text.split("e")
     if "." in mantissa:
         mantissa = mantissa.rstrip("0").rstrip(".")
-    if language == "es":
-        mantissa = mantissa.replace(".", ",")
+    integer, _, fraction = mantissa.partition(".")
+    decimal, thousands = (",", ".") if language == "es" else (".", ",")
+    # Como en la norma tipográfica, los enteros de cuatro cifras (p. ej., años) no se agrupan.
+    if not exponent and len(integer.lstrip("-")) >= 5:
+        integer = f"{int(integer):,}".replace(",", thousands)
+    mantissa = integer + (decimal + fraction if fraction else "")
     return mantissa + (f"e{int(exponent[0])}" if exponent else "")
 
 

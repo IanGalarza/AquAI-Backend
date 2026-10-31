@@ -4,9 +4,12 @@ import asyncio
 import re
 from time import perf_counter
 
-from aquai.application.answering.catalog import catalog_answer
+from pydantic import TypeAdapter, ValidationError
+
+from aquai.application.answering.catalog import catalog_segments
+from aquai.application.answering.segments import answer_text, segments_from_text
 from aquai.application.contracts.answering import (
-    GenerationRecord, QueryResponse, ResponseOperationReference, SourceReference,
+    AnswerSegment, GenerationRecord, QueryResponse, ResponseOperationReference, SourceReference,
 )
 from aquai.application.contracts.execution import ExecutionError
 from aquai.application.errors import LLMProviderError
@@ -17,6 +20,7 @@ from aquai.application.interfaces.sources import SourceQueries
 # Bloques o firmas de código: AquAI explica en palabras y no entrega programas.
 _CODE = re.compile(r"```|^\s*(?:def|class|import|from\s+\S+\s+import|SELECT|function|public\s+class)\b",
                    re.IGNORECASE | re.MULTILINE)
+_SEGMENTS = TypeAdapter(list[AnswerSegment])
 
 
 class GenerateDirectResponseHandler:
@@ -38,7 +42,7 @@ class GenerateDirectResponseHandler:
             response.response_type = "clarification"
             response.status = "needs_clarification"
             response.clarification_question = routing.clarification_question
-            response.answer = routing.clarification_question or "¿Podés precisar la consulta?"
+            self._publish(response, routing.clarification_question or "¿Podés precisar la consulta?")
             return response
         if routing.route == "failed":
             return self._failure(response, "routing_failed", routing.error)
@@ -69,6 +73,15 @@ class GenerateDirectResponseHandler:
             if not message.text_complete:
                 response.status = "partial"
                 response.limitations.append("El texto histórico disponible está abreviado.")
+            # El texto reproduce el original; los párrafos conservan sus citas y suman un aviso.
+            segments = self._historical_segments(message, response)
+            attached = any(segment.attachment for segment in segments)
+            response.segments = [*segments, AnswerSegment(kind="note", text=(
+                "Te muestro la respuesta anterior; no volví a consultar los datos."
+                + (" Sus tablas y gráficos están en ese mensaje." if attached else "")
+                if routing.language == "es" else
+                "This is the previous answer; I did not query the data again."
+                + (" Its tables and charts are in that message." if attached else "")))]
             return response
         if any(item.scientific for item in selected):
             raise ValueError("La ruta general no puede interpretar resultados científicos.")
@@ -86,15 +99,15 @@ class GenerateDirectResponseHandler:
             response.generation.output_tokens = reply.output_tokens
             if reply.draft.language != routing.language or not reply.draft.answer.strip():
                 raise LLMProviderError("La respuesta general no respeta el idioma solicitado.")
-            response.answer = reply.draft.answer.strip()
+            self._publish(response, reply.draft.answer.strip())
             if _CODE.search(response.answer):
-                response.answer = (
+                self._publish(response, (
                     "AquAI no genera código de programación. Puedo explicarte el concepto en palabras "
                     "o ayudarte a analizar los datos que ya cargaste: promedios, máximos, últimas "
                     "mediciones o gráficos." if routing.language == "es" else
                     "AquAI does not write programming code. I can explain the concept in words or help "
                     "you analyze the loaded data: averages, maxima, latest measurements or charts."
-                )
+                ))
                 response.limitations.append("Se omitió código generado por el modelo.")
             response.generation.model = reply.model
             response.generation.status = "generated"
@@ -118,9 +131,10 @@ class GenerateDirectResponseHandler:
             catalog = await asyncio.to_thread(self._catalog.catalog_overview)
         except Exception:
             return self._failure(response, "catalog_unavailable", "No se pudo consultar el catálogo de fuentes.")
-        response.answer = catalog_answer(
+        response.segments = catalog_segments(
             catalog, [item.dataset_id for item in routing.dataset_bindings], routing.language
         )
+        response.answer = answer_text(response.segments)
         response.limitations.append(
             "Inventario consultado en PostgreSQL durante esta respuesta; no se leyeron registros de los datasets."
             if routing.language == "es" else
@@ -130,13 +144,28 @@ class GenerateDirectResponseHandler:
         return response
 
     @staticmethod
-    def _failure(response, code, message):
+    def _publish(response, text):
+        response.answer = text
+        response.segments = segments_from_text(text)
+
+    @staticmethod
+    def _historical_segments(message, response):
+        """Párrafos estructurados del original; los anteriores a ese formato se derivan de su texto."""
+        if message.text_complete and message.segments:
+            try:
+                return _SEGMENTS.validate_python(message.segments)
+            except ValidationError:
+                pass
+        return segments_from_text(message.text, [item.evidence_id for item in response.operation_references])
+
+    @classmethod
+    def _failure(cls, response, code, message):
         response.status = "failed"
-        response.answer = (
+        cls._publish(response, (
             "No pude generar una respuesta válida. Podés volver a intentarlo."
             if response.language == "es" else
             "I could not generate a valid answer. You can try again."
-        )
+        ))
         response.generation.status = "failed"
         response.generation.error = ExecutionError(
             code=code, message=message or "El modelo no completó una respuesta válida."

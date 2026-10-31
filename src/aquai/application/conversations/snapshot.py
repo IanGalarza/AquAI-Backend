@@ -2,8 +2,8 @@
 
 import json
 
-from aquai.application.contracts.answering import SourceReference
-
+from aquai.application.answering.segments import answer_text
+from aquai.application.contracts.answering import AnswerSegment, SourceReference
 from aquai.application.contracts.conversations import (
     AssistantRecord, AssistantSnapshot, SourceAssociation,
     StoredGeneration, StoredQueryResponse, StoredTable,
@@ -198,10 +198,14 @@ class ConversationSnapshotBuilder:
                 "Las figuras exceden el límite del historial y no se conservaron; "
                 "no existe un archivo o enlace para recuperarlas."
             )
+            # Las tablas recortadas lo indican en su propia tarjeta; un gráfico omitido sólo tiene este aviso.
+            stored.segments.append(AnswerSegment(kind="note", text=(
+                "Los gráficos no se guardaron en la conversación por su tamaño." if response.language == "es"
+                else "The charts were not kept in the conversation because of their size.")))
+            stored.answer = answer_text(stored.segments)
         if warnings:
             snapshot.storage_warnings = list(dict.fromkeys(warnings))
             stored.limitations = list(dict.fromkeys([*stored.limitations, *snapshot.storage_warnings]))
-            stored.answer += "\n\n" + " ".join(snapshot.storage_warnings)
         if size() > self._max_message_bytes:
             raise ConversationStorageError(
                 "Los metadatos mínimos exceden el límite de almacenamiento del mensaje."
@@ -265,9 +269,12 @@ class ConversationSnapshotBuilder:
                         item for item in references
                         if str(source.dataset_id) in item["dataset_ids"]
                     ],
+                    "columns": [], "columns_complete": True,
                 }
                 if _bytes(details) > self._max_source_details_bytes:
                     raise ConversationStorageError("La referencia histórica supera su límite.")
+                # Las columnas del original permiten ubicar sus variables y celdas al reproducirlo.
+                self._add_columns(details, original.source_columns.get(str(source.dataset_id), []))
                 associations.append(SourceAssociation(
                     source.source_id, source.dataset_id, index, details
                 ))
@@ -276,8 +283,9 @@ class ConversationSnapshotBuilder:
         data = response.model_dump(exclude={"generation", "results"})
         generation = StoredGeneration(**response.generation.model_dump(exclude={"context"}))
         stored = StoredQueryResponse(**data, generation=generation, results=[])
+        operations = history[routing.history_message_ids[0]].analysis.operations if routing.route == "historical" else []
         snapshot = AssistantSnapshot(
-            response=stored, validated_at=None,
+            response=stored, validated_at=None, operations=operations,
             context_policy={
                 "history_message_ids": [str(key) for key in turn.history_message_ids],
                 "history_used_by": "router,direct_response",
@@ -293,6 +301,15 @@ class ConversationSnapshotBuilder:
             ),
             status_name="failed" if generation.status == "failed" else "completed",
         )
+
+    def _add_columns(self, details, columns):
+        """Agrega columnas mientras la referencia respete su límite; el resto queda marcado como incompleto."""
+        for column in columns:
+            details["columns"].append(column)
+            if _bytes(details) > self._max_source_details_bytes:
+                details["columns"].pop()
+                details["columns_complete"] = False
+                break
 
     def _associations(self, state, response):
         selected = {
@@ -325,17 +342,11 @@ class ConversationSnapshotBuilder:
                 raise ConversationStorageError(
                     "La procedencia mínima excede el límite de una referencia."
                 )
-            for column in dataset.columns_metadata:
-                value = column.model_dump(mode="json", include={
-                    "sql_name", "original_name", "sql_type", "unit", "unit_evidence",
-                    "numeric_eligible", "derived_from", "representation",
-                    "excluded_count", "source_column", "source_row",
-                })
-                details["columns"].append(value)
-                if _bytes(details) > self._max_source_details_bytes:
-                    details["columns"].pop()
-                    details["columns_complete"] = False
-                    break
+            self._add_columns(details, [column.model_dump(mode="json", include={
+                "sql_name", "original_name", "sql_type", "unit", "unit_evidence",
+                "numeric_eligible", "derived_from", "representation",
+                "excluded_count", "source_column", "source_row",
+            }) for column in dataset.columns_metadata])
             if _bytes(details) > self._max_source_details_bytes:
                 raise ConversationStorageError("La referencia excede su límite de metadatos.")
             result.append(SourceAssociation(

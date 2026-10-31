@@ -54,6 +54,79 @@ class MessageSourceView(BaseModel):
     details: dict[str, JsonValue]
 
 
+class CitationVariable(BaseModel):
+    """Variable leída y su ubicación en la planilla original (columna G, celdas G2:G1113)."""
+
+    name: str
+    column: str | None = None
+    row: int | None = None
+    cells: str | None = None
+
+
+class CitationView(BaseModel):
+    """Fuente legible de una afirmación: archivo, hoja, filas de datos y variables utilizadas."""
+
+    id: str
+    source_id: UUID
+    dataset_id: UUID
+    version: int
+    file_name: str
+    file_type: str
+    sheet: str | None
+    dataset: str
+    first_row: int | None = None
+    last_row: int | None = None
+    variables: list[CitationVariable] = Field(default_factory=list)
+
+
+class SegmentView(BaseModel):
+    kind: Literal["paragraph", "note"] = "paragraph"
+    text: str
+    items: list[str] = Field(default_factory=list)
+    citations: list[str] = Field(default_factory=list)
+    # Claves estructuradas de la tabla (evidence_id) o el gráfico (operation_id) que siguen al párrafo.
+    table: str | None = None
+    chart: str | None = None
+
+
+class ColumnView(BaseModel):
+    name: str
+    label: str
+    unit: str | None = None
+    unit_documented: bool = False
+    numeric: bool = False
+    # Agrupación temporal: una fecha de mes o año no se presenta como un día concreto.
+    time_grain: Literal["day", "month", "year"] | None = None
+
+
+class TableView(BaseModel):
+    evidence_id: str
+    columns: list[ColumnView]
+    citations: list[str] = Field(default_factory=list)
+
+
+class ChartView(BaseModel):
+    operation_id: str
+    citations: list[str] = Field(default_factory=list)
+    # Rótulos legibles: la figura guardada conserva los originales que validó el backend.
+    x_title: str | None = None
+    y_title: str | None = None
+    legend_title: str | None = None
+
+
+class MessagePresentation(BaseModel):
+    """Lectura del mensaje sin interpretar texto en el cliente; el detalle técnico queda en content_data."""
+
+    segments: list[SegmentView] = Field(default_factory=list)
+    citations: list[CitationView] = Field(default_factory=list)
+    tables: list[TableView] = Field(default_factory=list)
+    charts: list[ChartView] = Field(default_factory=list)
+    # Tablas y gráficos que ningún párrafo presenta; se muestran al final de la respuesta.
+    trailing_tables: list[str] = Field(default_factory=list)
+    trailing_charts: list[str] = Field(default_factory=list)
+    duration_ms: int | None = None
+
+
 class MessageView(BaseModel):
     id: UUID
     conversation_id: UUID
@@ -65,6 +138,7 @@ class MessageView(BaseModel):
     created_at: datetime
     updated_at: datetime | None
     sources: list[MessageSourceView] = Field(default_factory=list)
+    presentation: MessagePresentation | None = None
 
 
 class MessagePage(BaseModel):

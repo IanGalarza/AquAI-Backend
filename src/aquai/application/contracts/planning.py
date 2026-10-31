@@ -13,6 +13,8 @@ PlanningStatus = Literal["plannable", "needs_clarification", "insufficient_cover
 # "failed": el modelo no produjo un plan verificable tras reintentar; no es una pregunta al usuario.
 PlanningOutcome = Literal["plannable", "needs_clarification", "insufficient_coverage", "failed"]
 Identifier = Annotated[str, Field(pattern=r"^[a-z_][a-z0-9_]{0,62}$")]
+# Mayor cantidad de filas que un paso puede conservar; también acota la cantidad pedida por el usuario.
+MAX_ROW_LIMIT = 10000
 
 
 class PlanModel(BaseModel):
@@ -136,7 +138,7 @@ class PlanStep(PlanModel):
     calculations: list[CalculationSpec] = Field(default_factory=list, max_length=20)
     join_on: list[JoinKey] = Field(default_factory=list, max_length=10)
     order_by: list[OrderingSpec] = Field(default_factory=list, max_length=20)
-    limit: int | None = Field(default=None, ge=1, le=10000)
+    limit: int | None = Field(default=None, ge=1, le=MAX_ROW_LIMIT)
     visualization: VisualizationRequest | None = None
     purpose: str = Field(min_length=1, max_length=1000)
 

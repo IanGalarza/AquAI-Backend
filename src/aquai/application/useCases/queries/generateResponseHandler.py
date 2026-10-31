@@ -2,9 +2,12 @@
 
 from time import perf_counter
 
+from aquai.application.answering.blocked import blocked_explanations
 from aquai.application.answering.context import build_response_context, response_language
+from aquai.application.answering.segments import answer_text
 from aquai.application.contracts.answering import (
-    GenerationRecord, QueryResponse, QueryResponseState, ResponseOperationReference, ResponseResultReference,
+    AnswerSegment, GenerationRecord, QueryResponse, QueryResponseState, ResponseOperationReference,
+    ResponseResultReference,
 )
 from aquai.application.contracts.execution import ExecutionError
 from aquai.application.errors import LLMProviderError
@@ -12,8 +15,16 @@ from aquai.application.execution import evidence_fingerprint
 from aquai.application.interfaces.answering import ResponseProvider
 
 
+# Cada evidencia presenta primero su resultado y después su alcance y detalles.
+_RANK = {"result": 0, "meaning": 1, "summary": 2, "chart": 3, "scope": 4, "detail": 5}
+
+
+def _position(entry, order):
+    return order.get(entry["evidence_ids"][0], len(order)), _RANK.get(entry.get("kind"), len(_RANK))
+
+
 class GenerateResponseHandler:
-    def __init__(self, provider: ResponseProvider, *, max_preview_rows=10, deterministic_sentences=24):
+    def __init__(self, provider: ResponseProvider, *, max_preview_rows=3, deterministic_sentences=24):
         self._provider, self._max_preview_rows = provider, max_preview_rows
         self._deterministic_sentences = deterministic_sentences
 
@@ -39,17 +50,12 @@ class GenerateResponseHandler:
                 or (plan is not None and plan.context.evidence.get("question") != state.question)):
             response.status = "failed"
             response.errors.append(ExecutionError(code="evidence_changed", message="La evidencia cambió después de su validación."))
-            response.answer = self._message("failed", language)
+            self._publish(response, [AnswerSegment(text=self._message("failed", language))])
             return self._finish(response, started)
         if validation.status not in {"validated", "partial"} or not validation.usable_evidence:
-            response.answer = self._message(validation.status, language)
-            if any(item.code == "incomplete_materialization" for item in validation.issues):
-                response.answer += (" Hay una entrada truncada o incompleta; no se utilizó ese prefijo para calcular una respuesta."
-                                    if language == "es" else " An input is truncated or incomplete; that prefix was not used to calculate an answer.")
-            if validation.clarification_question:
-                response.answer += " " + validation.clarification_question
-            elif validation.missing_information:
-                response.answer += (" Información faltante: " if language == "es" else " Missing information: ") + "; ".join(validation.missing_information)
+            reasons = blocked_explanations(state, language)
+            self._publish(response, [AnswerSegment(text=self._unanswered(validation, language, explained=bool(reasons))),
+                                     *(AnswerSegment(kind="note", text=text) for text in reasons)])
             return self._finish(response, started)
 
         steps = {step.id: step for step in plan.operations}
@@ -68,23 +74,22 @@ class GenerateResponseHandler:
         response.visualizations = [chart for chart in state.python_execution.visualizations if chart.operation_id in authorized_charts] if state.python_execution else []
         context, language = build_response_context(state, self._provider.context_budget_bytes, self._max_preview_rows)
         response.generation.context = context
+        if context.omitted_rows:
+            response.limitations.append("El texto resume los resultados extensos; la tabla conserva todas sus filas."
+                                        if language == "es" else "The text summarizes long results; the table keeps every row.")
         catalog = {item["sentence_id"]: item for item in context.evidence["sentence_catalog"]}
+        entries = [(entry, entry["direct"]) for entry in self._ordered_entries(catalog, refs)]
+        introduction = [AnswerSegment(text=context.evidence["introduction"])] if context.evidence.get("introduction") else []
         if validation.status == "partial":
-            response.answer = self._message("partial", language) + "\n\n" + "\n\n".join(
-                item["direct"] + " " + " ".join(f"[{key}]" for key in item["evidence_ids"]) for item in self._ordered_entries(catalog, refs))
-            self._add_preview_note(response, context, language)
+            # Lo que no se pudo hacer se explica primero, con su motivo concreto cuando la ejecución lo informa.
+            missing = blocked_explanations(state, language) or [self._message("partial", language)]
+            self._publish(response, [*(AnswerSegment(kind="note", text=text) for text in missing), *introduction,
+                                     *self._segments(entries)])
             return self._finish(response, started)
         if len(catalog) <= self._deterministic_sentences:
-            # El orden (resultado, alcance, detalles) y la variante (fuente en el primer resultado)
-            # ya están determinados; el modelo sólo elegía entre textos verificados y demoraba
-            # entre 4 y 24 s. Un umbral menor reactiva la redacción con el proveedor.
-            first = next((item["sentence_id"] for item in self._ordered_entries(catalog, refs)
-                          if item.get("kind") == "result"), None)
-            response.answer = "\n\n".join(filter(None, [self._message(validation.status, language), *(
-                item["conversational" if item["sentence_id"] == first else "direct"] + " "
-                + " ".join(f"[{key}]" for key in item["evidence_ids"])
-                for item in self._ordered_entries(catalog, refs))]))
-            self._add_preview_note(response, context, language)
+            # El orden (resultado, alcance, detalles) ya está determinado y los textos son verificados;
+            # el modelo sólo elegía entre ellos y demoraba entre 4 y 24 s. Un umbral menor reactiva el proveedor.
+            self._publish(response, [*introduction, *self._segments(entries)])
             return self._finish(response, started)
         response.generation.model = self._provider.model
         model_started = perf_counter()
@@ -98,14 +103,14 @@ class GenerateResponseHandler:
             selected = [item.sentence_id for item in reply.draft.sentences]
             if len(selected) != len(set(selected)) or set(selected) != set(catalog):
                 raise LLMProviderError("El modelo omitió, repitió o inventó enunciados de evidencia.")
-            paragraphs = []
+            drafted = []
             for sentence in self._ordered(reply.draft.sentences, catalog, refs):
                 entry = catalog[sentence.sentence_id]
                 if (sentence.evidence_ids != entry["evidence_ids"]
                         or any(key not in refs for key in sentence.evidence_ids)):
                     raise LLMProviderError("La redacción cita evidencia no autorizada.")
-                paragraphs.append(entry[sentence.variant] + " " + " ".join(f"[{key}]" for key in entry["evidence_ids"]))
-            response.answer = "\n\n".join(filter(None, [self._message(validation.status, language), *paragraphs]))
+                drafted.append((entry, entry[sentence.variant]))
+            self._publish(response, [*introduction, *self._segments(drafted)])
             response.generation.status = "generated"
         except LLMProviderError as error:
             response.status = "failed"
@@ -119,51 +124,72 @@ class GenerateResponseHandler:
                 code="response_context_limit", message="La evidencia mínima supera el presupuesto de redacción; no se llamó al modelo.")
             response.errors.append(response.generation.error)
             # El reemplazo seguro no publica texto del LLM y deja explícito el fallo.
-            response.answer = self._message("generation_failed", language) + "\n\n" + "\n\n".join(
-                item["direct"] + " " + " ".join(f"[{key}]" for key in item["evidence_ids"]) for item in self._ordered_entries(catalog, refs))
+            self._publish(response, [AnswerSegment(kind="note", text=self._message("generation_failed", language)),
+                                     *introduction, *self._segments(entries)])
         response.generation.duration_ms = round((perf_counter() - model_started) * 1000, 3)
-        self._add_preview_note(response, context, language)
         return self._finish(response, started)
 
-    @classmethod
-    def _ordered_entries(cls, catalog, refs):
-        rank = {"result": 0, "summary": 1, "chart": 2, "scope": 3, "detail": 4}
+    @staticmethod
+    def _ordered_entries(catalog, refs):
         order = {key: index for index, key in enumerate(refs)}
-        return sorted(catalog.values(), key=lambda item: (
-            order.get(item["evidence_ids"][0], len(order)), rank.get(item.get("kind"), 4)))
+        return sorted(catalog.values(), key=lambda entry: _position(entry, order))
 
     @staticmethod
     def _ordered(sentences, catalog, refs):
-        """Cada evidencia presenta primero su resultado y después su alcance y detalles."""
         order = {key: index for index, key in enumerate(refs)}
-        rank = {"result": 0, "summary": 1, "chart": 2, "scope": 3, "detail": 4}
-        return sorted(sentences, key=lambda item: (
-            order.get(catalog[item.sentence_id]["evidence_ids"][0], len(order)),
-            rank.get(catalog[item.sentence_id].get("kind"), 4)))
+        return sorted(sentences, key=lambda item: _position(catalog[item.sentence_id], order))
 
     @staticmethod
-    def _add_preview_note(response, context, language):
-        if context.omitted_rows:
-            note = ("El texto muestra una vista abreviada; los resultados completos permanecen en las referencias estructuradas."
-                    if language == "es" else "The text is an abbreviated view; complete results remain available through the structured references.")
-            response.answer += "\n\n" + note
-            response.limitations.append(note)
+    def _segments(entries):
+        """Un párrafo por evidencia: su resultado, alcance y detalles, seguido de su tabla o gráfico."""
+        segments = []
+        for entry, text in entries:
+            previous = segments[-1] if segments else None
+            if previous is not None and previous.evidence_ids == entry["evidence_ids"]:
+                previous.text += " " + text
+                previous.attachment = previous.attachment or entry.get("attachment")
+            else:
+                segments.append(AnswerSegment(text=text, evidence_ids=list(entry["evidence_ids"]),
+                                              attachment=entry.get("attachment")))
+        return segments
+
+    @staticmethod
+    def _publish(response, segments):
+        response.segments = segments
+        response.answer = answer_text(segments)
+
+    @classmethod
+    def _unanswered(cls, validation, language, *, explained=False):
+        # Con un motivo concreto, la sugerencia genérica de reformular contradiría la explicación que sigue.
+        status = "blocked" if explained and validation.status == "failed" else validation.status
+        text = cls._message(status, language) or cls._message("failed", language)
+        if any(item.code == "incomplete_materialization" for item in validation.issues):
+            text += (" Uno de los resultados llegó incompleto, así que no lo usé para responder."
+                     if language == "es" else " One of the results was incomplete, so I did not use it to answer.")
+        if validation.clarification_question:
+            text += " " + validation.clarification_question
+        elif validation.missing_information:
+            text += (" Me faltó información sobre: " if language == "es" else " I was missing information about: ") \
+                + "; ".join(item.rstrip(". ") for item in validation.missing_information) + "."
+        return text
 
     @staticmethod
     def _message(status, language):
         messages = {
             "es": {"validated": "",
-                   "partial": "Pude responder parte de la consulta; quedan operaciones pendientes o con errores.",
-                   "needs_clarification": "Necesito una aclaración para continuar.",
-                   "insufficient_coverage": "No encontré evidencia suficiente entre los candidatos recuperados para responder esta pregunta; esto no demuestra que la información no exista en todo el catálogo.",
-                   "failed": "No pude construir un análisis verificable para esta pregunta con los datos disponibles. Podés reformularla indicando la variable, el sitio o la fuente que querés usar.",
-                   "generation_failed": "No pude completar la redacción verificada. Los valores que siguen provienen de la evidencia validada."},
+                   "partial": "Pude responder sólo una parte de la consulta; el resto no se pudo calcular de forma verificable.",
+                   "needs_clarification": "Necesito que me aclares algo para continuar.",
+                   "insufficient_coverage": "No encontré datos suficientes para responder esta pregunta en las fuentes que revisé. Esto no significa que la información no exista: puede estar en otra fuente o con otro nombre.",
+                   "failed": "No pude armar un análisis confiable para esta pregunta con los datos disponibles. Probá reformularla indicando la variable, el sitio o la fuente que querés usar.",
+                   "blocked": "No pude completar el análisis con los datos disponibles.",
+                   "generation_failed": "No pude redactar la respuesta completa. Estos son los resultados verificados:"},
             "en": {"validated": "",
-                   "partial": "I could answer part of the question; some operations remain pending or failed.",
-                   "needs_clarification": "I need a clarification to continue.",
-                   "insufficient_coverage": "There is insufficient evidence among the retrieved candidates to answer this question; this does not establish that the information is absent from the entire catalog.",
-                   "failed": "I could not build a verifiable analysis for this question with the available data. You can rephrase it with the variable, site or source you want to use.",
-                   "generation_failed": "I could not complete the verified wording. The values below come from validated evidence."},
+                   "partial": "I could only answer part of the question; the rest could not be calculated in a verifiable way.",
+                   "needs_clarification": "I need you to clarify something to continue.",
+                   "insufficient_coverage": "I did not find enough data to answer this question in the sources I reviewed. This does not mean the information does not exist: it may be in another source or under another name.",
+                   "failed": "I could not build a reliable analysis for this question with the available data. Try rephrasing it with the variable, site or source you want to use.",
+                   "blocked": "I could not complete the analysis with the available data.",
+                   "generation_failed": "I could not write the complete answer. These are the verified results:"},
         }
         return messages[language].get(status, messages[language]["failed"])
 

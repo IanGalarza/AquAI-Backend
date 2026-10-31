@@ -67,7 +67,7 @@ class ConversationMessage(BaseModel):
 
 
 class ResponseContextRecord(BaseModel):
-    prompt_version: str = "aquai-response-v1"
+    prompt_version: str = "aquai-response-v3"
     evidence: dict[str, JsonValue]
     sha256: str
     size_bytes: int
@@ -125,12 +125,24 @@ class ResponseResultReference(BaseModel):
     complete: Literal[True] = True
 
 
+class AnswerSegment(BaseModel):
+    """Párrafo de la respuesta vinculado a la evidencia que respalda sus afirmaciones."""
+
+    kind: Literal["paragraph", "note"] = "paragraph"
+    text: str = Field(min_length=1)
+    items: list[str] = Field(default_factory=list)
+    evidence_ids: list[str] = Field(default_factory=list)
+    # Evidencia (tabla o gráfico) que se presenta a continuación del párrafo.
+    attachment: str | None = None
+
+
 class QueryResponse(BaseModel):
     response_type: Literal["analytical", "general", "catalog", "clarification", "historical"] = "analytical"
     status: AnswerStatus | Literal["answered"]
     validation_status: AnswerStatus | None
     answer: str
     language: Language
+    segments: list[AnswerSegment] = Field(default_factory=list)
     sources: list[SourceReference] = Field(default_factory=list)
     operation_references: list[ResponseOperationReference] = Field(default_factory=list)
     results: list[ResponseResultReference] = Field(default_factory=list)

@@ -5,6 +5,7 @@ from contextlib import contextmanager
 from sqlalchemy import func, select
 
 from aquai.application.contracts.conversations import MessageView
+from aquai.application.conversations.presentation import present_message
 from aquai.application.errors import ConversationsUnavailableError
 from aquai.domain.models import MessageStatus
 
@@ -48,11 +49,12 @@ def message_view(item, statuses, sources=()):
     source_fields = (
         "id", "source_id", "dataset_id", "reference_order", "details",
     )
-    return MessageView.model_validate({
+    view = {
         **{key: getattr(item, key) for key in fields},
         "status": {"id": item.status_id, "name": statuses[item.status_id]},
         "sources": [
             {key: getattr(source, key) for key in source_fields}
             for source in sources
         ],
-    })
+    }
+    return MessageView.model_validate({**view, "presentation": present_message(view)})

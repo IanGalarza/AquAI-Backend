@@ -226,6 +226,24 @@ class SqlAlchemySourceQueries:
                     select(field).where(field.is_not(None)).distinct().limit(limit + 1)))
         return result
 
+    def frequent_text_values(self, dataset: VerifiedDataset, column: str, *, measured: str | None = None,
+                             limit: int = 12) -> list[dict[str, Any]]:
+        """Valores de una columna TEXT con más registros; con measured, sólo cuentan los que tienen esa variable."""
+        names = {item.sql_name: item for item in dataset.columns_metadata}
+        if (column not in names or names[column].sql_type != "TEXT" or (measured is not None and measured not in names)
+                or not re.fullmatch(r"dataset_[0-9a-f]{32}", dataset.physical_table_name)):
+            return []
+        table = Table(dataset.physical_table_name, MetaData(), *(Column(name, Text) for name in {column, measured} - {None}))
+        field = table.c[column]
+        statement = select(field.label("value"), func.count().label("rows")).where(field.is_not(None))
+        if measured is not None:
+            statement = statement.where(table.c[measured].is_not(None))
+        statement = statement.group_by(field).order_by(func.count().desc(), field).limit(limit)
+        with self._context.engine.connect() as connection, connection.begin():
+            connection.exec_driver_sql("SET TRANSACTION READ ONLY")
+            connection.execute(select(func.pg_catalog.set_config("statement_timeout", "3000", True)))
+            return [dict(row) for row in connection.execute(statement).mappings()]
+
     def get(self, source_id: UUID, *, include_content: bool = False) -> dict[str, Any]:
         with self._context.session() as session:
             snapshot = source_snapshot(session, source_id, include_content=include_content)

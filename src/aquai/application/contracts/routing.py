@@ -33,12 +33,15 @@ class HistoryMessage(BaseModel):
     context_message_ids: list[UUID] = Field(default_factory=list, max_length=4)
     # Variables ya interpretadas en ese turno; un seguimiento sin variable nueva las conserva.
     variables: list[str] = Field(default_factory=list, max_length=12)
+    # Párrafos con citas y columnas de cada fuente (por dataset_id); sólo se reproducen, nunca se envían al Router.
+    segments: list[dict[str, JsonValue]] = Field(default_factory=list)
+    source_columns: dict[str, list[dict[str, JsonValue]]] = Field(default_factory=dict)
 
 
 class DataMention(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     text: str = Field(min_length=1, max_length=200, description="Texto copiado literalmente de la pregunta actual o de una solicitud pendiente.")
-    kind: Literal["variable", "value", "date"] = Field(description="variable: parámetro medido; value: valor de columna que acota registros, como una localidad o estación; date: fecha o período solicitado.")
+    kind: Literal["variable", "value", "date", "limit"] = Field(description="variable: parámetro medido; value: valor de columna que acota registros, como una localidad o estación; date: fecha o período solicitado; limit: cantidad de registros o resultados que se pide ver.")
 
 
 class RoutingDraft(BaseModel):

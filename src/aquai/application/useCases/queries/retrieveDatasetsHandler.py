@@ -11,7 +11,7 @@ from aquai.application.contracts.retrieval import (
 from aquai.application.contracts.routing import DatasetBinding
 from aquai.application.interfaces.retrieval import DatasetSemanticSearch
 from aquai.application.interfaces.sources import SourceQueries
-from aquai.application.matching import contains_phrase
+from aquai.application.matching import contains_phrase, variable_core
 from aquai.domain.enums.sourceStatus import SemanticIndexStatus
 
 
@@ -32,10 +32,21 @@ class RetrieveDatasetsHandler:
             # Una fuente nombrada por el usuario se respeta; los datasets heredados del
             # historial sí se acotan por la evidencia de la nueva pregunta.
             inherited = all(item.historical_version is not None for item in dataset_bindings)
-            return await self._rank(result, data_mentions, limit=None, restrict=inherited,
-                                    tentative=tentative_values)
+            ranked = await self._rank(result, data_mentions, limit=None, restrict=inherited,
+                                      tentative=tentative_values)
+            if not inherited or self._answers(ranked, data_mentions):
+                return ranked
+            # Un seguimiento sobre otra variable o sitio («¿y la turbiedad?») no queda atado a
+            # datasets que no los registran: se busca en todo el catálogo con la misma evidencia.
+            # La similitud se calcula sobre lo pedido, no sobre los metadatos históricos de la pregunta.
+            requested = " ".join(dict.fromkeys(item.text for item in data_mentions))
+            found = await self._search(question, limit, data_mentions, tentative_values, query=requested)
+            return found if self._answers(found, data_mentions) else ranked
+        return await self._search(question, limit, data_mentions, tentative_values)
+
+    async def _search(self, question, limit, data_mentions, tentative_values, *, query=None):
         # La similitud ordena un conjunto amplio; la evidencia de registros decide el recorte.
-        hits = await self._index.search(question, limit=min(100, max(limit * 6, 30)))
+        hits = await self._index.search(query or question, limit=min(100, max(limit * 6, 30)))
         versions = {UUID(hit["dataset_id"]): hit["version"] for hit in hits}
         verified = await asyncio.to_thread(
             self._queries.verified_datasets, list(versions), versions=versions,
@@ -112,8 +123,17 @@ class RetrieveDatasetsHandler:
                     if contains_phrase(column.original_name, text, plural_insensitive=True)
                     or contains_phrase(column.sql_name, text, plural_insensitive=True)]
 
+        def variable_columns(variable):
+            # La estadística de la mención («pH promedio») se descarta sólo si ningún candidato nombra la mención entera.
+            exact = {dataset.dataset_id: named(dataset, variable) for dataset in candidates}
+            if any(exact.values()):
+                return exact
+            core = variable_core(variable)
+            return {dataset.dataset_id: named(dataset, core) for dataset in candidates}
+
+        columns = {variable: variable_columns(variable) for variable in variables}
         evidence = {dataset.dataset_id: DatasetEvidence(dataset_id=dataset.dataset_id, variable_matches={
-            variable: names for variable in variables if (names := named(dataset, variable))
+            variable: names for variable, matches in columns.items() if (names := matches[dataset.dataset_id])
         }) for dataset in candidates}
         with_variables = [dataset for dataset in candidates
                           if variables and len(evidence[dataset.dataset_id].variable_matches) == len(variables)]
@@ -204,6 +224,14 @@ class RetrieveDatasetsHandler:
                            or evidence[item.dataset_id].dimension_matches]
         result.status = "candidates_available" if ranked else "no_available_candidates"
         return result
+
+    @staticmethod
+    def _answers(result, mentions):
+        """Algún candidato registra todas las variables y valores mencionados."""
+        variables = {item.text for item in mentions if item.kind == "variable"}
+        values = {item.text for item in mentions if item.kind == "value"} - set(result.dimension_mentions)
+        return any(variables <= set(item.variable_matches) and values <= set(item.value_matches)
+                   for item in result.evidence) or not (variables or values)
 
     @staticmethod
     def _prune_overlaps(result):

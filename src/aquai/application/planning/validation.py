@@ -192,6 +192,7 @@ def validate_operations(decision: PlannerDecision, selected: list[SelectedDatase
                 y = resolve(chart.y) if chart.y is not None else None
                 if chart.series is not None:
                     resolve(chart.series)
+                    _require(chart.series != chart.x, "La serie del gráfico debe ser un campo distinto del eje x.")
                 numeric = lambda field: field.numeric_eligible and field.sql_type in {"BIGINT", "NUMERIC"}
                 if chart.chart_type in {"scatter", "histogram"}:
                     _require(numeric(x), "El eje x del gráfico requiere una variable numérica elegible.")
@@ -199,6 +200,8 @@ def validate_operations(decision: PlannerDecision, selected: list[SelectedDatase
                     _require(numeric(x) or x.sql_type in {"DATE", "TIMESTAMP"}, "Una línea requiere un eje numérico o temporal verificado; no se interpretan fechas TEXT.")
                 if y is not None:
                     _require(numeric(y), "El eje y del gráfico requiere una variable numérica elegible.")
+                    _require(chart.x != chart.y, "Los ejes x e y del gráfico deben ser campos distintos: x es la categoría "
+                             "(por ejemplo, el sitio agrupado) e y el valor calculado.")
                 if source in limited_steps:
                     issue("explicitly_limited_chart", "El gráfico representa el límite explícito del plan, no todo el dataset.", step.id, "warning")
                 fields = []

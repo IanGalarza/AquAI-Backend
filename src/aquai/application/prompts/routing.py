@@ -15,7 +15,8 @@ Rutas:
   Retriever y Planner buscan los datasets y los filtros. Un tema científico sin pedido
   de datos NO es data.
 - historical: pide repetir o recordar textualmente un resultado anterior, sin calcular
-  nada nuevo. Requiere exactamente un mensaje assistant con analysis.
+  nada nuevo. Requiere exactamente un mensaje assistant con analysis. Si además pide
+  otra cantidad, un gráfico, otra variable o un filtro, es data.
 - needs_clarification: sólo cuando la pregunta depende de una referencia previa que no
   se puede identificar en history ('¿Y en el otro sitio?' sin un sitio previo
   inequívoco, 'Compará esos dos' sin una pareja) o cuando falta la variable y el
@@ -23,7 +24,8 @@ Rutas:
 
 Historial y seguimientos:
 history_message_ids sólo puede contener identificadores de history. En un seguimiento
-('Ahora mostralo en un gráfico', '¿Y de qué año es?', '¿Y durante 2024?') usá data y
+('Ahora mostralo en un gráfico', '¿Y de qué año es?', '¿Y durante 2024?', 'Y ahora lo
+mismo para el pH') usá data, marcá context_required=true y
 citá el mensaje assistant con analysis correspondiente: sus sources/operations describen
 variables, filtros, períodos y agrupaciones verificadas. El nuevo pedido tiene prioridad.
 Un mensaje assistant con clarification=true pidió una aclaración. Si la pregunta actual
@@ -41,8 +43,13 @@ parezcan a una parte del nombre de un archivo.
 data_mentions contiene objetos {text, kind} con fragmentos LITERALES de la pregunta
 actual o de pending_requests: variable es el parámetro medido (pH, turbiedad,
 oxígeno disuelto); value es la localidad, sitio, estación u otro valor que acota
-registros; date es una fecha o período pedido. Separá variable y valor: en
+registros; date es una fecha o período pedido; limit es la cantidad de registros o
+resultados que se pide ver ('los primeros 5 registros', 'top 10', 'los 3 valores más
+altos', 'todos los registros'). Separá variable y valor: en
 'conductividad de La Balandra' son 'conductividad' (variable) y 'La Balandra' (value).
+En 'Graficá sólo los 3 primeros resultados' la mención es '3 primeros resultados'
+(limit): una cantidad nunca es una fecha ni un valor. Un superlativo sin cantidad
+('el mayor', 'la mayor cantidad', 'el más alto') no es un limit.
 Un value es un nombre concreto; lo que se pregunta no es un value: en '¿Qué estación
 tuvo la turbiedad más alta?' sólo 'turbiedad' es una mención (variable) y 'estación'
 no se incluye.

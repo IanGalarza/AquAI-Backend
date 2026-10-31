@@ -52,9 +52,9 @@ async def resolve_filter_values(decision, selected, operations, mentions, querie
                         ref.dataset_id, dataset.verified_version, ref.column, value)
                 matches = cache[key]
                 if len(matches) > 1:
-                    options = ", ".join(f"«{item}»" for item in matches)
+                    options = ", ".join(str(item) for item in matches)
                     issues.append(ValidationIssue(code="ambiguous_filter_value", severity="clarification", step_id=step.id,
-                        message=f"«{value}» coincide con varios valores de «{column.original_name}»: {options}. ¿Cuál querés usar?"))
+                        message=f"{value} coincide con varios valores de la columna {column.original_name}: {options}. ¿Cuál querés usar?"))
                     values.append(value)
                     continue
                 if matches:
@@ -79,15 +79,15 @@ async def resolve_filter_values(decision, selected, operations, mentions, querie
                 if not candidates and any(contains_phrase(name, value) for name in source_names):
                     # El usuario nombró así la fuente: no es un valor de registros que deba filtrarse.
                     issues.append(ValidationIssue(code="source_name_filter_removed", severity="warning", step_id=step.id,
-                        message=f"Se quitó el filtro «{value}» en «{column.original_name}»: es el nombre de la fuente indicada."))
+                        message=f"Se quitó el filtro {value} en la columna {column.original_name}: es el nombre de la fuente indicada."))
                 elif not candidates:
                     issues.append(ValidationIssue(code="filter_value_not_found", severity="clarification", step_id=step.id,
-                        message=f"«{value}» no aparece en la columna «{column.original_name}» de «{dataset.name}»."))
+                        message=f"{value} no aparece en la columna {column.original_name} de {dataset.name}."))
                     values.append(value)
                 elif len(candidates) > _MAX_EXPANDED_VALUES:
-                    sample = ", ".join(f"«{item}»" for item in candidates[:6])
+                    sample = ", ".join(str(item) for item in candidates[:6])
                     issues.append(ValidationIssue(code="ambiguous_filter_value", severity="clarification", step_id=step.id,
-                        message=f"«{value}» aparece en muchos valores de «{column.original_name}» ({sample}, …). ¿Cuál querés usar?"))
+                        message=f"{value} aparece en muchos valores de la columna {column.original_name} ({sample}, …). ¿Cuál querés usar?"))
                     values.append(value)
                 else:
                     values.extend(candidates)

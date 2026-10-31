@@ -80,6 +80,7 @@ class SqlAlchemyConversationQueries:
                     data["response"]["routing"]["request_history"].label("requests"),
                     data["response"]["routing"]["history_message_ids"].label("context_ids"),
                     data["response"]["routing"]["data_mentions"].label("mentions"),
+                    data["response"]["segments"].label("segments"),
                     data["operations"].label("operations"),
                     data["validated_at"].label("verified_at"),
                 )
@@ -114,6 +115,7 @@ class SqlAlchemyConversationQueries:
                     MessageSource.dataset_id,
                     MessageSource.details["dataset_version"].label("version"),
                     MessageSource.details["provenance"].label("provenance"),
+                    MessageSource.details["columns"].label("columns"),
                 ).where(MessageSource.message_id.in_(ids))
                 for item in session.execute(projection).mappings():
                     associations.setdefault(item["message_id"], []).append(dict(item))

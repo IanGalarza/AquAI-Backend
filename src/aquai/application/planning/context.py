@@ -27,7 +27,8 @@ def build_planning_context(question: str, datasets: list[VerifiedDataset], budge
          "values": {mention: [{"column": match.column, "stored_values": match.values[:30], "rows": match.rows}
                               for match in matches] for mention, matches in item.value_matches.items()},
          "variable_columns": item.variable_matches,
-         "requested_dimension_columns": item.dimension_matches}
+         "requested_dimension_columns": item.dimension_matches,
+         **({"category_values": item.category_values} if item.category_values else {})}
         for item in dataset_evidence
     ]
     column_fields = ["sql_name", "original_name", "sql_type", "unit", "numeric_eligible", "annotations"]

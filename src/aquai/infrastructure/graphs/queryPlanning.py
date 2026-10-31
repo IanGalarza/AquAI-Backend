@@ -9,6 +9,7 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 
 from aquai.application.contracts.answering import QueryResponseInput, QueryResponseState
+from aquai.application.conversations.context import cited_analysis
 from aquai.application.execution import summarize_execution
 from aquai.application.useCases.queries.executePythonPlanHandler import ExecutePythonPlanHandler
 from aquai.application.useCases.queries.executeSqlPlanHandler import ExecuteSqlPlanHandler
@@ -114,7 +115,9 @@ def build_query_planning_graph(
                                       original_question=state.question,
                                       data_mentions=[item for item in state.routing.data_mentions if not isinstance(item, str)],
                                       request_history=state.routing.request_history,
-                                      source_mentions=state.routing.source_mentions)
+                                      source_mentions=state.routing.source_mentions,
+                                      previous_analysis=cited_analysis(state.conversation_history,
+                                                                       state.routing.history_message_ids))
         return {
             "planning": result, "status": result.status,
             "pending_operations": [step.id for step in result.operations],

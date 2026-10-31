@@ -26,6 +26,21 @@ def _cap_free_text(schema):
             stack.extend(node)
 
 
+def _restrict_identifiers(schema, evidence):
+    """Los UUID y sql_name sólo pueden copiarse del contexto: el modelo altera dígitos o usa alias como columnas.
+
+    La validación sigue comprobando que cada columna pertenezca a su propio dataset."""
+    datasets = [item["dataset_id"] for item in evidence.get("datasets", [])]
+    columns = sorted({row[0] for rows in evidence.get("column_catalogs", {}).values() for row in rows})
+    if not datasets or not columns:
+        return
+    definitions = schema["$defs"]
+    for name in ("DatasetSelection", "ColumnRef"):
+        definitions[name]["properties"]["dataset_id"]["enum"] = datasets
+    definitions["DatasetSelection"]["properties"]["columns"]["items"]["enum"] = columns
+    definitions["ColumnRef"]["properties"]["column"]["enum"] = columns
+
+
 class OllamaPlannerProvider:
     def __init__(self, settings: TabularSettings) -> None:
         self._settings = settings
@@ -46,6 +61,7 @@ class OllamaPlannerProvider:
             raise LLMProviderError("El catálogo excede el presupuesto de contexto del Planner.")
         schema = self._output.json_schema()
         _cap_free_text(schema)
+        _restrict_identifiers(schema, context.evidence)
         if any(item["kind"] == "value" for item in context.evidence.get("query_mentions", [])):
             schema["$defs"]["ReadPlanStep"]["properties"]["filters"]["minItems"] = 1
         body = await self._client.post("/api/chat", {
