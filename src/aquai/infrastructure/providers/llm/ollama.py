@@ -53,6 +53,25 @@ def model_identity(model: str) -> str:
     return f"{model}:latest"
 
 
+def prompt_tokens(body: dict) -> int | None:
+    # Ollama puede omitir el recuento o enviarlo nulo: entonces el desborde no puede medirse.
+    count = body.get("prompt_eval_count")
+
+    if count is None:
+        return None
+
+    if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+        raise LLMProviderError("Ollama devolvió un recuento de tokens de entrada inválido.")
+
+    return count
+
+
+def exceeds_context(body: dict, limit: int) -> bool:
+    tokens = prompt_tokens(body)
+
+    return tokens is not None and tokens >= limit
+
+
 def _is_finite_number(value: Any) -> bool:
     return not isinstance(value, bool) and isinstance(value, (int, float)) and math.isfinite(value)
 

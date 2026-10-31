@@ -420,7 +420,8 @@ class _EvidenceEvaluation:
             )
 
     def _dependencies_unusable(self, step, record) -> bool:
-        if record.input_operation_ids != step.depends_on:
+        # Todo paso Python opera sobre un resultado previo: sin entrada no hay evidencia válida.
+        if not step.depends_on or record.input_operation_ids != step.depends_on:
             return True
 
         return any(self._dependency_unusable(parent) for parent in step.depends_on)

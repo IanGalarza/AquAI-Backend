@@ -8,8 +8,11 @@ IDENTIFIER_COLUMN = re.compile(
 )
 
 # Proyección numérica de una columna de texto: sólo en columnas de medición, nunca en estas.
+# Palabras completas (en singular o plural): «id» no debe excluir Turbidez ni Conductividad.
 NON_MEASUREMENT_COLUMN = re.compile(
-    r"(?:id|code|c[oó]digo|identificador|fecha|date|sitio|site|muestra)", re.IGNORECASE
+    r"(?<![^\W\d_])(?:id|code|c[oó]digo|identificador|fecha|date|sitio|site|muestra)(?:e?s)?"
+    r"(?![^\W\d_])",
+    re.IGNORECASE,
 )
 MEASUREMENT_COLUMN = re.compile(
     r"\b(?:abundancia|cantidad|recuento|valor|medida|concentraci[oó]n|"

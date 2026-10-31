@@ -49,7 +49,21 @@ class GenerateDirectResponseService:
 
         selected = _selected_history(state, routing)
 
+        if selected is None:
+            return self._failure(
+                response,
+                "routing_failed",
+                "La ruta cita mensajes que no están en el historial de la conversación.",
+            )
+
         if routing.route == "historical":
+            if len(selected) != 1 or selected[0].analysis is None:
+                return self._failure(
+                    response,
+                    "historical_reference_missing",
+                    "La ruta histórica no cita un único resultado anterior recuperable.",
+                )
+
             return self._historical_response(response, routing, selected[0])
 
         if any(item.scientific for item in selected):
@@ -209,6 +223,9 @@ def _initial_response(state, routing) -> QueryResponse:
 
 def _selected_history(state, routing):
     messages = {item.message_id: item for item in state.conversation_history}
+
+    if any(key not in messages for key in routing.history_message_ids):
+        return None
 
     return [messages[key] for key in routing.history_message_ids]
 

@@ -1170,10 +1170,12 @@ def _source_field(step, ref):
 
 def _goes_without_saying(predicate, shown):
     ref = predicate.field
-    # Una igualdad sobre una columna visible ya se lee en sus valores; un rango nunca.
-    visible_equality = _source_key(ref) in shown and predicate.operator in _EQUALITY_OPERATORS
+    # Los filtros sobre resultados ya calculados los anuncia result_filters.
+    if ref.kind != "column" or predicate.operator == "is_not_null":
+        return True
 
-    return ref.kind != "column" or predicate.operator == "is_not_null" or visible_equality
+    # Una igualdad sobre una columna visible ya se lee en sus valores; un rango nunca.
+    return _source_key(ref) in shown and predicate.operator in _EQUALITY_OPERATORS
 
 
 def _lists_places(predicate, label):

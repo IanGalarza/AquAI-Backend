@@ -11,7 +11,11 @@ from aquai.application.errors import LLMProviderError
 from aquai.application.prompts.response import RESPONSE_PROMPT
 from aquai.infrastructure.config.answering import AnsweringSettings
 from aquai.infrastructure.config.tabular import TabularSettings
-from aquai.infrastructure.providers.llm.ollama import _OllamaClient
+from aquai.infrastructure.providers.llm.ollama import (
+    _OllamaClient,
+    exceeds_context,
+    prompt_tokens,
+)
 
 
 class ResponseGenerationError(LLMProviderError):
@@ -76,7 +80,7 @@ class OllamaResponseProvider:
         )
         metadata = {
             "model": body.get("model", self.model),
-            "input_tokens": body.get("prompt_eval_count"),
+            "input_tokens": prompt_tokens(body),
             "output_tokens": body.get("eval_count"),
         }
         draft = self._parse_draft(self._message_content(body, metadata), metadata)
@@ -104,7 +108,7 @@ class OllamaResponseProvider:
             or body.get("done_reason") == "length"
             or not isinstance(message, dict)
             or not isinstance(message.get("content"), str)
-            or body.get("prompt_eval_count", 0) >= context_limit
+            or exceeds_context(body, context_limit)
         )
         if incomplete:
             raise ResponseGenerationError(

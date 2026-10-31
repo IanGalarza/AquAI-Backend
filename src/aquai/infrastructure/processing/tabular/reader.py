@@ -74,6 +74,15 @@ def _attribute_ids(element):
     return (value for key, value in element.attrib.items() if _local_name(key) == "id")
 
 
+def _table_part_id(element) -> str:
+    relation_id = next(_attribute_ids(element), None)
+
+    if relation_id is None:
+        raise TabularInputError("El XLSX declara una tabla sin identificador de relación.")
+
+    return relation_id
+
+
 def _part_path(base: str, target: str) -> str:
     if target.startswith("/"):
         return target.lstrip("/")
@@ -230,6 +239,8 @@ class TableReader:
 
         try:
             return self._read_excel(content)
+        except TabularInputError:
+            raise
         except (ValueError, KeyError, OSError, ElementTree.ParseError, InvalidOperation) as error:
             raise TabularInputError("No se pudo leer el contenido del XLSX.") from error
 
@@ -514,7 +525,7 @@ class TableReader:
                 elif tag == "mergeCell":
                     layout.merged_ranges.append(range_boundaries(element.attrib["ref"]))
                 elif tag == "tablePart":
-                    layout.table_parts.append(next(_attribute_ids(element)))
+                    layout.table_parts.append(_table_part_id(element))
 
                 if tag in {"c", "mergeCell", "tablePart", "row"}:
                     element.clear()
@@ -603,6 +614,12 @@ class TableReader:
             return None
 
         bounds = list(range_boundaries(table.attrib["ref"]))
+
+        if None in bounds:
+            raise TabularInputError(
+                f"La tabla {name} declara un rango sin límites de filas o columnas."
+            )
+
         totals = int(table.attrib.get("totalsRowCount", "0"))
 
         if totals or table.attrib.get("totalsRowShown", "0") in {"1", "true"}:

@@ -10,7 +10,11 @@ from aquai.application.contracts.routing import (
 )
 from aquai.application.errors import LLMProviderError
 from aquai.application.prompts.routing import GENERAL_PROMPT, ROUTER_PROMPT
-from aquai.infrastructure.providers.llm.ollama import _OllamaClient
+from aquai.infrastructure.providers.llm.ollama import (
+    _OllamaClient,
+    exceeds_context,
+    prompt_tokens,
+)
 from aquai.infrastructure.providers.llm.response import ResponseGenerationError
 
 
@@ -54,7 +58,7 @@ class _StructuredConversationProvider:
         )
         metadata = {
             "model": body.get("model", self.model),
-            "input_tokens": body.get("prompt_eval_count"),
+            "input_tokens": prompt_tokens(body),
             "output_tokens": body.get("eval_count"),
         }
         decision = self._parse_output(self._message_content(body, metadata), metadata)
@@ -69,7 +73,7 @@ class _StructuredConversationProvider:
             or body.get("done_reason") == "length"
             or not isinstance(message, dict)
             or not isinstance(message.get("content"), str)
-            or body.get("prompt_eval_count", 0) >= context_limit
+            or exceeds_context(body, context_limit)
         )
         if incomplete:
             raise ResponseGenerationError("Respuesta conversacional incompleta.", **metadata)

@@ -244,6 +244,10 @@ def _latest(step, rows, filtered, period_key):
     name = step.order_by[0].field.field
     warnings = []
 
+    undated = sum(1 for row in filtered if row[name] is None)
+    if undated:
+        warnings.append(f"Se excluyeron {undated} registros sin fecha.")
+
     # Un período TEXT se ordena por su fin explícito; los textos no interpretables se excluyen.
     key = period_key or (lambda value: value)
     dated = [(row, key(row[name])) for row in filtered if row[name] is not None]
@@ -260,7 +264,8 @@ def _latest(step, rows, filtered, period_key):
     maximum = max((value for _, value in dated), default=None)
     output = [row for row, value in dated if value == maximum]
 
-    return output, [], warnings, len(rows) - len(output)
+    # Sólo los filtros explícitos filtran; las filas de otras fechas son el criterio de latest.
+    return output, [], warnings, len(rows) - len(filtered)
 
 
 def _sort(step, rows, filtered, frame, budget):

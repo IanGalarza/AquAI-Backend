@@ -10,7 +10,11 @@ from aquai.application.contracts.planning import (
 from aquai.application.errors import LLMProviderError
 from aquai.application.prompts.planning import PLANNER_PROMPT
 from aquai.infrastructure.config.tabular import TabularSettings
-from aquai.infrastructure.providers.llm.ollama import _OllamaClient
+from aquai.infrastructure.providers.llm.ollama import (
+    _OllamaClient,
+    exceeds_context,
+    prompt_tokens,
+)
 
 _FREE_TEXT_LIMITS = {"reason": 400, "purpose": 160}
 
@@ -112,7 +116,7 @@ class OllamaPlannerProvider:
         return PlannerReply(
             decision=decision,
             model=body["model"],
-            input_tokens=body.get("prompt_eval_count"),
+            input_tokens=prompt_tokens(body),
             output_tokens=body.get("eval_count"),
         )
 
@@ -139,7 +143,7 @@ class OllamaPlannerProvider:
             raise LLMProviderError("Ollama devolvió una planificación incompleta.")
 
         context_limit = self._settings.llm_num_ctx - self._output_tokens - 256
-        if body.get("prompt_eval_count", 0) >= context_limit:
+        if exceeds_context(body, context_limit):
             raise LLMProviderError(
                 "El contexto del Planner se aproxima al límite real del modelo; hay que acotar la consulta."
             )
