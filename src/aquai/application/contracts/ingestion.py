@@ -1,5 +1,3 @@
-"""Tablas preparadas y metadatos; nunca contienen instrucciones ejecutables."""
-
 from dataclasses import dataclass, field
 from typing import Any, Literal
 

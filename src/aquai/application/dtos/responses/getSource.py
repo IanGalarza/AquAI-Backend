@@ -1,8 +1,9 @@
-"""Proyección del detalle que consume la interfaz, sin metadatos internos."""
 from datetime import datetime
 from typing import Any
 from uuid import UUID
+
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+
 from aquai.application.dtos.responses.sourceState import SourceStateResponse
 
 
@@ -28,9 +29,12 @@ class SourceLocator(BaseModel):
     @classmethod
     def project_overlap(cls, value: Any) -> Any:
         if isinstance(value, dict):
-            return {**value, "has_possible_overlap": bool(
-                value.get("has_possible_overlap") or value.get("possible_overlap")
-            )}
+            return {
+                **value,
+                "has_possible_overlap": bool(
+                    value.get("has_possible_overlap") or value.get("possible_overlap")
+                ),
+            }
         return value
 
 

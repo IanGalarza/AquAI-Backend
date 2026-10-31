@@ -1,12 +1,14 @@
-"""Puertos de historial y ejecución de una consulta; sin sesiones ni LangGraph."""
-
 from __future__ import annotations
 
 from typing import Protocol
 from uuid import UUID
 
 from aquai.application.contracts.answering import QueryResponseInput, QueryResponseState
-from aquai.application.contracts.conversations import AssistantRecord, MessageView, TurnReservation
+from aquai.application.contracts.conversations import (
+    AssistantRecord,
+    MessageView,
+    TurnReservation,
+)
 
 
 class ConversationQueries(Protocol):
@@ -21,7 +23,10 @@ class ConversationCommands(Protocol):
     def rename(self, conversation_id: UUID, title: str) -> dict: ...
     def delete(self, conversation_id: UUID) -> None: ...
     def begin_turn(
-        self, conversation_id: UUID, content: str, language: str | None,
+        self,
+        conversation_id: UUID,
+        content: str,
+        language: str | None,
     ) -> TurnReservation: ...
     def finish_turn(self, turn: TurnReservation, record: AssistantRecord) -> MessageView: ...
 

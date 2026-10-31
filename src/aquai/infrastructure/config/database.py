@@ -1,5 +1,3 @@
-"""Configuración validada de PostgreSQL, cargada cuando la aplicación la necesita."""
-
 from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy.engine import URL, make_url
@@ -7,8 +5,6 @@ from sqlalchemy.exc import ArgumentError
 
 
 class DatabaseSettings(BaseSettings):
-    """Lee la conexión desde las variables de entorno o el archivo .env local."""
-
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
@@ -24,7 +20,6 @@ class DatabaseSettings(BaseSettings):
     @field_validator("database_url", mode="before")
     @classmethod
     def validate_database_url(cls, value: object) -> SecretStr:
-        """Normaliza las URLs de PostgreSQL y rechaza los drivers incompatibles."""
         raw_value = value.get_secret_value() if isinstance(value, SecretStr) else value
         if not isinstance(raw_value, str) or not raw_value.strip():
             raise ValueError("DATABASE_URL debe contener una URL de conexión a PostgreSQL.")

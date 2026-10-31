@@ -1,11 +1,12 @@
-"""Router y redacción general reutilizando el transporte y la cola de Ollama."""
-
 import json
 
 from pydantic import ValidationError
 
 from aquai.application.contracts.routing import (
-    GeneralDraft, GeneralReply, RoutingDraft, RoutingReply,
+    GeneralDraft,
+    GeneralReply,
+    RoutingDraft,
+    RoutingReply,
 )
 from aquai.application.errors import LLMProviderError
 from aquai.application.prompts.routing import GENERAL_PROMPT, ROUTER_PROMPT
@@ -20,46 +21,66 @@ class _StructuredConversationProvider:
         self._prompt = prompt
         self._output = output
         self._output_tokens = min(output_tokens, settings.llm_num_ctx // 4)
+
         overhead = len(prompt.encode()) + len(json.dumps(output.model_json_schema())) + 1024
-        self.context_budget_bytes = max(0, min(
-            24_000, 2 * (settings.llm_num_ctx - self._output_tokens) - overhead
-        ))
+        self.context_budget_bytes = max(
+            0, min(24_000, 2 * (settings.llm_num_ctx - self._output_tokens) - overhead)
+        )
         self.model = settings.default_model
 
     async def _generate(self, context, schema=None):
         content = json.dumps(context, ensure_ascii=False, separators=(",", ":"))
         if len(content.encode("utf-8")) > self.context_budget_bytes:
             raise LLMProviderError("El contexto conversacional supera el límite permitido.")
-        body = await self._client.post("/api/chat", {
-            "model": self.model, "stream": False, "think": self._settings.llm_think,
-            "format": schema or self._output.model_json_schema(),
-            "options": {
-                "temperature": 0, "num_ctx": self._settings.llm_num_ctx,
-                "num_predict": self._output_tokens,
+
+        body = await self._client.post(
+            "/api/chat",
+            {
+                "model": self.model,
+                "stream": False,
+                "think": self._settings.llm_think,
+                "format": schema or self._output.model_json_schema(),
+                "options": {
+                    "temperature": 0,
+                    "num_ctx": self._settings.llm_num_ctx,
+                    "num_predict": self._output_tokens,
+                },
+                "messages": [
+                    {"role": "system", "content": self._prompt},
+                    {"role": "user", "content": content},
+                ],
             },
-            "messages": [
-                {"role": "system", "content": self._prompt},
-                {"role": "user", "content": content},
-            ],
-        }, self._settings.llm_timeout_seconds)
+            self._settings.llm_timeout_seconds,
+        )
         metadata = {
             "model": body.get("model", self.model),
             "input_tokens": body.get("prompt_eval_count"),
             "output_tokens": body.get("eval_count"),
         }
+        decision = self._parse_output(self._message_content(body, metadata), metadata)
+
+        return decision, metadata
+
+    def _message_content(self, body, metadata):
         message = body.get("message")
-        if (
-            body.get("done") is not True or body.get("done_reason") == "length"
-            or not isinstance(message, dict) or not isinstance(message.get("content"), str)
-            or body.get("prompt_eval_count", 0)
-            >= self._settings.llm_num_ctx - self._output_tokens - 256
-        ):
+        context_limit = self._settings.llm_num_ctx - self._output_tokens - 256
+        incomplete = (
+            body.get("done") is not True
+            or body.get("done_reason") == "length"
+            or not isinstance(message, dict)
+            or not isinstance(message.get("content"), str)
+            or body.get("prompt_eval_count", 0) >= context_limit
+        )
+        if incomplete:
             raise ResponseGenerationError("Respuesta conversacional incompleta.", **metadata)
+
+        return message["content"]
+
+    def _parse_output(self, content, metadata):
         try:
-            decision = self._output.model_validate_json(message["content"])
+            return self._output.model_validate_json(content)
         except ValidationError as error:
             raise ResponseGenerationError("Salida conversacional inválida.", **metadata) from error
-        return decision, metadata
 
 
 class OllamaRoutingProvider(_StructuredConversationProvider):
@@ -67,15 +88,24 @@ class OllamaRoutingProvider(_StructuredConversationProvider):
         super().__init__(settings, ROUTER_PROMPT, RoutingDraft, output_tokens=768)
 
     async def interpret(self, context):
+        schema = self._routing_schema(context["history"])
+        decision, metadata = await self._generate(context, schema)
+
+        return RoutingReply(decision=decision, **metadata)
+
+    @staticmethod
+    def _routing_schema(history):
         schema = RoutingDraft.model_json_schema()
         schema["properties"]["reason"]["maxLength"] = 240  # Un motivo breve acorta la generación.
-        ids = [item["message_id"] for item in context["history"]]
-        if ids:
-            schema["properties"]["history_message_ids"]["items"]["enum"] = ids
+
+        history_ids = [item["message_id"] for item in history]
+        history_property = schema["properties"]["history_message_ids"]
+        if history_ids:
+            history_property["items"]["enum"] = history_ids
         else:
-            schema["properties"]["history_message_ids"]["maxItems"] = 0
-        decision, metadata = await self._generate(context, schema)
-        return RoutingReply(decision=decision, **metadata)
+            history_property["maxItems"] = 0
+
+        return schema
 
 
 class OllamaGeneralResponseProvider(_StructuredConversationProvider):
@@ -84,4 +114,5 @@ class OllamaGeneralResponseProvider(_StructuredConversationProvider):
 
     async def generate(self, context):
         draft, metadata = await self._generate(context)
+
         return GeneralReply(draft=draft, **metadata)

@@ -1,14 +1,18 @@
-"""Lectura determinística y descripción semántica sin planes ejecutables."""
 from typing import Protocol
+
 from aquai.application.contracts.ingestion import (
-    PreparationResult, PreparedTable, SemanticDescription, StructureSuggestion,
+    PreparationResult,
+    PreparedTable,
+    SemanticDescription,
+    StructureSuggestion,
 )
 
 
 class TabularProcessor(Protocol):
     def validate_upload(self, filename: str | None, content: bytes) -> str: ...
-    def prepare(self, filename: str, content: bytes,
-                suggestions: list[StructureSuggestion] | None = None) -> PreparationResult: ...
+    def prepare(
+        self, filename: str, content: bytes, suggestions: list[StructureSuggestion] | None = None
+    ) -> PreparationResult: ...
 
 
 class SemanticProvider(Protocol):

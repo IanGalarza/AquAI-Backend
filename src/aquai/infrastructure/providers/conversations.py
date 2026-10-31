@@ -1,19 +1,33 @@
-"""Composición de la API conversacional, reutilizando PostgreSQL y LangGraph."""
-
 from dataclasses import dataclass
 from functools import lru_cache
 
 from aquai.application.conversations.snapshot import ConversationSnapshotBuilder
-from aquai.application.useCases.commands.createConversationHandler import CreateConversationHandler
-from aquai.application.useCases.commands.deleteConversationHandler import DeleteConversationHandler
-from aquai.application.useCases.commands.renameConversationHandler import RenameConversationHandler
-from aquai.application.useCases.commands.sendMessageHandler import SendMessageHandler
-from aquai.application.useCases.queries.conversationHistoryHandler import ConversationHistoryHandler
+from aquai.application.useCases.ConversationOperation.Commands.createConversationHandler import (
+    CreateConversationHandler,
+)
+from aquai.application.useCases.ConversationOperation.Commands.deleteConversationHandler import (
+    DeleteConversationHandler,
+)
+from aquai.application.useCases.ConversationOperation.Commands.renameConversationHandler import (
+    RenameConversationHandler,
+)
+from aquai.application.useCases.ConversationOperation.Commands.sendMessageHandler import (
+    SendMessageHandler,
+)
+from aquai.application.useCases.ConversationOperation.Queries.getConversationHandler import (
+    GetConversationHandler,
+)
+from aquai.application.useCases.ConversationOperation.Queries.getMessagesHandler import (
+    GetMessagesHandler,
+)
+from aquai.application.useCases.ConversationOperation.Queries.listConversationsHandler import (
+    ListConversationsHandler,
+)
 from aquai.bootstrap import initialize_application
+from aquai.infrastructure.commands.conversations import SqlAlchemyConversationCommands
 from aquai.infrastructure.config.conversations import ConversationSettings
 from aquai.infrastructure.graphs.conversationRunner import LangGraphConversationRunner
 from aquai.infrastructure.providers.database import get_db_context
-from aquai.infrastructure.commands.conversations import SqlAlchemyConversationCommands
 from aquai.infrastructure.queries.conversations import SqlAlchemyConversationQueries
 
 
@@ -22,8 +36,10 @@ class ConversationRuntime:
     create: CreateConversationHandler
     rename: RenameConversationHandler
     delete: DeleteConversationHandler
-    history: ConversationHistoryHandler
     send: SendMessageHandler
+    list: ListConversationsHandler
+    get: GetConversationHandler
+    messages: GetMessagesHandler
 
 
 @lru_cache
@@ -40,16 +56,23 @@ def create_conversation_runtime() -> ConversationRuntime:
     queries = SqlAlchemyConversationQueries(context, settings)
     snapshots = ConversationSnapshotBuilder(
         max_message_bytes=settings.max_message_bytes,
-        max_table_rows=settings.max_table_rows, max_table_bytes=settings.max_table_bytes,
+        max_table_rows=settings.max_table_rows,
+        max_table_bytes=settings.max_table_bytes,
         max_source_details_bytes=settings.max_source_details_bytes,
     )
+
     return ConversationRuntime(
         create=CreateConversationHandler(commands),
         rename=RenameConversationHandler(commands),
         delete=DeleteConversationHandler(commands),
-        history=ConversationHistoryHandler(queries),
         send=SendMessageHandler(
-            commands, queries, LangGraphConversationRunner(), snapshots,
+            commands,
+            queries,
+            LangGraphConversationRunner(),
+            snapshots,
             timeout_seconds=settings.generation_timeout_seconds,
         ),
+        list=ListConversationsHandler(queries),
+        get=GetConversationHandler(queries),
+        messages=GetMessagesHandler(queries),
     )

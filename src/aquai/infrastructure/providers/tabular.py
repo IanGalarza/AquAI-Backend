@@ -1,5 +1,5 @@
-"""Configuración compartida del lector y los adaptadores locales."""
 from functools import lru_cache
+
 from aquai.infrastructure.config.tabular import TabularSettings
 
 

@@ -1,5 +1,3 @@
-"""Evidencia autorizada y respuesta conversacional serializable, sin frameworks."""
-
 from datetime import datetime
 from typing import Literal
 from uuid import UUID
@@ -7,14 +5,17 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field, JsonValue
 
 from aquai.application.contracts.execution import (
-    ExecutionError, QueryExecutionState, VisualizationResult,
+    ExecutionError,
+    QueryExecutionState,
+    VisualizationResult,
 )
 from aquai.application.contracts.planning import OutputField, PlanningInput
 from aquai.application.contracts.retrieval import DatasetProvenance
 from aquai.application.contracts.routing import HistoryMessage, RoutingResult
 
-
-AnswerStatus = Literal["validated", "partial", "needs_clarification", "insufficient_coverage", "failed"]
+AnswerStatus = Literal[
+    "validated", "partial", "needs_clarification", "insufficient_coverage", "failed"
+]
 Language = Literal["es", "en"]
 
 
@@ -132,12 +133,13 @@ class AnswerSegment(BaseModel):
     text: str = Field(min_length=1)
     items: list[str] = Field(default_factory=list)
     evidence_ids: list[str] = Field(default_factory=list)
-    # Evidencia (tabla o gráfico) que se presenta a continuación del párrafo.
     attachment: str | None = None
 
 
 class QueryResponse(BaseModel):
-    response_type: Literal["analytical", "general", "catalog", "clarification", "historical"] = "analytical"
+    response_type: Literal["analytical", "general", "catalog", "clarification", "historical"] = (
+        "analytical"
+    )
     status: AnswerStatus | Literal["answered"]
     validation_status: AnswerStatus | None
     answer: str

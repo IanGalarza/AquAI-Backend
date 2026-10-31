@@ -1,5 +1,3 @@
-"""Archivo original cargado y sus metadatos de procesamiento."""
-
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -33,9 +31,7 @@ class Source:
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime | None = None
 
-    datasets: list[Dataset] = field(
-        default_factory=list, init=False, repr=False, compare=False
-    )
+    datasets: list[Dataset] = field(default_factory=list, init=False, repr=False, compare=False)
     message_sources: list[MessageSource] = field(
         default_factory=list, init=False, repr=False, compare=False
     )

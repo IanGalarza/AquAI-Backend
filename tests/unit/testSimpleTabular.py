@@ -9,8 +9,8 @@ from zipfile import ZIP_DEFLATED, ZipFile
 from openpyxl import Workbook
 from openpyxl.worksheet.table import Table
 
-from aquai.application.errors import FileTooLargeError, TabularInputError
 from aquai.application.contracts.ingestion import StructureSuggestion
+from aquai.application.errors import FileTooLargeError, TabularInputError
 from aquai.infrastructure.config.tabular import TabularSettings
 from aquai.infrastructure.processing.tabular import SimpleTabularProcessor
 
@@ -27,7 +27,9 @@ class SimpleTabularTests(unittest.TestCase):
         self.processor = SimpleTabularProcessor(TabularSettings(_env_file=None))
 
     def test_csv_preserves_all_records_codes_markers_zero_false_and_null(self) -> None:
-        content = b"codigo,,valor,marca,activo\n001,,0,NA,false\n002,,,nd,true\n,,,,\n002,,,nd,true\n"
+        content = (
+            b"codigo,,valor,marca,activo\n001,,0,NA,false\n002,,,nd,true\n,,,,\n002,,,nd,true\n"
+        )
         result = self.processor.prepare("sample.csv", content)
         self.assertEqual(len(result.tables), 1)
         table = result.tables[0]
@@ -42,13 +44,19 @@ class SimpleTabularTests(unittest.TestCase):
         self.assertEqual(table.columns[1]["source_column"], 3)
 
     def test_types_are_verified_over_full_column_and_names_are_safe(self) -> None:
-        content = ("valor,valor,fecha,medida [mg/L],_aquai_row,decimal\n"
-                   "1.234,2,03/04/2024,0.50,a,0.12345678901234567890123456789\n"
-                   "1.235,nd,04/05/2024,1.25,b,0.20\n").encode()
+        content = (
+            "valor,valor,fecha,medida [mg/L],_aquai_row,decimal\n"
+            "1.234,2,03/04/2024,0.50,a,0.12345678901234567890123456789\n"
+            "1.235,nd,04/05/2024,1.25,b,0.20\n"
+        ).encode()
         table = self.processor.prepare("mixed.csv", content).tables[0]
-        self.assertEqual([column["sql_type"] for column in table.columns],
-                         ["TEXT", "TEXT", "TEXT", "NUMERIC", "TEXT", "NUMERIC"])
-        self.assertEqual([column["original_name"] for column in table.columns][:2], ["valor", "valor"])
+        self.assertEqual(
+            [column["sql_type"] for column in table.columns],
+            ["TEXT", "TEXT", "TEXT", "NUMERIC", "TEXT", "NUMERIC"],
+        )
+        self.assertEqual(
+            [column["original_name"] for column in table.columns][:2], ["valor", "valor"]
+        )
         self.assertEqual(table.columns[1]["sql_name"], "valor_2")
         self.assertEqual(table.columns[4]["sql_name"], "column_aquai_row")
         self.assertEqual(table.rows[0]["decimal"], Decimal("0.12345678901234567890123456789"))
@@ -118,7 +126,9 @@ class SimpleTabularTests(unittest.TestCase):
         self.assertEqual(unnamed["source_column"], 2)
         self.assertEqual(result.tables[0].rows[0][unnamed["sql_name"]], "nd")
         self.assertEqual(result.tables[-1].source_locator["header_rows"], [1, 2, 3])
-        self.assertEqual(result.tables[-1].columns[1]["original_name"], "Mediciones | Sensor A | minimo")
+        self.assertEqual(
+            result.tables[-1].columns[1]["original_name"], "Mediciones | Sensor A | minimo"
+        )
 
     def test_numeric_projection_keeps_original_markers_and_excluded_count(self) -> None:
         content = b"Fecha,Abundancia,codigo,periodo\n2024-03-12,120,001,03/04/2024\n2024-03-13,135,002,04/05/2024\n2024-03-14,nd,nd,05/06/2024\n2024-03-15,180,004,06/07/2024\n"
@@ -126,11 +136,16 @@ class SimpleTabularTests(unittest.TestCase):
         original, auxiliary = table.columns[1], table.columns[-1]
         self.assertEqual(original["sql_type"], "TEXT")
         self.assertFalse(original["numeric_eligible"])
-        self.assertEqual([row[original["sql_name"]] for row in table.rows], ["120", "135", "nd", "180"])
+        self.assertEqual(
+            [row[original["sql_name"]] for row in table.rows], ["120", "135", "nd", "180"]
+        )
         self.assertEqual(auxiliary["derived_from"], original["sql_name"])
         self.assertEqual(auxiliary["excluded_count"], 1)
         self.assertEqual(auxiliary["nonempty_count"], 4)
-        self.assertEqual([row[auxiliary["sql_name"]] for row in table.rows], [Decimal(120), Decimal(135), None, Decimal(180)])
+        self.assertEqual(
+            [row[auxiliary["sql_name"]] for row in table.rows],
+            [Decimal(120), Decimal(135), None, Decimal(180)],
+        )
         self.assertEqual(len(table.columns), 5)
         self.assertTrue(any("excluidos" in warning for warning in table.warnings))
 
@@ -153,11 +168,21 @@ class SimpleTabularTests(unittest.TestCase):
         self.assertEqual([column["source_row"] for column in table.columns], [1, 2, 3, 4])
         self.assertEqual([row["_aquai_source_column"] for row in table.rows], [2, 3])
         self.assertEqual(table.rows[1]["masa_mg"], "nd")
-        corrected = self.processor.prepare("matrix.xlsx", content, [StructureSuggestion(candidate["region_id"], "columns", 1, 2, 3)]).tables[0]
+        corrected = self.processor.prepare(
+            "matrix.xlsx",
+            content,
+            [StructureSuggestion(candidate["region_id"], "columns", 1, 2, 3)],
+        ).tables[0]
         self.assertEqual(len(corrected.rows), 2)
         self.assertEqual(corrected.source_locator["structure_assistance"]["header_depth"], 1)
-        self.assertEqual(corrected.source_locator["structure_assistance"]["suggested_header_depth"], 2)
-        rejected = self.processor.prepare("matrix.xlsx", content, [StructureSuggestion(candidate["region_id"], "columns", 2, 1, 3)])
+        self.assertEqual(
+            corrected.source_locator["structure_assistance"]["suggested_header_depth"], 2
+        )
+        rejected = self.processor.prepare(
+            "matrix.xlsx",
+            content,
+            [StructureSuggestion(candidate["region_id"], "columns", 2, 1, 3)],
+        )
         self.assertFalse(rejected.tables)
         self.assertTrue(any("verificarse" in warning for warning in rejected.warnings))
 
@@ -199,7 +224,9 @@ class SimpleTabularTests(unittest.TestCase):
         self.assertGreaterEqual(len(result.warnings), 3)
 
     def test_csv_encoding_delimiter_and_physical_rows_survive_multiline_cells(self) -> None:
-        content = 'nombre;comentario;cantidad\nPeña;"primera\nsegunda";2\nOtro;normal;3\n'.encode("cp1252")
+        content = 'nombre;comentario;cantidad\nPeña;"primera\nsegunda";2\nOtro;normal;3\n'.encode(
+            "cp1252"
+        )
         result = self.processor.prepare("text.csv", content)
         table = result.tables[0]
         self.assertEqual(table.source_locator["encoding"], "cp1252")
@@ -209,7 +236,9 @@ class SimpleTabularTests(unittest.TestCase):
         self.assertEqual(table.rows[1]["_aquai_source_row"], 4)
 
     def test_validation_rejects_binary_csv_and_unsafe_or_oversized_excel(self) -> None:
-        self.assertEqual(self.processor.validate_upload("../folder\\sample.csv", b"a,b\n1,2\n"), "sample.csv")
+        self.assertEqual(
+            self.processor.validate_upload("../folder\\sample.csv", b"a,b\n1,2\n"), "sample.csv"
+        )
         with self.assertRaises(TabularInputError):
             self.processor.validate_upload(None, b"a,b\n1,2\n")
         with self.assertRaises(TabularInputError):
@@ -221,7 +250,9 @@ class SimpleTabularTests(unittest.TestCase):
         workbook.active.append([1, 2])
         workbook.active.cell(99999, 1000).number_format = "0.00"
         content = workbook_bytes(workbook)
-        self.assertEqual(self.processor.validate_upload("formatted.xlsx", content), "formatted.xlsx")
+        self.assertEqual(
+            self.processor.validate_upload("formatted.xlsx", content), "formatted.xlsx"
+        )
         self.assertEqual(len(self.processor.prepare("formatted.xlsx", content).tables[0].rows), 1)
         small = SimpleTabularProcessor(TabularSettings(_env_file=None, max_cells=3))
         with self.assertRaises(FileTooLargeError):
@@ -230,7 +261,10 @@ class SimpleTabularTests(unittest.TestCase):
         with self.assertRaises(FileTooLargeError):
             expanded.validate_upload("x.xlsx", content)
         unsafe = io.BytesIO()
-        with ZipFile(io.BytesIO(content)) as original, ZipFile(unsafe, "w", ZIP_DEFLATED) as changed:
+        with (
+            ZipFile(io.BytesIO(content)) as original,
+            ZipFile(unsafe, "w", ZIP_DEFLATED) as changed,
+        ):
             for entry in original.infolist():
                 data = original.read(entry.filename)
                 if entry.filename == "xl/worksheets/sheet1.xml":

@@ -1,5 +1,3 @@
-"""Puerto de redacción que reutiliza el modelo generativo configurado."""
-
 from typing import Protocol
 
 from aquai.application.contracts.answering import ResponseContextRecord, ResponseReply

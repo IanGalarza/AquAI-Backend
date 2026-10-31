@@ -1,7 +1,7 @@
 """Conecta Alembic con la configuración y los mapeos existentes de AquAI."""
 
-from logging.config import fileConfig
 import re
+from logging.config import fileConfig
 
 from alembic import context
 from sqlalchemy import Connection, create_engine
@@ -21,7 +21,9 @@ target_metadata = metadata
 
 def include_name(name: str | None, type_: str, parent_names: dict) -> bool:
     """Las tablas físicas del catálogo se crean durante la ingesta, fuera de Alembic."""
-    return not (type_ == "table" and name is not None and re.fullmatch(r"dataset_[0-9a-f]{32}", name))
+    return not (
+        type_ == "table" and name is not None and re.fullmatch(r"dataset_[0-9a-f]{32}", name)
+    )
 
 
 def run_migrations_offline() -> None:

@@ -1,11 +1,8 @@
-"""Interpretación conversacional; sin clientes, sesiones ni decisiones ejecutables."""
-
 from datetime import datetime
 from typing import Literal
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue
-
 
 QueryRoute = Literal["general", "catalog", "data", "historical", "needs_clarification", "failed"]
 
@@ -40,8 +37,14 @@ class HistoryMessage(BaseModel):
 
 class DataMention(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
-    text: str = Field(min_length=1, max_length=200, description="Texto copiado literalmente de la pregunta actual o de una solicitud pendiente.")
-    kind: Literal["variable", "value", "date", "limit"] = Field(description="variable: parámetro medido; value: valor de columna que acota registros, como una localidad o estación; date: fecha o período solicitado; limit: cantidad de registros o resultados que se pide ver.")
+    text: str = Field(
+        min_length=1,
+        max_length=200,
+        description="Texto copiado literalmente de la pregunta actual o de una solicitud pendiente.",
+    )
+    kind: Literal["variable", "value", "date", "limit"] = Field(
+        description="variable: parámetro medido; value: valor de columna que acota registros, como una localidad o estación; date: fecha o período solicitado; limit: cantidad de registros o resultados que se pide ver."
+    )
 
 
 class RoutingDraft(BaseModel):
@@ -50,8 +53,14 @@ class RoutingDraft(BaseModel):
     language: Literal["es", "en"]
     context_required: bool
     history_message_ids: list[UUID] = Field(max_length=4)
-    source_mentions: list[str] = Field(max_length=4, description="Nombres de archivos, fuentes o datasets copiados literalmente de la pregunta actual; nunca localidades, sitios, estaciones, variables ni fechas.")
-    data_mentions: list[DataMention] = Field(max_length=12, description="Variables, valores de columnas y fechas como menciones separadas: en 'pH de Punta Lara' son 'pH' (variable) y 'Punta Lara' (value). No son fuentes.")
+    source_mentions: list[str] = Field(
+        max_length=4,
+        description="Nombres de archivos, fuentes o datasets copiados literalmente de la pregunta actual; nunca localidades, sitios, estaciones, variables ni fechas.",
+    )
+    data_mentions: list[DataMention] = Field(
+        max_length=12,
+        description="Variables, valores de columnas y fechas como menciones separadas: en 'pH de Punta Lara' son 'pH' (variable) y 'Punta Lara' (value). No son fuentes.",
+    )
     clarification_question: str | None = Field(max_length=500)
     reason: str = Field(min_length=1, max_length=400)
 

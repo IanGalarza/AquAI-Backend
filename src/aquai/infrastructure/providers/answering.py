@@ -1,9 +1,7 @@
-"""Composición de Validator y Response Generator, sin endpoints ni clientes nuevos."""
-
 from functools import lru_cache
 
-from aquai.application.useCases.queries.generateResponseHandler import GenerateResponseHandler
-from aquai.application.useCases.queries.validateEvidenceHandler import ValidateEvidenceHandler
+from aquai.application.Services.generateResponseService import GenerateResponseService
+from aquai.application.Services.validateEvidenceService import ValidateEvidenceService
 from aquai.infrastructure.config.answering import AnsweringSettings
 from aquai.infrastructure.providers.llm.response import OllamaResponseProvider
 from aquai.infrastructure.providers.tabular import get_tabular_settings
@@ -15,9 +13,13 @@ def get_answering_settings():
 
 
 def create_evidence_validator():
-    return ValidateEvidenceHandler()
+    return ValidateEvidenceService()
 
 
 def create_response_generator():
     settings = get_answering_settings()
-    return GenerateResponseHandler(OllamaResponseProvider(get_tabular_settings(), settings), max_preview_rows=settings.max_preview_rows)
+
+    return GenerateResponseService(
+        OllamaResponseProvider(get_tabular_settings(), settings),
+        max_preview_rows=settings.max_preview_rows,
+    )

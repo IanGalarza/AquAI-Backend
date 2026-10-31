@@ -1,5 +1,3 @@
-"""Puerto del modelo generativo; Application desconoce su transporte y framework."""
-
 from typing import Protocol
 
 from aquai.application.contracts.planning import PlannerReply, PlanningContextRecord

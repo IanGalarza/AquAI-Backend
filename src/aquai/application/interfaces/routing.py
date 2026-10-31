@@ -1,5 +1,3 @@
-"""Puertos para una interpretación y una respuesta general, sin otro transporte."""
-
 from typing import Protocol
 
 from aquai.application.contracts.routing import GeneralReply, RoutingReply

@@ -1,11 +1,11 @@
-"""Límites del ejecutor y conexión opcional con permisos restringidos de lectura."""
-
 from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class SqlExecutionSettings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", env_prefix="SQL_EXECUTION_", extra="ignore", hide_input_in_errors=True)
+    model_config = SettingsConfigDict(
+        env_file=".env", env_prefix="SQL_EXECUTION_", extra="ignore", hide_input_in_errors=True
+    )
     database_url: SecretStr | None = None
     dataset_schema: str = Field(default="public", pattern=r"^[a-z_][a-z0-9_]{0,62}$")
     statement_timeout_ms: int = Field(default=10000, ge=1, le=60000)

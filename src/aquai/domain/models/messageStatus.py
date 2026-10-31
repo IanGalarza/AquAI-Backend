@@ -1,5 +1,3 @@
-"""Entrada del catálogo que describe el estado de generación de un mensaje."""
-
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -14,6 +12,4 @@ class MessageStatus:
     id: int
     name: str
 
-    messages: list[Message] = field(
-        default_factory=list, init=False, repr=False, compare=False
-    )
+    messages: list[Message] = field(default_factory=list, init=False, repr=False, compare=False)

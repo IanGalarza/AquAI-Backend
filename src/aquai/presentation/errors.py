@@ -1,5 +1,3 @@
-"""Traducción de errores de Application al contrato HTTP de fuentes."""
-
 from collections.abc import Awaitable, Callable
 
 from fastapi import FastAPI, Request
@@ -7,16 +5,15 @@ from fastapi.responses import JSONResponse
 from sqlalchemy.exc import SQLAlchemyError
 
 from aquai.application.errors import (
+    ConversationConflictError,
+    ConversationNotFoundError,
+    ConversationsUnavailableError,
     FileTooLargeError,
     SourceConflictError,
     SourceNotFoundError,
     SourcesUnavailableError,
     TabularInputError,
-    ConversationConflictError,
-    ConversationNotFoundError,
-    ConversationsUnavailableError,
 )
-
 
 ERROR_RESPONSES = {
     400: {"description": "Archivo o solicitud inválidos."},
@@ -48,7 +45,10 @@ def _error_handler(status_code: int) -> Callable[[Request, Exception], Awaitable
 def register_exception_handlers(app: FastAPI) -> None:
     for error_type, status_code in _ERROR_STATUS_CODES.items():
         app.add_exception_handler(error_type, _error_handler(status_code))
+
     async def database_unavailable(_request: Request, _error: Exception) -> JSONResponse:
-        return JSONResponse(status_code=503, content={"detail": "La persistencia no está disponible."})
+        return JSONResponse(
+            status_code=503, content={"detail": "La persistencia no está disponible."}
+        )
 
     app.add_exception_handler(SQLAlchemyError, database_unavailable)

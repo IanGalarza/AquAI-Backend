@@ -1,5 +1,3 @@
-"""Conversación compartida dentro del historial del chat."""
-
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -19,6 +17,4 @@ class Conversation:
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime | None = None
 
-    messages: list[Message] = field(
-        default_factory=list, init=False, repr=False, compare=False
-    )
+    messages: list[Message] = field(default_factory=list, init=False, repr=False, compare=False)

@@ -1,5 +1,3 @@
-"""Evidencia de recuperación serializable, sin planes ni instrucciones ejecutables."""
-
 from datetime import datetime
 from typing import Literal
 from uuid import UUID

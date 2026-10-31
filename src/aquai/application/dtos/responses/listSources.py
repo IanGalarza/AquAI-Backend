@@ -1,6 +1,7 @@
-"""Proyección paginada sin originales ni informes."""
 from datetime import datetime
+
 from pydantic import BaseModel, Field
+
 from aquai.application.dtos.responses.sourceState import SourceStateResponse
 
 

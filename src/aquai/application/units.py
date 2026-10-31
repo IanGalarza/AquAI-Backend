@@ -1,11 +1,10 @@
-"""Unidades de presentación; no modifica los metadatos ni convierte valores."""
-
-import re
+from aquai.application.Rules.variables import NAME_SEPARATORS, PH_ALIASES
 
 
 def is_ph_name(name: str) -> bool:
-    normalized = re.sub(r"[\s_\[\]().-]+", "", name).casefold()
-    return normalized in {"ph", "phuph", "phudeph", "phunidadesdeph"}
+    normalized = NAME_SEPARATORS.sub("", name).casefold()
+
+    return normalized in PH_ALIASES
 
 
 def is_ph_field(field) -> bool:

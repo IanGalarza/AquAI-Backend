@@ -1,11 +1,12 @@
-"""Tabla de conversaciones y navegación ordenada de sus mensajes."""
-
 from sqlalchemy import Column, String, Table
 from sqlalchemy.dialects.postgresql import TIMESTAMP
 from sqlalchemy.orm import registry, relationship
 
 from aquai.domain.models import Conversation
-from aquai.infrastructure.persistence.configurations.common import identity_column, timestamp_columns
+from aquai.infrastructure.persistence.configurations.common import (
+    identity_column,
+    timestamp_columns,
+)
 
 
 def configure(mapper_registry: registry) -> None:
@@ -22,7 +23,9 @@ def configure(mapper_registry: registry) -> None:
         table,
         properties={
             "messages": relationship(
-                "Message", back_populates="conversation", passive_deletes="all",
+                "Message",
+                back_populates="conversation",
+                passive_deletes="all",
                 order_by="Message.sequence_number",
             ),
         },

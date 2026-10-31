@@ -1,6 +1,7 @@
-"""Filtros y paginación del listado de fuentes."""
 from enum import StrEnum
+
 from pydantic import BaseModel, ConfigDict, Field
+
 from aquai.domain.enums.sourceStatus import ProcessingStatus
 
 

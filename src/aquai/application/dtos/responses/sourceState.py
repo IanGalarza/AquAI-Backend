@@ -1,6 +1,7 @@
-"""Identidad y estados necesarios para actualizar y sondear las fuentes."""
 from uuid import UUID
+
 from pydantic import BaseModel
+
 from aquai.domain.enums.sourceStatus import ProcessingStatus, SemanticIndexStatus
 
 

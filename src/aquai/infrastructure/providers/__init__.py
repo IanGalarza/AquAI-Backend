@@ -1,5 +1,3 @@
-"""Proveedores de dependencias de infraestructura."""
-
 from aquai.infrastructure.providers.database import (
     get_database_settings,
     get_db_context,

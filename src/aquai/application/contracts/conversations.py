@@ -1,5 +1,3 @@
-"""Contratos HTTP e instantáneas persistentes, sin objetos de infraestructura."""
-
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Literal
@@ -8,7 +6,10 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field, JsonValue
 
 from aquai.application.contracts.answering import (
-    ConversationMessage, GenerationRecord, Language, QueryResponse,
+    ConversationMessage,
+    GenerationRecord,
+    Language,
+    QueryResponse,
 )
 from aquai.application.contracts.execution import ValueExclusion
 from aquai.application.contracts.planning import OutputField
@@ -127,7 +128,6 @@ class MessagePresentation(BaseModel):
     citations: list[CitationView] = Field(default_factory=list)
     tables: list[TableView] = Field(default_factory=list)
     charts: list[ChartView] = Field(default_factory=list)
-    # Tablas y gráficos que ningún párrafo presenta; se muestran al final de la respuesta.
     trailing_tables: list[str] = Field(default_factory=list)
     trailing_charts: list[str] = Field(default_factory=list)
     duration_ms: int | None = None

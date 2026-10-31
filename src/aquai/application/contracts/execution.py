@@ -1,5 +1,3 @@
-"""Resultados acotados de ejecución, sin objetos de persistencia ni SQL libre."""
-
 from datetime import date, datetime
 from decimal import Decimal
 from typing import Literal
@@ -10,9 +8,16 @@ from pydantic import BaseModel, ConfigDict, Field, JsonValue
 from aquai.application.contracts.planning import OutputField, QueryPlanningState
 from aquai.application.contracts.retrieval import DatasetProvenance, RetrievedColumn
 
-
 ExecutionStatus = Literal["succeeded", "partial", "failed", "not_executed"]
-OperationStatus = Literal["executed", "executed_as_dependency", "pending_python", "unsupported", "blocked", "error", "not_executed"]
+OperationStatus = Literal[
+    "executed",
+    "executed_as_dependency",
+    "pending_python",
+    "unsupported",
+    "blocked",
+    "error",
+    "not_executed",
+]
 ResultValue = str | int | float | bool | Decimal | date | datetime | None
 
 

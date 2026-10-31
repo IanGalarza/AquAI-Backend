@@ -1,5 +1,5 @@
-"""Confirmación de activación sin reenviar tablas ni informes."""
 from pydantic import ConfigDict, Field
+
 from aquai.application.dtos.responses.sourceState import SourceStateResponse
 
 

@@ -1,4 +1,5 @@
 """SQLite aislado con exclusión de transacciones y tipos compatibles."""
+
 from contextlib import contextmanager
 from threading import RLock
 
@@ -25,7 +26,9 @@ class SourceTestDbContext:
     def __init__(self):
         configure_mappings()
         self.engine = create_engine(
-            "sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool,
+            "sqlite://",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
         )
         self._lock = RLock()
 
@@ -34,7 +37,8 @@ class SourceTestDbContext:
             connection.execute("PRAGMA foreign_keys=ON")
 
         metadata.create_all(
-            self.engine, tables=[metadata.tables[name] for name in ("Source", "Dataset")],
+            self.engine,
+            tables=[metadata.tables[name] for name in ("Source", "Dataset")],
         )
 
     @contextmanager

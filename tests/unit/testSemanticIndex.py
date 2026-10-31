@@ -12,8 +12,15 @@ from qdrant_client import QdrantClient, models
 from aquai.application.contracts.ingestion import PreparedTable
 from aquai.application.errors import LLMProviderError
 from aquai.infrastructure.config.tabular import TabularSettings
-from aquai.infrastructure.providers.llm.ollama import OllamaEmbeddingProvider, OllamaSemanticProvider, model_identity
-from aquai.infrastructure.providers.semanticIndex import QdrantSemanticIndex, SemanticIndexError
+from aquai.infrastructure.providers.llm.ollama import (
+    OllamaEmbeddingProvider,
+    OllamaSemanticProvider,
+    model_identity,
+)
+from aquai.infrastructure.providers.semanticIndex import (
+    QdrantSemanticIndex,
+    SemanticIndexError,
+)
 
 
 class _Queries:
@@ -24,8 +31,11 @@ class _Queries:
 
     def usable_dataset_ids(self, dataset_ids, *, versions=None):
         self.requested = dataset_ids
-        return {dataset_id for dataset_id in self.usable.intersection(dataset_ids)
-                if versions is None or self.versions.get(dataset_id) == versions.get(dataset_id)}
+        return {
+            dataset_id
+            for dataset_id in self.usable.intersection(dataset_ids)
+            if versions is None or self.versions.get(dataset_id) == versions.get(dataset_id)
+        }
 
 
 class SemanticProviderTests(unittest.IsolatedAsyncioTestCase):
@@ -35,32 +45,63 @@ class SemanticProviderTests(unittest.IsolatedAsyncioTestCase):
             name="Mediciones",
             source_locator={"file_type": "csv", "sheet": "Mediciones", "range": [1, 20, 1, 2]},
             columns=[
-                {"original_name": "Cantidad [mg]", "sql_name": "cantidad_mg", "sql_type": "NUMERIC",
-                 "unit": "mg", "numeric_eligible": True},
-                {"original_name": "Fecha", "sql_name": "fecha", "sql_type": "DATE", "numeric_eligible": False},
+                {
+                    "original_name": "Cantidad [mg]",
+                    "sql_name": "cantidad_mg",
+                    "sql_type": "NUMERIC",
+                    "unit": "mg",
+                    "numeric_eligible": True,
+                },
+                {
+                    "original_name": "Fecha",
+                    "sql_name": "fecha",
+                    "sql_type": "DATE",
+                    "numeric_eligible": False,
+                },
             ],
-            rows=[{"cantidad_mg": Decimal("0.0010"), "fecha": date(2026, 1, day)} for day in range(1, 20)],
+            rows=[
+                {"cantidad_mg": Decimal("0.0010"), "fecha": date(2026, 1, day)}
+                for day in range(1, 20)
+            ],
             warnings=["Conservar precisión; no convertir unidades."],
         )
         before = deepcopy(table)
-        response = {"description": "Cantidades por fecha.", "columns": [
-            {"original_name": "Cantidad [mg]", "meaning": "Cantidad registrada."},
-            {"original_name": "Fecha", "meaning": "Fecha del registro."},
-        ]}
+        response = {
+            "description": "Cantidades por fecha.",
+            "columns": [
+                {"original_name": "Cantidad [mg]", "meaning": "Cantidad registrada."},
+                {"original_name": "Fecha", "meaning": "Fecha del registro."},
+            ],
+        }
         requests = []
 
         def handle(request):
             requests.append(json.loads(request.content))
-            return httpx.Response(200, json={"model": settings.default_model, "done": True,
-                                           "message": {"content": json.dumps(response)}})
+            return httpx.Response(
+                200,
+                json={
+                    "model": settings.default_model,
+                    "done": True,
+                    "message": {"content": json.dumps(response)},
+                },
+            )
 
         provider = OllamaSemanticProvider(settings, transport=httpx.MockTransport(handle))
         result = await provider.describe(table)
         self.assertEqual(table, before)
 
         semantic_response = response
-        response = {"suggestions": [{"region_id": "0:1:1:3:4", "orientation": "columns",
-                                     "header_start": 1, "header_depth": 1, "data_start": 2}]}
+        response = {
+            "suggestions": [
+                {
+                    "region_id": "0:1:1:3:4",
+                    "orientation": "columns",
+                    "header_start": 1,
+                    "header_depth": 1,
+                    "data_start": 2,
+                }
+            ]
+        }
         candidates = [{"region_id": "0:1:1:3:4", "shape": [4, 3], "sample": []}]
         hints = await provider.suggest_structure(candidates)
         self.assertEqual(hints[0].orientation, "columns")
@@ -111,7 +152,10 @@ class SemanticProviderTests(unittest.IsolatedAsyncioTestCase):
     async def test_embedding_endpoint_returns_actual_vectors_and_rejects_bad_protocol(self):
         settings = TabularSettings(_env_file=None)
         requests = []
-        body = {"model": "nomic-embed-text:latest", "embeddings": [[0.12, -0.3, 0.8], [0.4, 0.2, -0.1]]}
+        body = {
+            "model": "nomic-embed-text:latest",
+            "embeddings": [[0.12, -0.3, 0.8], [0.4, 0.2, -0.1]],
+        }
 
         def handle(request):
             requests.append(request)
@@ -120,9 +164,14 @@ class SemanticProviderTests(unittest.IsolatedAsyncioTestCase):
         provider = OllamaEmbeddingProvider(settings, transport=httpx.MockTransport(handle))
         self.assertEqual(await provider.embed(["Uno", "Dos"]), body["embeddings"])
         self.assertEqual(str(requests[0].url), "http://localhost:11434/api/embed")
-        self.assertEqual(json.loads(requests[0].content), {
-            "model": "nomic-embed-text", "input": ["Uno", "Dos"], "truncate": False,
-        })
+        self.assertEqual(
+            json.loads(requests[0].content),
+            {
+                "model": "nomic-embed-text",
+                "input": ["Uno", "Dos"],
+                "truncate": False,
+            },
+        )
         self.assertEqual(await provider.embed([]), [])
         invalid = (
             {"model": settings.default_model, "embeddings": [[0.1, 0.2]]},
@@ -145,24 +194,44 @@ class SemanticIndexTests(unittest.IsolatedAsyncioTestCase):
         def handle(request):
             payload = json.loads(request.content)
             self.requests.append(payload)
-            return httpx.Response(200, json={"model": self.settings.embedding_model,
-                                           "embeddings": [[0.25, 0.75] for _ in payload["input"]]})
+            return httpx.Response(
+                200,
+                json={
+                    "model": self.settings.embedding_model,
+                    "embeddings": [[0.25, 0.75] for _ in payload["input"]],
+                },
+            )
 
-        self.embeddings = OllamaEmbeddingProvider(self.settings, transport=httpx.MockTransport(handle))
+        self.embeddings = OllamaEmbeddingProvider(
+            self.settings, transport=httpx.MockTransport(handle)
+        )
 
     def tearDown(self):
         self.client.close()
 
     async def test_idempotent_dataset_points_lifecycle_and_postgres_validation(self):
         first, second, source_id = uuid4(), uuid4(), uuid4()
-        source = {"id": source_id, "is_active": True, "datasets": [
-            {"id": dataset_id, "semantic_point_id": dataset_id, "version": 1, "description": "Tabla de muestras.",
-             "columns_metadata": [{"original_name": "Código", "sql_name": "codigo", "sql_type": "TEXT"}],
-             "rows": [{"codigo": "sentinel_sql_row_value"}]}
-            for dataset_id in (first, second)
-        ]}
+        source = {
+            "id": source_id,
+            "is_active": True,
+            "datasets": [
+                {
+                    "id": dataset_id,
+                    "semantic_point_id": dataset_id,
+                    "version": 1,
+                    "description": "Tabla de muestras.",
+                    "columns_metadata": [
+                        {"original_name": "Código", "sql_name": "codigo", "sql_type": "TEXT"}
+                    ],
+                    "rows": [{"codigo": "sentinel_sql_row_value"}],
+                }
+                for dataset_id in (first, second)
+            ],
+        }
         queries = _Queries([first], {first: 2, second: 2})
-        index = QdrantSemanticIndex(self.settings, client=self.client, embeddings=self.embeddings, queries=queries)
+        index = QdrantSemanticIndex(
+            self.settings, client=self.client, embeddings=self.embeddings, queries=queries
+        )
         await index.index_source(source)
         await index.index_source(source)
         for dataset in source["datasets"]:
@@ -173,16 +242,24 @@ class SemanticIndexTests(unittest.IsolatedAsyncioTestCase):
         points, _ = self.client.scroll(self.settings.qdrant_collection)
         self.assertTrue(all(point.payload["version"] == 2 for point in points))
         self.assertEqual({point.id for point in points}, {str(first), str(second)})
-        self.assertTrue(all(point.payload["content_type"] == "dataset_description" for point in points))
-        self.assertTrue(all(point.payload["embedding_model"] == "nomic-embed-text:latest" for point in points))
+        self.assertTrue(
+            all(point.payload["content_type"] == "dataset_description" for point in points)
+        )
+        self.assertTrue(
+            all(point.payload["embedding_model"] == "nomic-embed-text:latest" for point in points)
+        )
         config = self.client.get_collection(self.settings.qdrant_collection).config.params.vectors
         self.assertTrue(all(":" not in name for name in config))
         results = await index.search("muestras")
         self.assertEqual([item["dataset_id"] for item in results], [str(first)])
         self.assertEqual(set(queries.requested), {first, second})
-        self.client.set_payload(self.settings.qdrant_collection, payload={"version": 1}, points=[str(first)])
+        self.client.set_payload(
+            self.settings.qdrant_collection, payload={"version": 1}, points=[str(first)]
+        )
         self.assertEqual(await index.search("muestras"), [])
-        self.client.set_payload(self.settings.qdrant_collection, payload={"version": 2}, points=[str(first)])
+        self.client.set_payload(
+            self.settings.qdrant_collection, payload={"version": 2}, points=[str(first)]
+        )
         await index.set_source_active(source_id, False)
         # La actividad real proviene de SQL, incluso con payload obsoleto.
         queries.usable.clear()
@@ -194,18 +271,34 @@ class SemanticIndexTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await index.search("muestras"), [])
 
     async def test_collection_rejects_dimension_or_model_mismatch_without_upsert(self):
-        source = {"id": uuid4(), "is_active": True, "datasets": [{"id": uuid4(), "description": "Muestras."}]}
+        source = {
+            "id": uuid4(),
+            "is_active": True,
+            "datasets": [{"id": uuid4(), "description": "Muestras."}],
+        }
         for vector_name, dimension, message in (
-            ("embedding_" + sha256(model_identity(self.settings.embedding_model).encode()).hexdigest()[:24], 3, "dimensión"),
+            (
+                "embedding_"
+                + sha256(model_identity(self.settings.embedding_model).encode()).hexdigest()[:24],
+                3,
+                "dimensión",
+            ),
             ("otro_modelo", 2, "otro modelo"),
         ):
             with self.subTest(vector_name=vector_name, dimension=dimension):
                 client = QdrantClient(":memory:")
                 try:
-                    client.create_collection(self.settings.qdrant_collection, vectors_config={
-                        vector_name: models.VectorParams(size=dimension, distance=models.Distance.COSINE),
-                    })
-                    index = QdrantSemanticIndex(self.settings, client=client, embeddings=self.embeddings)
+                    client.create_collection(
+                        self.settings.qdrant_collection,
+                        vectors_config={
+                            vector_name: models.VectorParams(
+                                size=dimension, distance=models.Distance.COSINE
+                            ),
+                        },
+                    )
+                    index = QdrantSemanticIndex(
+                        self.settings, client=client, embeddings=self.embeddings
+                    )
                     with self.assertRaisesRegex(SemanticIndexError, message):
                         await index.index_source(source)
                     self.assertEqual(client.count(self.settings.qdrant_collection).count, 0)

@@ -1,5 +1,3 @@
-"""Mapeo del catálogo de mensajes; sus datos iniciales están en statusSeeds."""
-
 from sqlalchemy import Column, Integer, String, Table
 from sqlalchemy.orm import registry, relationship
 
@@ -17,8 +15,6 @@ def configure(mapper_registry: registry) -> None:
         MessageStatus,
         table,
         properties={
-            "messages": relationship(
-                "Message", back_populates="status", passive_deletes="all"
-            ),
+            "messages": relationship("Message", back_populates="status", passive_deletes="all"),
         },
     )

@@ -1,5 +1,3 @@
-"""Estados operativos persistidos como cadenas con constraints en PostgreSQL."""
-
 from enum import StrEnum
 
 

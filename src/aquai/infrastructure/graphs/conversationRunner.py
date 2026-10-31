@@ -1,5 +1,3 @@
-"""Adaptador del grafo existente; inicialización diferida fuera del event loop."""
-
 import asyncio
 
 from aquai.application.contracts.answering import QueryResponseInput, QueryResponseState
@@ -15,5 +13,7 @@ class LangGraphConversationRunner:
         async with self._lock:
             if self._graph is None:
                 self._graph = await asyncio.to_thread(create_query_planning_graph)
+
         result = await self._graph.ainvoke(query.model_dump())
+
         return QueryResponseState.model_validate(result)

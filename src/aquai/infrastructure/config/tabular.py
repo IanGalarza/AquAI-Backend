@@ -50,6 +50,8 @@ class TabularSettings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_separate_embedding_model(self) -> "TabularSettings":
-        if self.default_model.removesuffix(":latest") == self.embedding_model.removesuffix(":latest"):
+        if self.default_model.removesuffix(":latest") == self.embedding_model.removesuffix(
+            ":latest"
+        ):
             raise ValueError("La descripción y los embeddings requieren modelos diferentes.")
         return self

@@ -1,5 +1,3 @@
-"""Puerto de lectura del índice existente; no depende de Qdrant ni de Ollama."""
-
 from typing import Any, Protocol
 
 

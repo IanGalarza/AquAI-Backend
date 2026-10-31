@@ -1,11 +1,22 @@
-"""Tabla de fuentes, columnas escalares y mapeos de las propiedades de navegación."""
-
-from sqlalchemy import BigInteger, Boolean, CheckConstraint, Column, JSON, LargeBinary, String, Table, Text
+from sqlalchemy import (
+    JSON,
+    BigInteger,
+    Boolean,
+    CheckConstraint,
+    Column,
+    LargeBinary,
+    String,
+    Table,
+    Text,
+)
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import deferred, registry, relationship
 
 from aquai.domain.models import Source
-from aquai.infrastructure.persistence.configurations.common import identity_column, timestamp_columns
+from aquai.infrastructure.persistence.configurations.common import (
+    identity_column,
+    timestamp_columns,
+)
 
 
 def configure(mapper_registry: registry) -> None:
@@ -22,18 +33,29 @@ def configure(mapper_registry: registry) -> None:
         Column("description", Text, nullable=True),
         Column("contentHash", String(64), key="content_hash", nullable=False, unique=True),
         Column("processingStatus", String(32), key="processing_status", nullable=False, index=True),
-        Column("processingReport", JSONB().with_variant(JSON(), "sqlite"), key="processing_report", nullable=False),
-        Column("semanticIndexStatus", String(16), key="semantic_index_status", nullable=False, index=True),
+        Column(
+            "processingReport",
+            JSONB().with_variant(JSON(), "sqlite"),
+            key="processing_report",
+            nullable=False,
+        ),
+        Column(
+            "semanticIndexStatus",
+            String(16),
+            key="semantic_index_status",
+            nullable=False,
+            index=True,
+        ),
         Column("fileContent", LargeBinary, key="file_content", nullable=False),
         *timestamp_columns(),
         CheckConstraint('"fileSizeBytes" >= 0', name="file_size_nonnegative"),
         CheckConstraint('length("contentHash") = 64', name="content_hash_length"),
         CheckConstraint(
-            '"processingStatus" IN (\'uploaded\', \'processing\', \'ready\', \'ready_with_warnings\', \'failed\')',
+            "\"processingStatus\" IN ('uploaded', 'processing', 'ready', 'ready_with_warnings', 'failed')",
             name="processing_status_values",
         ),
         CheckConstraint(
-            '"semanticIndexStatus" IN (\'pending\', \'processing\', \'ready\', \'failed\')',
+            "\"semanticIndexStatus\" IN ('pending', 'processing', 'ready', 'failed')",
             name="semantic_index_status_values",
         ),
     )
@@ -41,11 +63,12 @@ def configure(mapper_registry: registry) -> None:
         Source,
         table,
         properties={
-            # El contenido binario se carga recién cuando se accede a esta propiedad.
             "file_content": deferred(table.c.file_content),
             "datasets": relationship("Dataset", back_populates="source", passive_deletes="all"),
             "message_sources": relationship(
-                "MessageSource", back_populates="source", passive_deletes="all",
+                "MessageSource",
+                back_populates="source",
+                passive_deletes="all",
                 foreign_keys="MessageSource.source_id",
             ),
         },

@@ -1,4 +1,3 @@
-"""Espera escrituras en curso antes de liberar la exclusión del worker."""
 import asyncio
 from collections.abc import Callable
 from typing import Any

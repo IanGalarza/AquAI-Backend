@@ -1,20 +1,29 @@
-"""Transacciones cortas de carga, tablas físicas y estados operativos de fuentes."""
-
+import json
+import re
 from collections.abc import Iterator
 from contextlib import contextmanager
 from copy import deepcopy
 from datetime import datetime, timezone
 from hashlib import sha256
-import json
-import re
 from threading import Lock
 from typing import Any
 from uuid import UUID, uuid4
 from weakref import WeakKeyDictionary
 
 from sqlalchemy import (
-    BigInteger, Boolean, Column, Date, DateTime, Engine, MetaData, Numeric,
-    Table, Text, func, select, text,
+    BigInteger,
+    Boolean,
+    Column,
+    Date,
+    DateTime,
+    Engine,
+    MetaData,
+    Numeric,
+    Table,
+    Text,
+    func,
+    select,
+    text,
 )
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -25,15 +34,19 @@ from aquai.domain.enums.sourceStatus import ProcessingStatus, SemanticIndexStatu
 from aquai.domain.models import Dataset, MessageSource, Source
 from aquai.infrastructure.persistence.dbContext import DbContext
 
-
 _WORKER_KEY = int.from_bytes(sha256(b"aquai-source-ingestion").digest()[:8], "big", signed=True)
 _engine_locks: WeakKeyDictionary[Engine, tuple[Lock, Lock]] = WeakKeyDictionary()
 _engine_locks_guard = Lock()
 _SQL_TYPES = {
-    "TEXT": Text, "BIGINT": BigInteger, "NUMERIC": Numeric,
-    "BOOLEAN": Boolean, "DATE": Date, "TIMESTAMP": DateTime,
+    "TEXT": Text,
+    "BIGINT": BigInteger,
+    "NUMERIC": Numeric,
+    "BOOLEAN": Boolean,
+    "DATE": Date,
+    "TIMESTAMP": DateTime,
 }
 _PROVENANCE_COLUMNS = {"_aquai_row", "_aquai_source_row"}
+_INSERT_BATCH_SIZE = 1000
 
 
 def _sqlite_locks(engine: Engine) -> tuple[Lock, Lock]:
@@ -48,63 +61,232 @@ def _now() -> datetime:
 
 
 def _warnings(*groups: list[str]) -> list[str]:
-    return list(dict.fromkeys(str(item)[:1000] for group in groups for item in group))[:50]
+    unique = dict.fromkeys(str(item)[:1000] for group in groups for item in group)
+    return list(unique)[:50]
+
+
+def _report_with_warnings(report: dict[str, Any], warnings: list[str]) -> dict[str, Any]:
+    updated = deepcopy(report)
+    updated["warnings"] = _warnings(updated.get("warnings", []), warnings)
+    return updated
 
 
 def _validate_table(table: PreparedTable) -> None:
     if not isinstance(table.source_locator, dict):
         raise ValueError("La procedencia de la tabla debe ser un objeto JSON.")
-    if not isinstance(table.columns, list) or any(not isinstance(column, dict) for column in table.columns):
+    if not isinstance(table.columns, list) or any(
+        not isinstance(column, dict) for column in table.columns
+    ):
         raise ValueError("Los metadatos de columnas deben ser objetos JSON.")
     json.dumps(table.source_locator, allow_nan=False)
     json.dumps(table.columns, allow_nan=False)
+
     names = [column.get("sql_name") for column in table.columns]
     if not names or len(set(names)) != len(names):
         raise ValueError("La tabla debe tener columnas con nombres SQL únicos.")
     for column in table.columns:
-        name = column["sql_name"]
-        if not isinstance(name, str) or not re.fullmatch(r"[a-z_][a-z0-9_]{0,62}", name):
-            raise ValueError("El nombre técnico de columna no es seguro.")
-        if name in _PROVENANCE_COLUMNS or name.startswith("_aquai_"):
-            raise ValueError("El nombre técnico usa una columna interna reservada.")
-        if column.get("sql_type") not in _SQL_TYPES:
-            raise ValueError("El tipo SQL de columna no está admitido.")
-        if not isinstance(column.get("original_name"), str):
-            raise ValueError("Falta el nombre original de una columna.")
-        if type(column.get("numeric_eligible")) is not bool:
-            raise ValueError("Falta la aptitud numérica verificada de una columna.")
-        if column["numeric_eligible"] and column["sql_type"] not in {"BIGINT", "NUMERIC"}:
-            raise ValueError("Una columna no numérica no puede habilitar cálculos numéricos.")
+        _validate_column(column)
+
     if not table.rows:
         raise ValueError("Una tabla consultable debe contener registros.")
     transposed = table.source_locator.get("orientation") == "columns"
-    expected = set(names) | _PROVENANCE_COLUMNS | ({"_aquai_source_column"} if transposed else set())
+    expected = (
+        set(names) | _PROVENANCE_COLUMNS | ({"_aquai_source_column"} if transposed else set())
+    )
     for position, row in enumerate(table.rows, 1):
-        if set(row) != expected:
-            raise ValueError("Los registros no corresponden a las columnas declaradas.")
-        if type(row["_aquai_row"]) is not int or row["_aquai_row"] != position:
-            raise ValueError("El orden interno de registros debe ser consecutivo.")
-        if type(row["_aquai_source_row"]) is not int or row["_aquai_source_row"] < 1:
-            raise ValueError("La fila original debe tener procedencia válida.")
-        if transposed and (type(row["_aquai_source_column"]) is not int or row["_aquai_source_column"] < 1):
-            raise ValueError("La columna original debe tener procedencia válida.")
+        _validate_row(row, position, expected, transposed)
+
+
+def _validate_column(column: dict[str, Any]) -> None:
+    name = column["sql_name"]
+    if not isinstance(name, str) or not re.fullmatch(r"[a-z_][a-z0-9_]{0,62}", name):
+        raise ValueError("El nombre técnico de columna no es seguro.")
+    if name in _PROVENANCE_COLUMNS or name.startswith("_aquai_"):
+        raise ValueError("El nombre técnico usa una columna interna reservada.")
+    if column.get("sql_type") not in _SQL_TYPES:
+        raise ValueError("El tipo SQL de columna no está admitido.")
+    if not isinstance(column.get("original_name"), str):
+        raise ValueError("Falta el nombre original de una columna.")
+    if type(column.get("numeric_eligible")) is not bool:
+        raise ValueError("Falta la aptitud numérica verificada de una columna.")
+    if column["numeric_eligible"] and column["sql_type"] not in {"BIGINT", "NUMERIC"}:
+        raise ValueError("Una columna no numérica no puede habilitar cálculos numéricos.")
+
+
+def _validate_row(row: dict[str, Any], position: int, expected: set[str], transposed: bool) -> None:
+    if set(row) != expected:
+        raise ValueError("Los registros no corresponden a las columnas declaradas.")
+    if type(row["_aquai_row"]) is not int or row["_aquai_row"] != position:
+        raise ValueError("El orden interno de registros debe ser consecutivo.")
+    if type(row["_aquai_source_row"]) is not int or row["_aquai_source_row"] < 1:
+        raise ValueError("La fila original debe tener procedencia válida.")
+    if transposed and (
+        type(row["_aquai_source_column"]) is not int or row["_aquai_source_column"] < 1
+    ):
+        raise ValueError("La columna original debe tener procedencia válida.")
+
+
+def _validate_prepared(tables: list[PreparedTable], report: dict[str, Any]) -> None:
+    locators: set[str] = set()
+    for table in tables:
+        _validate_table(table)
+        locator = json.dumps(table.source_locator, sort_keys=True, allow_nan=False)
+        if locator in locators:
+            raise ValueError(
+                "Dos datasets de la misma fuente no pueden tener idéntica procedencia."
+            )
+        locators.add(locator)
+
+    if not isinstance(report, dict):
+        raise ValueError("El informe de procesamiento debe ser un objeto JSON.")
+    json.dumps(report, allow_nan=False)
 
 
 def _physical_table(name: str, columns: list[dict[str, Any]], *, transposed: bool = False) -> Table:
     return Table(
-        name, MetaData(),
+        name,
+        MetaData(),
         Column("_aquai_row", BigInteger, primary_key=True, autoincrement=False),
         Column("_aquai_source_row", BigInteger, nullable=False),
         *([Column("_aquai_source_column", BigInteger, nullable=False)] if transposed else []),
-        *(Column(column["sql_name"], _SQL_TYPES[column["sql_type"]](), quote=True)
-          for column in columns),
+        *(
+            Column(column["sql_name"], _SQL_TYPES[column["sql_type"]](), quote=True)
+            for column in columns
+        ),
         quote=True,
     )
 
 
 def _region_key(locator: dict) -> str:
-    stable = {key: locator.get(key) for key in ("file_type", "sheet", "range")} if "range" in locator else locator
+    stable = (
+        {key: locator.get(key) for key in ("file_type", "sheet", "range")}
+        if "range" in locator
+        else locator
+    )
     return json.dumps(stable, sort_keys=True)
+
+
+def _reduces_rows(prior: Dataset | None, prepared: PreparedTable) -> bool:
+    if prior is None or len(prepared.rows) >= prior.row_count:
+        return False
+    prior_orientation = prior.source_locator.get("orientation", "rows")
+    return prior_orientation == prepared.source_locator.get("orientation", "rows")
+
+
+def _final_report(
+    report: dict[str, Any], tables: list[PreparedTable], replace_existing: bool
+) -> dict[str, Any]:
+    final_report = deepcopy(report)
+    if replace_existing:
+        final_report["reprocessed"] = True
+    final_report["warnings"] = _warnings(
+        final_report.get("warnings", []),
+        *(table.warnings for table in tables),
+    )
+    final_report["dataset_count"] = len(tables)
+    final_report["row_count"] = sum(len(table.rows) for table in tables)
+    return final_report
+
+
+def _prepared_status(tables: list[PreparedTable], warnings: list[str]) -> ProcessingStatus:
+    if not tables:
+        return ProcessingStatus.FAILED
+    if warnings:
+        return ProcessingStatus.READY_WITH_WARNINGS
+    return ProcessingStatus.READY
+
+
+def _failure_status(has_datasets: bool, code: str) -> ProcessingStatus:
+    if has_datasets:
+        return ProcessingStatus.READY_WITH_WARNINGS
+    if code == "interrupted":
+        return ProcessingStatus.UPLOADED
+    return ProcessingStatus.FAILED
+
+
+def _has_queryable_dataset(session: Session, source_id: UUID) -> bool:
+    dataset_id = session.scalar(
+        select(Dataset.id)
+        .where(Dataset.source_id == source_id, Dataset.queryable.is_(True))
+        .limit(1)
+    )
+    return dataset_id is not None
+
+
+def _insert_rows(session: Session, table: Table, rows: list[dict[str, Any]]) -> int:
+    for offset in range(0, len(rows), _INSERT_BATCH_SIZE):
+        session.execute(table.insert(), rows[offset : offset + _INSERT_BATCH_SIZE])
+    count = session.scalar(select(func.count()).select_from(table))
+    if count != len(rows):
+        raise RuntimeError("No se confirmó la cantidad completa de registros.")
+    return count
+
+
+def _drop_previous_table(session: Session, dataset: Dataset) -> None:
+    if not re.fullmatch(r"dataset_[0-9a-f]{32}", dataset.physical_table_name):
+        raise ValueError("La tabla anterior no corresponde a un dataset administrado.")
+    old_table = Table(
+        dataset.physical_table_name,
+        MetaData(),
+        autoload_with=session.connection(),
+    )
+    old_table.drop(session.connection())
+
+
+def _apply_prepared(
+    dataset: Dataset, prepared: PreparedTable, physical_name: str, row_count: int
+) -> None:
+    dataset.name = prepared.name
+    dataset.description = prepared.description
+    dataset.source_locator = deepcopy(prepared.source_locator)
+    dataset.physical_table_name = physical_name
+    dataset.row_count = row_count
+    dataset.columns_metadata = deepcopy(prepared.columns)
+    dataset.queryable = True
+    dataset.quality_warnings = _warnings(prepared.warnings)
+    dataset.semantic_description = None
+
+
+def _apply_column_meanings(metadata: list[dict[str, Any]], columns: list[dict[str, Any]]) -> None:
+    existing = {column["sql_name"]: column for column in metadata}
+    if columns and [column.get("sql_name") for column in columns] != list(existing):
+        raise ValueError("La descripción alteró, omitió o reordenó columnas de la tabla.")
+
+    for column in columns:
+        stored = existing[column.get("sql_name")]
+        for field in ("original_name", "sql_name", "sql_type", "numeric_eligible", "unit"):
+            if column.get(field) != stored.get(field):
+                raise ValueError("La descripción no puede alterar metadatos verificados.")
+        if "meaning" not in column:
+            continue
+        meaning = column["meaning"]
+        if meaning is not None and not isinstance(meaning, str):
+            raise ValueError("El significado debe ser texto o null.")
+        stored["meaning"] = meaning
+
+
+@contextmanager
+def _sqlite_worker_lock(engine: Engine) -> Iterator[bool]:
+    lock = _sqlite_locks(engine)[0]
+    acquired = lock.acquire(blocking=False)
+    try:
+        yield acquired
+    finally:
+        if acquired:
+            lock.release()
+
+
+@contextmanager
+def _advisory_worker_lock(engine: Engine) -> Iterator[bool]:
+    with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as connection:
+        acquired = bool(
+            connection.scalar(text("SELECT pg_try_advisory_lock(:key)"), {"key": _WORKER_KEY})
+        )
+        try:
+            yield acquired
+        finally:
+            if acquired:
+                connection.execute(text("SELECT pg_advisory_unlock(:key)"), {"key": _WORKER_KEY})
 
 
 class SqlAlchemySourceCommands:
@@ -130,25 +312,14 @@ class SqlAlchemySourceCommands:
         """Un lock global evita inferencias simultáneas y habilita recuperar interrupciones."""
         engine = self._context.engine
         if engine.dialect.name == "sqlite":
-            lock = _sqlite_locks(engine)[0]
-            acquired = lock.acquire(blocking=False)
-            try:
+            with _sqlite_worker_lock(engine) as acquired:
                 yield acquired
-            finally:
-                if acquired:
-                    lock.release()
             return
+
         if engine.dialect.name != "postgresql":
             raise RuntimeError("El worker requiere PostgreSQL.")
-        with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as connection:
-            acquired = bool(connection.scalar(
-                text("SELECT pg_try_advisory_lock(:key)"), {"key": _WORKER_KEY}
-            ))
-            try:
-                yield acquired
-            finally:
-                if acquired:
-                    connection.execute(text("SELECT pg_advisory_unlock(:key)"), {"key": _WORKER_KEY})
+        with _advisory_worker_lock(engine) as acquired:
+            yield acquired
 
     @staticmethod
     def _source(session: Session, source_id: UUID) -> Source:
@@ -165,6 +336,7 @@ class SqlAlchemySourceCommands:
             raise ValueError("El tamaño declarado no corresponde al original.")
         if source.processing_status != ProcessingStatus.UPLOADED:
             raise ValueError("Una fuente nueva debe comenzar en uploaded.")
+
         source.content_hash = digest
         try:
             with self._write_session() as session:
@@ -185,12 +357,15 @@ class SqlAlchemySourceCommands:
     def claim_next(self) -> UUID | None:
         with self._write_session() as session:
             source = session.scalar(
-                select(Source).where(Source.processing_status == ProcessingStatus.UPLOADED)
-                .order_by(Source.created_at, Source.id).limit(1)
+                select(Source)
+                .where(Source.processing_status == ProcessingStatus.UPLOADED)
+                .order_by(Source.created_at, Source.id)
+                .limit(1)
                 .with_for_update(skip_locked=True)
             )
             if source is None:
                 return None
+
             source.processing_status = ProcessingStatus.PROCESSING
             source.updated_at = _now()
             return source.id
@@ -198,43 +373,41 @@ class SqlAlchemySourceCommands:
     def recover_interrupted(self) -> int:
         """Sólo se llama tras obtener worker_lock, cuando ningún otro worker trabaja."""
         with self._write_session() as session:
-            sources = session.scalars(select(Source).where(
-                (Source.processing_status == ProcessingStatus.PROCESSING)
-                | (Source.semantic_index_status == SemanticIndexStatus.PROCESSING)
-            ).with_for_update()).all()
+            sources = session.scalars(
+                select(Source)
+                .where(
+                    (Source.processing_status == ProcessingStatus.PROCESSING)
+                    | (Source.semantic_index_status == SemanticIndexStatus.PROCESSING)
+                )
+                .with_for_update()
+            ).all()
             for source in sources:
                 if source.processing_status == ProcessingStatus.PROCESSING:
-                    has_datasets = session.scalar(select(Dataset.id).where(
-                        Dataset.source_id == source.id, Dataset.queryable.is_(True)
-                    ).limit(1)) is not None
-                    source.processing_status = (
-                        ProcessingStatus.READY_WITH_WARNINGS if has_datasets
-                        else ProcessingStatus.UPLOADED
-                    )
-                    report = deepcopy(source.processing_report)
-                    report["warnings"] = _warnings(
-                        report.get("warnings", []), ["Se recuperó un procesamiento interrumpido."]
-                    )
-                    source.processing_report = report
+                    self._recover_processing(session, source)
                 if source.semantic_index_status == SemanticIndexStatus.PROCESSING:
                     source.semantic_index_status = SemanticIndexStatus.PENDING
                 source.updated_at = _now()
             return len(sources)
 
+    @staticmethod
+    def _recover_processing(session: Session, source: Source) -> None:
+        has_datasets = _has_queryable_dataset(session, source.id)
+        source.processing_status = (
+            ProcessingStatus.READY_WITH_WARNINGS if has_datasets else ProcessingStatus.UPLOADED
+        )
+        source.processing_report = _report_with_warnings(
+            source.processing_report, ["Se recuperó un procesamiento interrumpido."]
+        )
+
     def save_prepared(
-        self, source_id: UUID, tables: list[PreparedTable], report: dict[str, Any],
-        *, replace_existing: bool = False,
+        self,
+        source_id: UUID,
+        tables: list[PreparedTable],
+        report: dict[str, Any],
+        *,
+        replace_existing: bool = False,
     ) -> None:
-        locators: set[str] = set()
-        for table in tables:
-            _validate_table(table)
-            locator = json.dumps(table.source_locator, sort_keys=True, allow_nan=False)
-            if locator in locators:
-                raise ValueError("Dos datasets de la misma fuente no pueden tener idéntica procedencia.")
-            locators.add(locator)
-        if not isinstance(report, dict):
-            raise ValueError("El informe de procesamiento debe ser un objeto JSON.")
-        json.dumps(report, allow_nan=False)
+        _validate_prepared(tables, report)
         created_tables: list[Table] = []
         try:
             with self._write_session() as session:
@@ -242,72 +415,35 @@ class SqlAlchemySourceCommands:
                     # SQLite difiere BEGIN: iniciarlo explícitamente incluye también el DDL.
                     session.connection().exec_driver_sql("BEGIN IMMEDIATE")
                 source = self._source(session, source_id)
-                existing = session.scalars(select(Dataset).where(Dataset.source_id == source_id).with_for_update()).all()
+                existing = session.scalars(
+                    select(Dataset).where(Dataset.source_id == source_id).with_for_update()
+                ).all()
                 if existing and not replace_existing:
                     return
+
                 previous = {_region_key(dataset.source_locator): dataset for dataset in existing}
                 new_keys = {_region_key(table.source_locator) for table in tables}
                 if replace_existing:
-                    if source.processing_status == ProcessingStatus.PROCESSING:
-                        raise ValueError("La fuente está siendo procesada.")
-                    if session.scalar(select(MessageSource.id).where(MessageSource.source_id == source_id).limit(1)):
-                        raise ValueError("La fuente está referenciada por mensajes; se conserva su versión actual.")
-                    if not set(previous).issubset(new_keys) or len(new_keys) != len(tables):
-                        raise ValueError("El reprocesamiento perdería o combinaría regiones existentes; se conserva la versión actual.")
-                    for prepared in tables:
-                        prior = previous.get(_region_key(prepared.source_locator))
-                        if prior is not None and len(prepared.rows) < prior.row_count and (
-                            prior.source_locator.get("orientation", "rows") == prepared.source_locator.get("orientation", "rows")
-                        ):
-                            raise ValueError("El reprocesamiento reduciría registros existentes; se conserva la versión actual.")
-                final_report = deepcopy(report)
-                if replace_existing:
-                    final_report["reprocessed"] = True
-                warnings = _warnings(
-                    final_report.get("warnings", []),
-                    *(table.warnings for table in tables),
-                )
-                final_report["warnings"] = warnings
-                final_report["dataset_count"] = len(tables)
-                final_report["row_count"] = sum(len(table.rows) for table in tables)
+                    self._ensure_replaceable(session, source, source_id, previous, new_keys, tables)
+
+                final_report = _final_report(report, tables, replace_existing)
                 for prepared in tables:
-                    dataset = previous.get(_region_key(prepared.source_locator)) if replace_existing else None
-                    dataset_id = dataset.id if dataset is not None else uuid4()
-                    physical_name = f"dataset_{uuid4().hex if dataset is not None else dataset_id.hex}"
-                    table = _physical_table(physical_name, prepared.columns,
-                                            transposed=prepared.source_locator.get("orientation") == "columns")
-                    table.create(session.connection())
-                    created_tables.append(table)
-                    for offset in range(0, len(prepared.rows), 1000):
-                        session.execute(table.insert(), prepared.rows[offset:offset + 1000])
-                    count = session.scalar(select(func.count()).select_from(table))
-                    if count != len(prepared.rows):
-                        raise RuntimeError("No se confirmó la cantidad completa de registros.")
-                    if dataset is None:
-                        dataset = Dataset(id=dataset_id, source_id=source_id, name=prepared.name,
-                                          source_locator={}, physical_table_name=physical_name, semantic_point_id=dataset_id)
-                        session.add(dataset)
-                    else:
-                        if not re.fullmatch(r"dataset_[0-9a-f]{32}", dataset.physical_table_name):
-                            raise ValueError("La tabla anterior no corresponde a un dataset administrado.")
-                        old_table = Table(dataset.physical_table_name, MetaData(), autoload_with=session.connection())
-                        old_table.drop(session.connection())
-                        dataset.version += 1
-                        dataset.updated_at = _now()
-                    dataset.name, dataset.description = prepared.name, prepared.description
-                    dataset.source_locator = deepcopy(prepared.source_locator)
-                    dataset.physical_table_name, dataset.row_count = physical_name, count
-                    dataset.columns_metadata, dataset.queryable = deepcopy(prepared.columns), True
-                    dataset.quality_warnings, dataset.semantic_description = _warnings(prepared.warnings), None
+                    prior = (
+                        previous.get(_region_key(prepared.source_locator))
+                        if replace_existing
+                        else None
+                    )
+                    self._store_prepared(session, source_id, prepared, prior, created_tables)
+
                 source.processing_report = final_report
-                source.processing_status = (
-                    ProcessingStatus.READY_WITH_WARNINGS if warnings else ProcessingStatus.READY
-                ) if tables else ProcessingStatus.FAILED
+                source.processing_status = _prepared_status(tables, final_report["warnings"])
                 if not tables:
-                    final_report["errors"] = [{
-                        "code": "no_reliable_tables",
-                        "message": "No se encontraron tablas confiables; se conserva el original.",
-                    }]
+                    final_report["errors"] = [
+                        {
+                            "code": "no_reliable_tables",
+                            "message": "No se encontraron tablas confiables; se conserva el original.",
+                        }
+                    ]
                 source.semantic_index_status = SemanticIndexStatus.PENDING
                 source.updated_at = _now()
         except BaseException:
@@ -318,55 +454,121 @@ class SqlAlchemySourceCommands:
                         table.drop(connection, checkfirst=True)
             raise
 
+    @staticmethod
+    def _ensure_replaceable(
+        session: Session,
+        source: Source,
+        source_id: UUID,
+        previous: dict[str, Dataset],
+        new_keys: set[str],
+        tables: list[PreparedTable],
+    ) -> None:
+        if source.processing_status == ProcessingStatus.PROCESSING:
+            raise ValueError("La fuente está siendo procesada.")
+        if session.scalar(
+            select(MessageSource.id).where(MessageSource.source_id == source_id).limit(1)
+        ):
+            raise ValueError(
+                "La fuente está referenciada por mensajes; se conserva su versión actual."
+            )
+        if not set(previous).issubset(new_keys) or len(new_keys) != len(tables):
+            raise ValueError(
+                "El reprocesamiento perdería o combinaría regiones existentes; se conserva la versión actual."
+            )
+        for prepared in tables:
+            prior = previous.get(_region_key(prepared.source_locator))
+            if _reduces_rows(prior, prepared):
+                raise ValueError(
+                    "El reprocesamiento reduciría registros existentes; se conserva la versión actual."
+                )
+
+    @staticmethod
+    def _store_prepared(
+        session: Session,
+        source_id: UUID,
+        prepared: PreparedTable,
+        dataset: Dataset | None,
+        created_tables: list[Table],
+    ) -> None:
+        if dataset is None:
+            dataset_id = uuid4()
+            physical_name = f"dataset_{dataset_id.hex}"
+        else:
+            dataset_id = dataset.id
+            physical_name = f"dataset_{uuid4().hex}"
+
+        table = _physical_table(
+            physical_name,
+            prepared.columns,
+            transposed=prepared.source_locator.get("orientation") == "columns",
+        )
+        table.create(session.connection())
+        created_tables.append(table)
+        count = _insert_rows(session, table, prepared.rows)
+
+        if dataset is None:
+            dataset = Dataset(
+                id=dataset_id,
+                source_id=source_id,
+                name=prepared.name,
+                source_locator={},
+                physical_table_name=physical_name,
+                semantic_point_id=dataset_id,
+            )
+            session.add(dataset)
+        else:
+            _drop_previous_table(session, dataset)
+            dataset.version += 1
+            dataset.updated_at = _now()
+        _apply_prepared(dataset, prepared, physical_name, count)
+
     def save_dataset_semantics(
-        self, dataset_id: UUID, description: str, columns: list[dict[str, Any]],
+        self,
+        dataset_id: UUID,
+        description: str,
+        columns: list[dict[str, Any]],
         warnings: list[str] | None = None,
     ) -> None:
         with self._write_session() as session:
-            dataset = session.scalar(select(Dataset).where(Dataset.id == dataset_id).with_for_update())
+            dataset = session.scalar(
+                select(Dataset).where(Dataset.id == dataset_id).with_for_update()
+            )
             if dataset is None:
                 raise SourceNotFoundError("El dataset no existe.")
+
             metadata = deepcopy(dataset.columns_metadata)
-            existing = {column["sql_name"]: column for column in metadata}
-            if columns and [column.get("sql_name") for column in columns] != list(existing):
-                raise ValueError("La descripción alteró, omitió o reordenó columnas de la tabla.")
-            for column in columns:
-                name = column.get("sql_name")
-                stored = existing[name]
-                for field in ("original_name", "sql_name", "sql_type", "numeric_eligible", "unit"):
-                    if column.get(field) != stored.get(field):
-                        raise ValueError("La descripción no puede alterar metadatos verificados.")
-                if "meaning" in column:
-                    value = column["meaning"]
-                    if value is not None and not isinstance(value, str):
-                        raise ValueError("El significado debe ser texto o null.")
-                    stored["meaning"] = value
+            _apply_column_meanings(metadata, columns)
             dataset.columns_metadata = metadata
             dataset.semantic_description = description
             dataset.quality_warnings = _warnings(dataset.quality_warnings, warnings or [])
             dataset.updated_at = _now()
+
             if warnings:
                 source = self._source(session, dataset.source_id)
-                report = deepcopy(source.processing_report)
-                report["warnings"] = _warnings(report.get("warnings", []), warnings)
-                source.processing_report = report
+                source.processing_report = _report_with_warnings(source.processing_report, warnings)
                 if source.processing_status == ProcessingStatus.READY:
                     source.processing_status = ProcessingStatus.READY_WITH_WARNINGS
                 source.updated_at = _now()
 
     def set_index_status(
-        self, source_id: UUID, status: str, error: str | None = None,
-        *, expected_active: bool | None = None,
+        self,
+        source_id: UUID,
+        status: str,
+        error: str | None = None,
+        *,
+        expected_active: bool | None = None,
     ) -> None:
         status = SemanticIndexStatus(status)
         with self._write_session() as session:
             source = self._source(session, source_id)
             if (
-                status == SemanticIndexStatus.READY and expected_active is not None
+                status == SemanticIndexStatus.READY
+                and expected_active is not None
                 and source.is_active != expected_active
             ):
                 status = SemanticIndexStatus.PENDING
             source.semantic_index_status = status
+
             report = deepcopy(source.processing_report)
             if error:
                 report["semantic_index_error"] = str(error)[:2000]
@@ -377,14 +579,21 @@ class SqlAlchemySourceCommands:
 
     def claim_index_next(self) -> UUID | None:
         with self._write_session() as session:
-            source = session.scalar(select(Source).where(
-                Source.semantic_index_status == SemanticIndexStatus.PENDING,
-                Source.processing_status.in_(
-                    (ProcessingStatus.READY, ProcessingStatus.READY_WITH_WARNINGS)
-                ),
-            ).order_by(Source.created_at, Source.id).limit(1).with_for_update(skip_locked=True))
+            source = session.scalar(
+                select(Source)
+                .where(
+                    Source.semantic_index_status == SemanticIndexStatus.PENDING,
+                    Source.processing_status.in_(
+                        (ProcessingStatus.READY, ProcessingStatus.READY_WITH_WARNINGS)
+                    ),
+                )
+                .order_by(Source.created_at, Source.id)
+                .limit(1)
+                .with_for_update(skip_locked=True)
+            )
             if source is None:
                 return None
+
             source.semantic_index_status = SemanticIndexStatus.PROCESSING
             source.updated_at = _now()
             return source.id
@@ -392,10 +601,14 @@ class SqlAlchemySourceCommands:
     def set_active(self, source_id: UUID, is_active: bool) -> None:
         if type(is_active) is not bool:
             raise ValueError("is_active debe ser booleano.")
+
         with self._write_session() as session:
             source = self._source(session, source_id)
             source.is_active = is_active
-            if source.processing_status in (ProcessingStatus.READY, ProcessingStatus.READY_WITH_WARNINGS):
+            if source.processing_status in (
+                ProcessingStatus.READY,
+                ProcessingStatus.READY_WITH_WARNINGS,
+            ):
                 source.semantic_index_status = SemanticIndexStatus.PENDING
             source.updated_at = _now()
 
@@ -403,19 +616,16 @@ class SqlAlchemySourceCommands:
         with self._write_session() as session:
             source = self._source(session, source_id)
             report = deepcopy(source.processing_report)
-            report["errors"] = [*report.get("errors", []), {
-                "code": code[:100], "message": str(message)[:2000],
-            }][-20:]
+            failure = {"code": code[:100], "message": str(message)[:2000]}
+            report["errors"] = [*report.get("errors", []), failure][-20:]
             source.processing_report = report
-            has_datasets = session.scalar(select(Dataset.id).where(
-                Dataset.source_id == source_id, Dataset.queryable.is_(True)
-            ).limit(1)) is not None
-            source.processing_status = (
-                ProcessingStatus.READY_WITH_WARNINGS if has_datasets
-                else ProcessingStatus.UPLOADED if code == "interrupted"
-                else ProcessingStatus.FAILED
-            )
-            if code == "interrupted" and source.semantic_index_status == SemanticIndexStatus.PROCESSING:
+
+            has_datasets = _has_queryable_dataset(session, source_id)
+            source.processing_status = _failure_status(has_datasets, code)
+            if (
+                code == "interrupted"
+                and source.semantic_index_status == SemanticIndexStatus.PROCESSING
+            ):
                 source.semantic_index_status = SemanticIndexStatus.PENDING
             source.updated_at = _now()
 

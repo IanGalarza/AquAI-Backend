@@ -1,13 +1,13 @@
-"""Plan declarativo: referencias y operadores, nunca SQL ni código Python."""
-
 from datetime import datetime
 from typing import Annotated, Literal
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
 
-from aquai.application.contracts.retrieval import DatasetRetrievalResult, VerifiedDataset
-
+from aquai.application.contracts.retrieval import (
+    DatasetRetrievalResult,
+    VerifiedDataset,
+)
 
 PlanningStatus = Literal["plannable", "needs_clarification", "insufficient_coverage"]
 # "failed": el modelo no produjo un plan verificable tras reintentar; no es una pregunta al usuario.
@@ -18,13 +18,19 @@ MAX_ROW_LIMIT = 10000
 
 
 class PlanModel(BaseModel):
-    model_config = ConfigDict(extra="forbid", strict=True, str_strip_whitespace=True, allow_inf_nan=False)
+    model_config = ConfigDict(
+        extra="forbid", strict=True, str_strip_whitespace=True, allow_inf_nan=False
+    )
 
 
 class ColumnRef(PlanModel):
     kind: Literal["column"]
     dataset_id: UUID
-    column: str = Field(min_length=1, max_length=63, description="sql_name exacto de una columna incluida en datasets[].columns para este mismo dataset_id.")
+    column: str = Field(
+        min_length=1,
+        max_length=63,
+        description="sql_name exacto de una columna incluida en datasets[].columns para este mismo dataset_id.",
+    )
 
 
 class ResultRef(PlanModel):
@@ -39,13 +45,19 @@ ValueRef = Annotated[ColumnRef | ResultRef, Field(discriminator="kind")]
 class DatasetSelection(PlanModel):
     dataset_id: UUID
     version: int = Field(ge=1)
-    columns: list[str] = Field(min_length=1, max_length=1024, description="Todos los sql_name que usan los read de este dataset, incluidos los necesarios para filtros y orden temporal; nunca nombres originales ni alias.")
+    columns: list[str] = Field(
+        min_length=1,
+        max_length=1024,
+        description="Todos los sql_name que usan los read de este dataset, incluidos los necesarios para filtros y orden temporal; nunca nombres originales ni alias.",
+    )
     reason: str = Field(min_length=1, max_length=1500)
 
 
 class FilterSpec(PlanModel):
     field: ValueRef
-    operator: Literal["eq", "ieq", "ne", "lt", "le", "gt", "ge", "in", "not_in", "is_null", "is_not_null"]
+    operator: Literal[
+        "eq", "ieq", "ne", "lt", "le", "gt", "ge", "in", "not_in", "is_null", "is_not_null"
+    ]
     values: list[str | int | float | bool] = Field(default_factory=list, max_length=100)
 
     @model_validator(mode="after")
@@ -69,7 +81,20 @@ class GroupingSpec(PlanModel):
 
 
 class CalculationSpec(PlanModel):
-    function: Literal["count", "count_distinct", "sum", "mean", "min", "max", "difference", "ratio", "correlation", "median", "stddev", "quantile"]
+    function: Literal[
+        "count",
+        "count_distinct",
+        "sum",
+        "mean",
+        "min",
+        "max",
+        "difference",
+        "ratio",
+        "correlation",
+        "median",
+        "stddev",
+        "quantile",
+    ]
     inputs: list[ValueRef] = Field(default_factory=list, max_length=2)
     output_name: Identifier
     null_policy: Literal["exclude", "preserve"] = "exclude"
@@ -79,9 +104,12 @@ class CalculationSpec(PlanModel):
     @model_validator(mode="after")
     def valid_arity(self):
         if (self.function == "quantile") != (self.quantile is not None):
-            raise ValueError("quantile requiere una probabilidad explícita entre 0 y 1, exclusiva de esa función.")
+            raise ValueError(
+                "quantile requiere una probabilidad explícita entre 0 y 1, exclusiva de esa función."
+            )
         if self.function != "stddev":
-            self.ddof = 1  # ddof no interviene en otras funciones; se normaliza sin cambiar el cálculo.
+            # ddof no interviene en otras funciones; se normaliza sin cambiar el cálculo.
+            self.ddof = 1
         expected = 2 if self.function in {"difference", "ratio", "correlation"} else 1
         if self.function == "count" and not self.inputs:
             return self
@@ -113,7 +141,8 @@ class HistogramVisualizationRequest(_VisualizationRequest):
 
 
 VisualizationRequest = Annotated[
-    CartesianVisualizationRequest | HistogramVisualizationRequest, Field(discriminator="chart_type"),
+    CartesianVisualizationRequest | HistogramVisualizationRequest,
+    Field(discriminator="chart_type"),
 ]
 
 
@@ -130,7 +159,9 @@ class OrderingSpec(PlanModel):
 class PlanStep(PlanModel):
     id: Identifier
     tool: Literal["sql", "python"]
-    operation: Literal["read", "aggregate", "calculate", "sort", "latest", "join", "append", "visualize"]
+    operation: Literal[
+        "read", "aggregate", "calculate", "sort", "latest", "join", "append", "visualize"
+    ]
     depends_on: list[Identifier] = Field(default_factory=list, max_length=12)
     columns: list[ColumnRef] = Field(default_factory=list, max_length=1024)
     filters: list[FilterSpec] = Field(default_factory=list, max_length=30)
@@ -148,7 +179,10 @@ class ReadPlanStep(PlanStep):
     tool: Literal["sql"]
     depends_on: list[Identifier] = Field(default_factory=list, max_length=0)
     columns: list[ColumnRef] = Field(min_length=1, max_length=1024)
-    filters: list[FilterSpec] = Field(max_length=30, description="Filtros explícitos del alcance solicitado. Si hay query_mentions de kind=value, usá sus textos como valores de filtros en las columnas verificadas correspondientes.")
+    filters: list[FilterSpec] = Field(
+        max_length=30,
+        description="Filtros explícitos del alcance solicitado. Si hay query_mentions de kind=value, usá sus textos como valores de filtros en las columnas verificadas correspondientes.",
+    )
     group_by: list[GroupingSpec] = Field(default_factory=list, max_length=0)
     calculations: list[CalculationSpec] = Field(default_factory=list, max_length=0)
     join_on: list[JoinKey] = Field(default_factory=list, max_length=0)
@@ -208,8 +242,15 @@ class CombinePlanStep(PlanStep):
     visualization: None = None
 
 
-ProposedStep = Annotated[ReadPlanStep | AggregatePlanStep | SortPlanStep | LatestPlanStep | VisualizePlanStep
-                         | CombinePlanStep, Field(discriminator="operation")]
+ProposedStep = Annotated[
+    ReadPlanStep
+    | AggregatePlanStep
+    | SortPlanStep
+    | LatestPlanStep
+    | VisualizePlanStep
+    | CombinePlanStep,
+    Field(discriminator="operation"),
+]
 
 
 class PlannerDecision(PlanModel):
@@ -225,8 +266,16 @@ class PlannerDecision(PlanModel):
     @model_validator(mode="after")
     def coherent_status(self):
         if self.status == "plannable":
-            if not self.datasets or not self.steps or not self.output_steps or self.clarification_question or self.missing_information:
-                raise ValueError("Un plan completo necesita datasets, pasos y salidas, sin aclaraciones pendientes.")
+            if (
+                not self.datasets
+                or not self.steps
+                or not self.output_steps
+                or self.clarification_question
+                or self.missing_information
+            ):
+                raise ValueError(
+                    "Un plan completo necesita datasets, pasos y salidas, sin aclaraciones pendientes."
+                )
         elif self.steps or self.output_steps:
             raise ValueError("Una planificación bloqueada no debe publicar operaciones.")
         if self.status == "needs_clarification" and not self.clarification_question:

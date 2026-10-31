@@ -1,5 +1,3 @@
-"""Definiciones de columnas compartidas por las entidades con fechas de creación y actualización."""
-
 from sqlalchemy import Column
 from sqlalchemy.dialects.postgresql import TIMESTAMP, UUID
 

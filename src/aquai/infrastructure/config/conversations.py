@@ -1,5 +1,3 @@
-"""Límites de generación y de las fotografías guardadas en el historial."""
-
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 

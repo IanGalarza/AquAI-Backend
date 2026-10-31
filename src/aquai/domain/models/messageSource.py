@@ -1,5 +1,3 @@
-"""Fuente y conjunto de datos opcional usados como respaldo de un mensaje."""
-
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -26,12 +24,6 @@ class MessageSource:
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime | None = None
 
-    message: Message | None = field(
-        default=None, init=False, repr=False, compare=False
-    )
-    source: Source | None = field(
-        default=None, init=False, repr=False, compare=False
-    )
-    dataset: Dataset | None = field(
-        default=None, init=False, repr=False, compare=False
-    )
+    message: Message | None = field(default=None, init=False, repr=False, compare=False)
+    source: Source | None = field(default=None, init=False, repr=False, compare=False)
+    dataset: Dataset | None = field(default=None, init=False, repr=False, compare=False)

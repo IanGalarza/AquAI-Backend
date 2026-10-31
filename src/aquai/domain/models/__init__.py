@@ -1,5 +1,3 @@
-"""Entidades de dominio, sin dependencias de persistencia ni de los frameworks de aplicación."""
-
 from aquai.domain.models.conversation import Conversation
 from aquai.domain.models.dataset import Dataset
 from aquai.domain.models.jsonTypes import JsonDocument, JsonValue
