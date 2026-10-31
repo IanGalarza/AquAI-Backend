@@ -50,9 +50,9 @@ altos', 'todos los registros'). Separá variable y valor: en
 En 'Graficá sólo los 3 primeros resultados' la mención es '3 primeros resultados'
 (limit): una cantidad nunca es una fecha ni un valor. Un superlativo sin cantidad
 ('el mayor', 'la mayor cantidad', 'el más alto') no es un limit.
-Un value es un nombre concreto; lo que se pregunta no es un value: en '¿Qué estación
-tuvo la turbiedad más alta?' sólo 'turbiedad' es una mención (variable) y 'estación'
-no se incluye.
+Un value es un nombre concreto; lo que se pregunta no es un value sino una dimension:
+en '¿Qué estación tuvo la turbiedad más alta?' son 'turbiedad' (variable) y 'estación'
+(dimension); en '¿Qué sitios tienen un pH promedio mayor que 8?', 'sitios' es dimension.
 'Último dato' y 'más reciente' piden una nueva consulta temporal (data), no recordar
 el último mensaje del chat. No elijas vos una medición ni una fecha.
 

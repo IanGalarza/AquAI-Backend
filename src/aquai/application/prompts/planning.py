@@ -35,14 +35,28 @@ una sigla del archivo): ya determinan los datasets candidatos y nunca son valore
 filtrar registros ni motivo para pedir una aclaración.
 previous_attempt_feedback, si existe, explica por qué se rechazó tu plan anterior:
 corregí exactamente esos problemas.
-No agregues gráficos si la pregunta sólo pide una medición. Un read y un latest
-son suficientes para la última medición de una variable en una localidad.
+Agregá visualize sólo si la pregunta pide un gráfico; requested_chart=true exige uno
+(para 'promedio por mes' agrupá la fecha con time_grain=month). Usá latest sólo si existe
+temporal_requirements o si verified_history_metadata ya lo usa; latest nunca publica
+un resultado. Un read y un latest son suficientes para la última medición de una
+variable en una localidad.
 query_mentions describe la intención literal del usuario, no valores observados
 ni nombres de fuentes. Cada mención kind=value debe aparecer en los filtros del
 alcance que alimenta latest; usá sus textos literales y columnas verificadas.
 Una mención kind=limit es la cantidad de filas que el usuario quiere ver: ese número
 es el limit del sort que publica el resultado o alimenta el gráfico ('los 5 sitios con
 mayor promedio' es read -> aggregate por sitio -> sort desc con limit 5).
+Una mención kind=dimension es lo que se pregunta o agrupa (sitio, estación, fecha):
+requested_dimension_columns son sus columnas y el resultado publicado debe incluir una
+de ellas, como group_by del aggregate o como columna de los registros publicados.
+requested_statistics son estadísticas pedidas por su nombre (mean, median, sum, stddev,
+count): calculalas con aggregate; publicar los registros leídos no responde un promedio.
+requested_thresholds son comparaciones pedidas: aplicá cada una como filtro con ese
+operator y value exactos. Con compares_statistic=true se filtra el resultado calculado:
+read -> aggregate (group_by por la dimensión) -> sort con el filtro sobre el alias del
+cálculo ('sitios con conductividad promedio mayor que 500'). Si no, filtrá la variable en
+el read antes de calcular ('mediciones con turbiedad mayor que 100': read con filtro gt
+100 -> aggregate count).
 
 Estados:
 - plannable: todas las partes de la pregunta tienen cobertura verificable en los
@@ -121,7 +135,9 @@ Gramática del plan:
   algún operando. Nunca sustituyas faltantes por cero.
 - calculate: difference, ratio o correlation sobre campos de un resultado previo.
   Usá python para análisis como correlation; SQL o Python para agregados según entrada.
-- sort: orden/filtros/límite sobre un resultado previo; campos de esa dependencia.
+- sort: orden/filtros/límite sobre un resultado previo; campos de esa dependencia. Un filtro
+  sobre un valor calculado (un promedio mayor que un umbral) va en un sort que depende del
+  aggregate y refiere a su alias.
 - latest: SQL preferido, depends_on=[paso de datos], order_by con UN único campo
   DATE/TIMESTAMP de esa dependencia y direction=desc. Devuelve todas las filas
   cuya fecha es igual a la máxima de la entrada filtrada. Sin limit, group_by ni

@@ -14,8 +14,16 @@ from aquai.application.conversations.context import contextual_question, routing
 from aquai.application.errors import LLMProviderError
 from aquai.application.interfaces.routing import RoutingProvider
 from aquai.application.interfaces.sources import SourceQueries
-from aquai.application.matching import contains_phrase, normalize_name, normalize_text
+from aquai.application.matching import (
+    contains_phrase,
+    normalize_name,
+    normalize_text,
+    numeric_comparisons,
+    variable_core,
+)
 from aquai.application.Rules.vocabulary import (
+    CATEGORY_CUES,
+    MENTION_CONNECTORS,
     SOURCE_CUE_WINDOW,
     SOURCE_CUE_WORDS,
     SOURCE_NAME_CONNECTORS,
@@ -23,6 +31,10 @@ from aquai.application.Rules.vocabulary import (
 )
 
 _logger = logging.getLogger(__name__)
+# Menciones que el modelo confunde con un umbral cuando copian su número.
+_NUMERIC_KINDS = {"value", "limit", "threshold"}
+# Menciones que acotan o agrupan y que el modelo a veces copia dentro de la variable.
+_SCOPE_KINDS = {"value", "dimension", "threshold", "date"}
 SOURCE_CUE = re.compile(
     rf"\b(?:{'|'.join(SOURCE_CUE_WORDS)})\s+"
     rf"(?:(?:{'|'.join(SOURCE_NAME_CONNECTORS)})\s+)*[«\"“']?\s*$",
@@ -210,9 +222,13 @@ class RouteQueryService:
     def _record_mentions(result, decision, question, messages):
         result.history_message_ids = [item.message_id for item in messages]
         result.context_used = bool(messages)
-        result.data_mentions = RouteQueryService._literal_mentions(
+        mentions = RouteQueryService._literal_mentions(
             decision.data_mentions, question, messages, result
         )
+        mentions = RouteQueryService._comparison_mentions(
+            mentions, [question, *RouteQueryService._pending_requests(messages)]
+        )
+        result.data_mentions = RouteQueryService._separated_variables(mentions)
 
         if messages and not any(item.kind == "variable" for item in result.data_mentions):
             # Un seguimiento sin variable nueva conserva la ya interpretada; los valores no
@@ -450,6 +466,119 @@ class RouteQueryService:
 
             kept.setdefault((text.casefold(), item.kind), item.model_copy(update={"text": text}))
         return list(kept.values())
+
+    @staticmethod
+    def _comparison_mentions(mentions, texts):
+        """Un número comparado («mayor que 500») es un umbral, no un valor almacenado ni una cantidad de filas.
+
+        El modelo suele copiarlo como value («500»), lo que restringiría la recuperación a registros con ese
+        texto. Como los límites, sólo cuentan los de la pregunta actual o de la solicitud que esperaba aclaración.
+        Un superlativo sin número («mayor») no es un umbral."""
+        mentions = [
+            item for item in mentions if item.kind != "threshold" or numeric_comparisons(item.text)
+        ]
+        found = [(text, item.text) for text in texts for item in numeric_comparisons(text)]
+        if not found:
+            return mentions
+
+        kept, variables = [], []
+        for item in mentions:
+            compared = [
+                comparison
+                for text, comparison in found
+                if RouteQueryService._overlaps(item.text, comparison, text)
+            ]
+            if item.kind not in _NUMERIC_KINDS or not compared:
+                kept.append(item)
+            elif item.kind == "threshold":
+                variables.extend(RouteQueryService._compared_variable(item.text, compared[0]))
+
+        known = {item.text.casefold() for item in kept if item.kind == "variable"}
+        added = {
+            text.casefold(): DataMention(text=text, kind="variable")
+            for text in variables
+            if text.casefold() not in known
+        }
+        thresholds = {
+            comparison.casefold(): DataMention(text=comparison, kind="threshold")
+            for _, comparison in found
+        }
+        return [*kept, *added.values(), *thresholds.values()]
+
+    @staticmethod
+    def _compared_variable(mention, comparison):
+        """Un umbral copiado con su variable («pH promedio mayor que 8») conserva esa variable: pH."""
+        index = mention.casefold().find(comparison.casefold())
+        prefix = mention[:index].strip() if index > 0 else ""
+
+        return [prefix] if variable_core(prefix) else []
+
+    @staticmethod
+    def _separated_variables(mentions):
+        """El modelo copia a veces la variable con otra mención («turbiedad promedio en Punta Lara»).
+
+        Esa otra mención ya figura aparte: se recorta de la variable si está en un extremo, así el texto sigue
+        siendo literal y el Retriever puede encontrar su columna. Una dimensión pierde sus conectores
+        («por sitio» → sitio) por la misma razón."""
+        others = [item.text for item in mentions if item.kind in _SCOPE_KINDS]
+        separated = {}
+        for item in mentions:
+            text, kind = item.text, item.kind
+            for other in others if kind == "variable" else ():
+                text = RouteQueryService._without_edge(text, other)
+            # «cada punto de muestreo» o «qué sitios» nombran una categoría, nunca un valor almacenado.
+            words = normalize_text(text).split()
+            names_category = kind == "value" and bool(words) and words[0] in CATEGORY_CUES
+            if names_category:
+                kind = "dimension"
+            if kind == "dimension":
+                text = RouteQueryService._trimmed(text) or text
+            separated.setdefault(
+                (text.casefold(), kind), item.model_copy(update={"text": text, "kind": kind})
+            )
+        return list(separated.values())
+
+    @staticmethod
+    def _without_edge(text, other):
+        index = text.casefold().find(other.casefold())
+        if index == 0:
+            remainder = text[len(other) :]
+        elif index > 0 and index + len(other) == len(text):
+            remainder = text[:index]
+        else:
+            return text
+
+        return RouteQueryService._trimmed(remainder) or text
+
+    @staticmethod
+    def _trimmed(text):
+        words = text.split()
+        while words and normalize_text(words[0]) in MENTION_CONNECTORS:
+            words.pop(0)
+        while words and normalize_text(words[-1]) in MENTION_CONNECTORS:
+            words.pop()
+        return " ".join(words)
+
+    @staticmethod
+    def _overlaps(mention, comparison, text):
+        words = normalize_text(text).split()
+        spans = RouteQueryService._spans(words, normalize_text(mention).split())
+        compared = RouteQueryService._spans(words, normalize_text(comparison).split())
+
+        return any(
+            start < other_end and other_start < end
+            for start, end in spans
+            for other_start, other_end in compared
+        )
+
+    @staticmethod
+    def _spans(words, target):
+        size = len(target)
+        return [
+            (index, index + size)
+            for index in range(len(words) - size + 1)
+            if size and words[index : index + size] == target
+        ]
 
     @staticmethod
     def _changes(mentions, sources, question, messages):

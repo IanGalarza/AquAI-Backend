@@ -42,8 +42,8 @@ class DataMention(BaseModel):
         max_length=200,
         description="Texto copiado literalmente de la pregunta actual o de una solicitud pendiente.",
     )
-    kind: Literal["variable", "value", "date", "limit"] = Field(
-        description="variable: parámetro medido; value: valor de columna que acota registros, como una localidad o estación; date: fecha o período solicitado; limit: cantidad de registros o resultados que se pide ver."
+    kind: Literal["variable", "value", "dimension", "threshold", "date", "limit"] = Field(
+        description="variable: parámetro medido; value: valor de columna que acota registros, como una localidad o estación; dimension: categoría que se pregunta o por la que se agrupa, como 'qué sitios'; threshold: comparación con un número, como 'mayor que 500'; date: fecha o período solicitado; limit: cantidad de registros o resultados que se pide ver."
     )
 
 
@@ -59,7 +59,7 @@ class RoutingDraft(BaseModel):
     )
     data_mentions: list[DataMention] = Field(
         max_length=12,
-        description="Variables, valores de columnas y fechas como menciones separadas: en 'pH de Punta Lara' son 'pH' (variable) y 'Punta Lara' (value). No son fuentes.",
+        description="Variables, valores de columnas, dimensiones, umbrales y fechas como menciones separadas: en 'pH de Punta Lara' son 'pH' (variable) y 'Punta Lara' (value). No son fuentes.",
     )
     clarification_question: str | None = Field(max_length=500)
     reason: str = Field(min_length=1, max_length=400)

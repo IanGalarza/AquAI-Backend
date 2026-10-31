@@ -206,9 +206,12 @@ class RetrieveDatasetsService:
         """Ordena por evidencia verificable: valores almacenados, columnas y similitud."""
         values = list(dict.fromkeys(item.text for item in mentions if item.kind == "value"))
         variables = list(dict.fromkeys(item.text for item in mentions if item.kind == "variable"))
+        dimensions = list(dict.fromkeys(item.text for item in mentions if item.kind == "dimension"))
         candidates = self._prune_overlaps(result)
         evidence = self._variable_evidence(candidates, variables)
-        values = self._split_dimensions(result, candidates, evidence, values, variables)
+        values = self._split_dimensions(
+            result, candidates, evidence, values, variables, dimensions
+        )
 
         tentative = [item for item in dict.fromkeys(tentative) if item not in values]
         values, tentative, found = await self._stored_values(result, candidates, values, tentative)
@@ -270,7 +273,7 @@ class RetrieveDatasetsService:
         return {dataset.dataset_id: _named_columns(dataset, core) for dataset in candidates}
 
     @staticmethod
-    def _split_dimensions(result, candidates, evidence, values, variables):
+    def _split_dimensions(result, candidates, evidence, values, variables, dimensions):
         with_variables = [
             dataset
             for dataset in candidates
@@ -278,26 +281,34 @@ class RetrieveDatasetsService:
         ]
         # Una «mención de valor» que nombra una columna de un dataset con la variable pedida
         # es la dimensión que se pregunta (sitio -> Sitios), no un valor para filtrar.
-        result.dimension_mentions = [
+        reclassified = [
             value
             for value in values
             if any(_named_columns(dataset, value) for dataset in with_variables)
         ]
+        # Una dimensión que no nombra ninguna columna («punto de muestreo») no exige nada.
+        asked = [
+            dimension
+            for dimension in dimensions
+            if any(_named_columns(dataset, dimension) for dataset in with_variables)
+        ]
+        result.dimension_mentions = list(dict.fromkeys([*reclassified, *asked]))
         if not result.dimension_mentions:
             return values
 
-        values = [value for value in values if value not in result.dimension_mentions]
+        values = [value for value in values if value not in reclassified]
         for dataset in candidates:
             evidence[dataset.dataset_id].dimension_matches = {
                 dimension: names
                 for dimension in result.dimension_mentions
                 if (names := _named_columns(dataset, dimension))
             }
-        result.warnings.append(
-            "Se interpretó como columna, no como valor de filtro: "
-            + "; ".join(f"«{value}»" for value in result.dimension_mentions)
-            + "."
-        )
+        if reclassified:
+            result.warnings.append(
+                "Se interpretó como columna, no como valor de filtro: "
+                + "; ".join(f"«{value}»" for value in reclassified)
+                + "."
+            )
         return values
 
     async def _stored_values(self, result, candidates, values, tentative):

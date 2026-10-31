@@ -8,6 +8,7 @@ from aquai.application.contracts.planning import (
     PlannableDecision,
     PlannerDecision,
     PlanningResult,
+    RequestedThreshold,
     SelectedDataset,
     ValidatedStep,
     ValidationIssue,
@@ -37,6 +38,8 @@ _AGGREGATE_FUNCTIONS = {
 }
 _PYTHON_ONLY_FUNCTIONS = {"median", "stddev", "quantile"}
 _COUNT_FUNCTIONS = {"count", "count_distinct"}
+# Una estadística pedida por su nombre puede calcularse con cualquiera de estas funciones.
+_STATISTIC_FUNCTIONS = {"count": _COUNT_FUNCTIONS}
 _EXTREME_FUNCTIONS = {"min", "max"}
 _AUTHORIZED_METADATA = (
     "source_id",
@@ -196,6 +199,222 @@ def _unscoped_output_issues(outputs, requested_values) -> list[ValidationIssue]:
             )
 
     return issues
+
+
+def validate_requested_scope(
+    operations,
+    output_steps,
+    *,
+    thresholds=(),
+    statistics=(),
+    dimensions=None,
+    categories=False,
+    chart=False,
+) -> list[ValidationIssue]:
+    """Cada umbral, estadística, dimensión y gráfico pedidos deben llegar a una salida publicada.
+
+    También se revalida antes de ejecutar: un plan que pierde un filtro pedido no responde la consulta."""
+    steps = {step.id: step for step in operations}
+    relevant = _reachable_step_ids(steps, output_steps)
+    published = [step for step in operations if step.id in relevant]
+    issues = [
+        *_threshold_issues(steps, output_steps, thresholds),
+        *_statistic_issues(published, statistics),
+    ]
+
+    if chart and not any(step.operation == "visualize" for step in published):
+        issues.append(
+            ValidationIssue(
+                code="missing_requested_chart",
+                severity="clarification",
+                message="La consulta pide un gráfico, pero el plan no publica ningún visualize: agregá uno "
+                "que dependa del paso que ya responde.",
+            )
+        )
+
+    # Contar una categoría («cuántos sitios») no la enumera.
+    if categories and "count" not in statistics:
+        issues.extend(_dimension_issues(steps, output_steps, dimensions or {}))
+
+    return issues
+
+
+def requested_dimensions(evidence, datasets) -> dict[UUID, set[str]]:
+    """Columnas no numéricas de lo que se pregunta («qué sitios»), por dataset."""
+    types = {
+        (dataset.dataset_id, column.sql_name): column.sql_type
+        for dataset in datasets
+        for column in dataset.columns_metadata
+    }
+    dimensions = {}
+
+    for item in evidence.get("observed_evidence", []):
+        dataset_id = UUID(item["dataset_id"])
+        columns = {
+            column
+            for names in item.get("requested_dimension_columns", {}).values()
+            for column in names
+            if types.get((dataset_id, column)) not in {*_NUMERIC_TYPES, None}
+        }
+        if columns:
+            dimensions[dataset_id] = columns
+
+    return dimensions
+
+
+def _threshold_issues(steps, output_steps, thresholds) -> list[ValidationIssue]:
+    """Como los valores pedidos, cada salida publicada debe conservar cada umbral."""
+    issues = []
+
+    for key in output_steps:
+        chain = [steps[item] for item in _reachable_step_ids(steps, [key])]
+        for threshold in thresholds:
+            issues.extend(_output_threshold_issues(key, chain, steps, threshold))
+
+    return issues
+
+
+def _output_threshold_issues(key, chain, steps, threshold) -> list[ValidationIssue]:
+    applied = [
+        predicate
+        for step in chain
+        for predicate in step.filters
+        if applies_threshold(predicate, threshold)
+    ]
+    if not applied:
+        return [
+            ValidationIssue(
+                code="missing_requested_threshold",
+                severity="clarification",
+                step_id=key,
+                message=f"La consulta pide {threshold.text}, pero la salida {key} no filtra con "
+                f"{threshold.operator} {threshold.value}.",
+            )
+        ]
+
+    on_calculation = any(_filters_calculation(predicate, steps) for predicate in applied)
+    if threshold.compares_statistic and not on_calculation:
+        return [
+            ValidationIssue(
+                code="threshold_before_calculation",
+                severity="clarification",
+                step_id=key,
+                message=f"{threshold.text} compara el resultado del cálculo: filtrá su alias en un sort "
+                "que dependa del aggregate, no los registros antes de calcular.",
+            )
+        ]
+
+    return []
+
+
+def applies_threshold(predicate, threshold: RequestedThreshold) -> bool:
+    """El filtro aplica exactamente la comparación pedida: mismo operador y mismo número."""
+    return predicate.operator == threshold.operator and any(
+        type(value) in {int, float} and value == threshold.value for value in predicate.values
+    )
+
+
+def _filters_calculation(predicate, steps) -> bool:
+    ref = predicate.field
+    if ref.kind != "result":
+        return False
+
+    origin = steps.get(ref.step_id)
+    while origin is not None and origin.operation in _PASSTHROUGH_OPERATIONS and origin.depends_on:
+        origin = steps.get(origin.depends_on[0])
+
+    return origin is not None and any(
+        calculation.output_name == ref.field for calculation in origin.calculations
+    )
+
+
+def _statistic_issues(published, statistics) -> list[ValidationIssue]:
+    computed = {calculation.function for step in published for calculation in step.calculations}
+
+    return [
+        ValidationIssue(
+            code="missing_requested_statistic",
+            severity="clarification",
+            message=f"La consulta pide la estadística {function}, pero ninguna salida la calcula: "
+            "agregá un aggregate con ese cálculo; un read sin aggregate no la responde.",
+        )
+        for function in statistics
+        if not _STATISTIC_FUNCTIONS.get(function, {function}) & computed
+    ]
+
+
+def _dimension_issues(steps, output_steps, dimensions) -> list[ValidationIssue]:
+    """La categoría preguntada debe verse en cada salida: su columna, si se identificó, o al menos varias filas."""
+    issues = []
+
+    for key in output_steps:
+        rows = _published_rows(steps.get(key), steps)
+        if rows is None:
+            continue
+
+        requested = {
+            (dataset_id, column)
+            for dataset_id in _read_datasets(rows, steps)
+            for column in dimensions.get(dataset_id, ())
+        }
+        if requested and not _exposes(rows, requested):
+            names = ", ".join(sorted({column for _, column in requested}))
+            issues.append(
+                ValidationIssue(
+                    code="missing_requested_dimension",
+                    severity="clarification",
+                    step_id=key,
+                    message=f"La consulta pregunta por {names}, pero la salida {key} no la incluye: agrupá "
+                    "por esa columna en el aggregate o publicá registros que la contengan (un sort del read).",
+                )
+            )
+        elif not requested and _is_ungrouped(rows, steps):
+            issues.append(
+                ValidationIssue(
+                    code="missing_requested_grouping",
+                    severity="clarification",
+                    step_id=key,
+                    message=f"La consulta pide un resultado por categoría, pero la salida {key} es un único "
+                    "valor sin agrupar: agregá al aggregate un group_by con la columna de esa categoría.",
+                )
+            )
+
+    return issues
+
+
+def _is_ungrouped(step, steps) -> bool:
+    while step.operation in _PASSTHROUGH_OPERATIONS and step.depends_on and step.depends_on[0] in steps:
+        step = steps[step.depends_on[0]]
+
+    return step.operation == "aggregate" and not step.group_by
+
+
+def _published_rows(step, steps):
+    """Un gráfico publica las filas de su entrada."""
+    if step is not None and step.operation == "visualize" and step.depends_on:
+        return steps.get(step.depends_on[0])
+
+    return step
+
+
+def _read_datasets(step, steps) -> set[UUID]:
+    datasets, visit = set(), [step] if step is not None else []
+
+    while visit:
+        current = visit.pop()
+        if current.operation == "read":
+            datasets.update(ref.dataset_id for ref in current.columns)
+        visit.extend(steps[key] for key in current.depends_on if key in steps)
+
+    return datasets
+
+
+def _exposes(step, requested) -> bool:
+    return any(
+        not field.numeric_eligible
+        and {(ref.dataset_id, ref.column) for ref in field.sources} & requested
+        for field in step.output_fields
+    )
 
 
 def validate_selections(
@@ -408,7 +627,7 @@ class _OperationValidator:
             return []
 
         if step.operation == "sort":
-            self._check_sort(step)
+            self._check_sort(step, source)
             return inherited
 
         if step.operation == "latest":
@@ -487,11 +706,28 @@ class _OperationValidator:
                 "warning",
             )
 
-    def _check_sort(self, step) -> None:
+    def _check_sort(self, step, source: str) -> None:
         _require(
             not step.group_by and not step.calculations and bool(step.order_by),
             "sort sólo debe ordenar/filtrar/limitar un resultado previo.",
         )
+
+        # Filtrar una única fila (¿supera el umbral?) tiene sentido; ordenarla, no.
+        if not step.filters and self._is_single_row(source):
+            self._issue(
+                "degenerate_sort",
+                f"El paso {step.id} ordena el resultado de {source}, que es una única fila sin agrupación: "
+                "si la pregunta pide un valor por categoría, agregá esa columna como group_by del aggregate; "
+                f"si no, publicá {source} sin ordenarlo.",
+                step.id,
+            )
+
+    def _is_single_row(self, key: str) -> bool:
+        step = self._steps[key]
+        while step.operation in _PASSTHROUGH_OPERATIONS and step.depends_on:
+            step = self._steps[step.depends_on[0]]
+
+        return step.operation == "aggregate" and not step.group_by
 
     def _check_latest(self, step, source: str) -> None:
         _require(
@@ -796,6 +1032,17 @@ def validate_execution_plan(plan: PlanningResult, catalog: list[VerifiedDataset]
             requested_values=_requested_values(evidence),
         )
     )
+    issues.extend(
+        validate_requested_scope(
+            operations,
+            plan.output_steps,
+            thresholds=_requested_thresholds(evidence),
+            statistics=evidence.get("requested_statistics", []),
+            dimensions=requested_dimensions(evidence, selected),
+            categories=_asks_categories(evidence),
+            chart=evidence.get("requested_chart", False),
+        )
+    )
     _require(
         not any(issue.severity == "clarification" for issue in issues),
         "La operación requiere resolver una aclaración antes de ejecutarse.",
@@ -850,3 +1097,16 @@ def _latest_required(evidence) -> bool:
 
 def _requested_values(evidence) -> list[str]:
     return [item["text"] for item in evidence.get("query_mentions", []) if item["kind"] == "value"]
+
+
+def _asks_categories(evidence) -> bool:
+    observed = evidence.get("observed_evidence", [])
+    return any(item["kind"] == "dimension" for item in evidence.get("query_mentions", [])) or any(
+        item.get("requested_dimension_columns") for item in observed
+    )
+
+
+def _requested_thresholds(evidence) -> list[RequestedThreshold]:
+    return [
+        RequestedThreshold.model_validate(item) for item in evidence.get("requested_thresholds", [])
+    ]

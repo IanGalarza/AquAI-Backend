@@ -15,6 +15,7 @@ PlanningOutcome = Literal["plannable", "needs_clarification", "insufficient_cove
 Identifier = Annotated[str, Field(pattern=r"^[a-z_][a-z0-9_]{0,62}$")]
 # Mayor cantidad de filas que un paso puede conservar; también acota la cantidad pedida por el usuario.
 MAX_ROW_LIMIT = 10000
+_MEMBERSHIP = {"eq": "in", "ieq": "in", "ne": "not_in"}
 
 
 class PlanModel(BaseModel):
@@ -59,6 +60,16 @@ class FilterSpec(PlanModel):
         "eq", "ieq", "ne", "lt", "le", "gt", "ge", "in", "not_in", "is_null", "is_not_null"
     ]
     values: list[str | int | float | bool] = Field(default_factory=list, max_length=100)
+
+    @model_validator(mode="before")
+    @classmethod
+    def membership(cls, data):
+        """Una igualdad con varios valores sólo puede significar pertenencia: eq [a, b] es in [a, b]."""
+        if not isinstance(data, dict) or len(data.get("values") or []) < 2:
+            return data
+
+        operator = _MEMBERSHIP.get(data.get("operator"))
+        return {**data, "operator": operator} if operator else data
 
     @model_validator(mode="after")
     def valid_arity(self):
@@ -362,6 +373,15 @@ class FilterValueResolution(PlanModel):
     requested: str
     resolved: str | list[str]
     method: Literal["unique_case_insensitive", "contains_words"] = "unique_case_insensitive"
+
+
+class RequestedThreshold(PlanModel):
+    """Comparación numérica pedida («promedio mayor que 500»); si compara una estadística, filtra su resultado."""
+
+    text: str
+    operator: Literal["gt", "ge", "lt", "le"]
+    value: int | float
+    compares_statistic: bool
 
 
 class TemporalTextColumn(PlanModel):

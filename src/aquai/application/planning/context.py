@@ -2,11 +2,14 @@ import json
 import re
 from hashlib import sha256
 
-from aquai.application.contracts.planning import PlanningContextRecord
+from aquai.application.contracts.planning import PlanningContextRecord, RequestedThreshold
 from aquai.application.contracts.retrieval import VerifiedDataset
+from aquai.application.matching import contains_phrase, numeric_comparisons
 from aquai.application.Rules.vocabulary import (
+    CHART_WORDS,
     OBSERVATION_NOUNS_EN,
     OBSERVATION_NOUNS_ES,
+    REQUESTED_STATISTICS,
 )
 
 _COLUMN_FIELDS = (
@@ -44,6 +47,31 @@ def latest_requested(question: str) -> bool:
     )
 
 
+def chart_requested(question: str) -> bool:
+    return bool(re.search(rf"\b{CHART_WORDS}\b", question, re.IGNORECASE))
+
+
+def requested_statistics(question: str) -> list[str]:
+    """Estadísticas que la pregunta nombra («pH promedio» → mean); un máximo puede ser un orden y no se exige."""
+    return [
+        function
+        for function, words in REQUESTED_STATISTICS.items()
+        if any(contains_phrase(question, word) for word in words)
+    ]
+
+
+def requested_thresholds(mentions) -> list[RequestedThreshold]:
+    """Umbrales de las menciones threshold; una comparación sin número legible no fija ninguno."""
+    thresholds = {}
+    for item in mentions:
+        if item.kind != "threshold":
+            continue
+        for comparison in numeric_comparisons(item.text)[:1]:
+            thresholds[comparison.text.casefold()] = RequestedThreshold(**comparison._asdict())
+
+    return list(thresholds.values())
+
+
 def build_planning_context(
     question: str,
     datasets: list[VerifiedDataset],
@@ -56,6 +84,9 @@ def build_planning_context(
     dataset_evidence=(),
     unmatched_values=(),
     source_mentions=(),
+    thresholds=(),
+    statistics=(),
+    chart=False,
 ) -> PlanningContextRecord:
     observed = [_observed_dataset(item) for item in dataset_evidence]
     warnings = list(dict.fromkeys(warning for dataset in datasets for warning in dataset.warnings))
@@ -78,6 +109,13 @@ def build_planning_context(
         ]
     if query_mentions:
         evidence["query_mentions"] = [item.model_dump(mode="json") for item in query_mentions]
+    if thresholds:
+        # Operador y valor exactos de cada comparación pedida; se revalidan antes de ejecutar.
+        evidence["requested_thresholds"] = [item.model_dump(mode="json") for item in thresholds]
+    if statistics:
+        evidence["requested_statistics"] = list(statistics)
+    if chart:
+        evidence["requested_chart"] = True
     if observed:
         # Hechos observados en PostgreSQL: valores TEXT almacenados que contienen cada mención.
         evidence["observed_evidence"] = observed

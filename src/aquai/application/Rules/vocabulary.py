@@ -140,3 +140,154 @@ PLACE_WORDS = {
 }
 # Palabras que quedan en minúscula al suavizar un nombre en mayúsculas: PUNTA DE LARA → Punta de Lara.
 PLACE_NAME_LOWERCASE_WORDS = {"de", "del", "la", "las", "los", "y", "el"}
+
+# Comparaciones numéricas: «mayor que 500» acota con gt. Fragmentos de regex unidos sin escapar;
+# dentro de la alternancia, «mayor o igual que» (ge) se prueba antes que «mayor que» (gt).
+COMPARISON_CUES = {
+    "ge": (
+        r"mayor(?:es)? o igual(?:es)? (?:que|a)",
+        r"al menos",
+        r"como m[ií]nimo",
+        r"no menos de",
+        r"at least",
+        r"greater than or equal to",
+    ),
+    "le": (
+        r"menor(?:es)? o igual(?:es)? (?:que|a)",
+        r"como m[aá]ximo",
+        r"no m[aá]s de",
+        r"at most",
+        r"less than or equal to",
+    ),
+    "gt": (
+        r"mayor(?:es)? (?:que|a)",
+        r"m[aá]s (?:de|que)",
+        r"superior(?:es)? a",
+        r"super[aeoáó]\w*",
+        r"sobrepas\w*",
+        r"exced\w*",
+        r"por encima de",
+        r"greater than",
+        r"more than",
+        r"higher than",
+        r"above",
+        r"over",
+        r"exceed\w*",
+    ),
+    "lt": (
+        r"menor(?:es)? (?:que|a)",
+        r"menos (?:de|que)",
+        r"inferior(?:es)? a",
+        r"por debajo de",
+        r"less than",
+        r"lower than",
+        r"fewer than",
+        r"below",
+        r"under",
+    ),
+}
+# Artículos entre la comparación y el número: «superó los 100».
+COMPARISON_ARTICLES = r"(?:los|las|el|la|un|una|the)"
+NUMBER = re.compile(r"-?\d+(?:[.,]\d+)*")
+# Una estadística hasta dos palabras antes de la comparación es lo comparado: «un promedio de pH superior a 8».
+COMPARED_STATISTICS = {
+    "promedio",
+    "promedios",
+    "media",
+    "medias",
+    "mediana",
+    "medianas",
+    "maximo",
+    "maximos",
+    "maxima",
+    "maximas",
+    "minimo",
+    "minimos",
+    "minima",
+    "minimas",
+    "suma",
+    "average",
+    "mean",
+    "median",
+    "maximum",
+    "minimum",
+    "sum",
+}
+COMPARISON_FILLERS = {
+    "de",
+    "del",
+    "la",
+    "el",
+    "los",
+    "las",
+    "un",
+    "una",
+    "es",
+    "fue",
+    "sea",
+    "of",
+    "the",
+    "is",
+    "was",
+}
+# Lo anterior a estas palabras ya no es lo comparado: «el pH promedio de las muestras con turbiedad mayor que 100».
+COMPARISON_BOUNDARIES = {
+    "con",
+    "cuyo",
+    "cuya",
+    "cuyos",
+    "cuyas",
+    "donde",
+    "y",
+    "o",
+    "with",
+    "where",
+    "whose",
+    "and",
+    "or",
+}
+
+# Conectores que quedan en el borde de una mención: «pH promedio en», «por sitio», «cada estación».
+MENTION_CONNECTORS = {
+    "en",
+    "de",
+    "del",
+    "para",
+    "con",
+    "por",
+    "cada",
+    "que",
+    "cual",
+    "cuales",
+    "la",
+    "el",
+    "los",
+    "las",
+    "in",
+    "at",
+    "of",
+    "for",
+    "with",
+    "by",
+    "per",
+    "each",
+    "which",
+}
+
+# Una mención que empieza así pregunta por una categoría («cada punto de muestreo»), no nombra un valor.
+CATEGORY_CUES = {"cada", "que", "cual", "cuales", "por", "each", "which", "per"}
+
+# Estadísticas que una pregunta pide por su nombre: «pH promedio» exige calcular mean. Frases normalizadas.
+REQUESTED_STATISTICS = {
+    "mean": ("promedio", "promedios", "media", "medias", "average", "mean"),
+    "median": ("mediana", "median"),
+    "sum": ("suma", "sum"),
+    "stddev": ("desvio estandar", "desviacion estandar", "standard deviation"),
+    "count": ("cuantos", "cuantas", "how many"),
+}
+
+# Pedidos de un gráfico; fragmento de regex que se inserta sin escapar.
+CHART_WORDS = (
+    r"(?:gr[aá]fic\w*|plot\w*|chart\w*|diagrama\w*|histograma\w*|visualiz\w*|dibuj\w*|"
+    r"barras|l[ií]neas|dispersi[oó]n|distribuci[oó]n|scatter)"
+)
