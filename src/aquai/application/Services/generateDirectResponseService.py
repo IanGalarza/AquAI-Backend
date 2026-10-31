@@ -108,7 +108,6 @@ class GenerateDirectResponseService:
     def _historical_response(self, response, routing, message):
         analysis = message.analysis
         response.response_type = "historical"
-        response.answer = message.text
         response.historical_message_ids = [message.message_id]
         response.sources = [SourceReference.model_validate(item) for item in analysis.sources]
         response.operation_references = [
@@ -130,8 +129,10 @@ class GenerateDirectResponseService:
 
         segments = self._historical_segments(message, response)
         attached = any(segment.attachment for segment in segments)
+        results = _result_paragraphs(segments)
+        response.answer = answer_text(results)
         notice = AnswerSegment(kind="note", text=_replay_notice(routing.language, attached))
-        response.segments = [*segments, notice]
+        response.segments = [*results, notice]
 
         return response
 
@@ -230,14 +231,25 @@ def _selected_history(state, routing):
     return [messages[key] for key in routing.history_message_ids]
 
 
+def _result_paragraphs(segments):
+    """Una referencia al resultado anterior («¿Y de qué año es?») muestra sus párrafos con resultados, sin repetir
+    introducciones, tablas ni gráficos; una respuesta sin párrafos citados se muestra entera."""
+    cited = [
+        segment.model_copy(update={"attachment": None})
+        for segment in segments
+        if segment.kind == "paragraph" and segment.evidence_ids
+    ]
+    return cited or segments
+
+
 def _replay_notice(language, attached):
     if language == "es":
-        suffix = " Sus tablas y gráficos están en ese mensaje." if attached else ""
-        return "Te muestro la respuesta anterior; no volví a consultar los datos." + suffix
+        suffix = " Sus tablas y gráficos siguen en ese mensaje." if attached else ""
+        return "Es el resultado que ya calculé; no volví a consultar los datos." + suffix
 
-    suffix = " Its tables and charts are in that message." if attached else ""
+    suffix = " Its tables and charts remain in that message." if attached else ""
 
-    return "This is the previous answer; I did not query the data again." + suffix
+    return "This is the result I already calculated; I did not query the data again." + suffix
 
 
 def _code_refusal(language):

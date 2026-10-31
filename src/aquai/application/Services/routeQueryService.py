@@ -15,15 +15,25 @@ from aquai.application.errors import LLMProviderError
 from aquai.application.interfaces.routing import RoutingProvider
 from aquai.application.interfaces.sources import SourceQueries
 from aquai.application.matching import (
+    contains_any_phrase,
     contains_phrase,
+    mentioned_count,
     normalize_name,
     normalize_text,
     numeric_comparisons,
+    starts_with_phrase,
     variable_core,
 )
+from aquai.application.planning.context import chart_requested, requested_statistics
+from aquai.application.planning.followUp import requested_time_grain
 from aquai.application.Rules.vocabulary import (
+    ADDITIVE_CUES,
     CATEGORY_CUES,
+    CHART_WORDS,
+    CONTINUATION_CUES,
+    MEASURED_STATISTICS,
     MENTION_CONNECTORS,
+    SOURCE_ALIAS_CUES,
     SOURCE_CUE_WINDOW,
     SOURCE_CUE_WORDS,
     SOURCE_NAME_CONNECTORS,
@@ -35,6 +45,19 @@ _logger = logging.getLogger(__name__)
 _NUMERIC_KINDS = {"value", "limit", "threshold"}
 # Menciones que acotan o agrupan y que el modelo a veces copia dentro de la variable.
 _SCOPE_KINDS = {"value", "dimension", "threshold", "date"}
+# Condiciones de un análisis citado que un seguimiento conserva si no las cambia; umbrales y cantidades
+# viajan con sus operaciones verificadas.
+_CONSERVED_KINDS = {"variable", "value", "dimension", "date"}
+# Palabras que no agregan un pedido propio a un fragmento («¿Y en Punta Piedras?»).
+_ELLIPSIS_WORDS = {*MENTION_CONNECTORS, *(word for cue in CONTINUATION_CUES for word in cue.split())}
+_CHART_FILLERS = {*MENTION_CONNECTORS, "un", "una", "a", "an"}
+_CHART_WORD = re.compile(rf"\b{CHART_WORDS}\b", re.IGNORECASE)
+# «los datos de ABSA», «la base FQ»: la palabra siguiente puede abreviar el nombre de una fuente.
+SOURCE_ALIAS = re.compile(
+    rf"\b(?:{'|'.join(SOURCE_ALIAS_CUES)})\s+(?:(?:{'|'.join(SOURCE_NAME_CONNECTORS)})\s+)*"
+    r"(?P<name>[^\W_][\w-]*)",
+    re.IGNORECASE,
+)
 SOURCE_CUE = re.compile(
     rf"\b(?:{'|'.join(SOURCE_CUE_WORDS)})\s+"
     rf"(?:(?:{'|'.join(SOURCE_NAME_CONNECTORS)})\s+)*[«\"“']?\s*$",
@@ -126,15 +149,23 @@ class RouteQueryService:
         asked = [
             item for item in decision.data_mentions if self._literal(item.text, state.question)
         ]
-        if route == "historical" and self._changes(
-            asked, decision.source_mentions, state.question, messages
+        # Otro sitio, variable, fuente, cantidad o un gráfico cambian el resultado: no es repetirlo.
+        if route == "historical" and (
+            self._changes(asked, decision.source_mentions, state.question, messages)
+            or chart_requested(state.question)
         ):
-            route = "data"  # Otro sitio, variable, fuente o cantidad cambia el resultado: no es repetir el anterior.
+            route = "data"
 
-        if self._needs_implicit_reference(decision, route, asked, messages):
-            if last is not None and (last.analysis is not None or last.clarification):
+        anchor = self._anchor(state.conversation_history, allowed)
+        if anchor is not None and self._fragment(decision, route, asked, state.question):
+            # Un fragmento («¿Y el pH?», «La conductividad») continúa el último análisis o aclaración,
+            # aunque el modelo cite otro mensaje, pida aclarar o el último turno haya fallado.
+            route = "data"
+            messages = self._with_context([anchor], provided)
+        elif self._needs_implicit_reference(decision, route, asked, messages):
+            if anchor is not None:
                 # Sin una cita explícita, el seguimiento refiere al último resultado o aclaración.
-                messages = self._with_context([last], provided)
+                messages = self._with_context([anchor], provided)
             elif decision.context_required and route == "data" and not decision.data_mentions:
                 return self._clarify(result, "¿A qué resultado o consulta anterior te referís?")
 
@@ -151,7 +182,7 @@ class RouteQueryService:
         result.route = route
 
         if route == "historical":
-            return self._historical_result(result, messages)
+            return self._historical_result(result, messages, state.conversation_history)
         if route == "general":
             return self._general_result(result, messages)
 
@@ -206,6 +237,17 @@ class RouteQueryService:
         return decision.route, messages
 
     @staticmethod
+    def _anchor(history, allowed):
+        """Último análisis verificado o aclaración visible: un turno fallido no corta la conversación."""
+        replies = [
+            item for item in history if item.role == "assistant" and str(item.message_id) in allowed
+        ]
+        return next(
+            (item for item in reversed(replies) if item.analysis is not None or item.clarification),
+            None,
+        )
+
+    @staticmethod
     def _needs_implicit_reference(decision, route, asked, messages):
         # Sin variable, valor, fecha ni fuente propios no hay nada que recuperar («Ahora mostrame todos»):
         # la consulta sólo puede continuar el último resultado, aunque el modelo no lo haya marcado.
@@ -219,6 +261,30 @@ class RouteQueryService:
         )
 
     @staticmethod
+    def _fragment(decision, route, asked, question):
+        """Sólo menciones y conectores («¿Y en Punta Piedras?») u otra presentación sin condiciones propias
+        («Ahora mostralo en un gráfico de líneas»): no hay un pedido nuevo que buscar."""
+        presentation = chart_requested(question) and all(
+            RouteQueryService._presentation(item) for item in asked
+        )
+        # Una fuente que el modelo agregó sin que figure en la pregunta no es un pedido propio.
+        names_source = any(
+            RouteQueryService._literal(text, question) for text in decision.source_mentions
+        )
+        return (
+            route in {"data", "needs_clarification"}
+            and not names_source
+            and (presentation or RouteQueryService._elliptical(question, asked))
+        )
+
+    @staticmethod
+    def _elliptical(question, asked):
+        covered = {word for item in asked for word in normalize_text(item.text).split()}
+        words = normalize_text(question).split()
+
+        return bool(asked) and all(word in covered or word in _ELLIPSIS_WORDS for word in words)
+
+    @staticmethod
     def _record_mentions(result, decision, question, messages):
         result.history_message_ids = [item.message_id for item in messages]
         result.context_used = bool(messages)
@@ -228,13 +294,75 @@ class RouteQueryService:
         mentions = RouteQueryService._comparison_mentions(
             mentions, [question, *RouteQueryService._pending_requests(messages)]
         )
-        result.data_mentions = RouteQueryService._separated_variables(mentions)
+        mentions = RouteQueryService._without_chart_phrases(mentions)
+        own, conserved = RouteQueryService._conserved_scope(
+            RouteQueryService._separated_variables(mentions), question, messages
+        )
+        result.data_mentions = [*own, *conserved]
+        result.conserved_mentions = conserved
 
-        if messages and not any(item.kind == "variable" for item in result.data_mentions):
-            # Un seguimiento sin variable nueva conserva la ya interpretada; los valores no
-            # se heredan porque la nueva pregunta o la aclaración pueden reemplazarlos.
-            variables = dict.fromkeys(text for item in messages for text in item.variables)
-            result.data_mentions += [DataMention(text=text, kind="variable") for text in variables]
+    @staticmethod
+    def _without_chart_phrases(mentions):
+        """«gráfico de líneas» pide una presentación: no es una variable, un valor ni una cantidad de filas."""
+        return [item for item in mentions if not RouteQueryService._presentation(item)]
+
+    @staticmethod
+    def _presentation(item):
+        # El modelo a veces copia todo el pedido («Ahora mostralo en un gráfico») como una cantidad sin número.
+        uncounted = item.kind == "limit" and mentioned_count(item.text) is None
+        return RouteQueryService._names_chart(item.text) or (
+            uncounted and _CHART_WORD.search(item.text) is not None
+        )
+
+    @staticmethod
+    def _names_chart(text):
+        remainder = _CHART_WORD.sub(" ", text)
+        words = [word for word in normalize_text(remainder).split() if word not in _CHART_FILLERS]
+        return remainder != text and not words
+
+    @staticmethod
+    def _conserved_scope(mentions, question, messages):
+        """Un seguimiento conserva las condiciones del análisis citado que no cambia y reemplaza las que nombra.
+
+        El alcance vigente es el que interpretó el turno citado; lo que el modelo copió de solicitudes anteriores no
+        es un pedido nuevo ni lo reemplaza: «¿Y en Punta Piedras?» cambia el sitio y conserva la variable, y un
+        sitio ya reemplazado no vuelve. Valores, dimensiones y fechas sólo se conservan si la pregunta continúa la
+        anterior: no nombra otra variable o empieza como continuación («¿Y la turbiedad?»). Un conector aditivo
+        («compará con …») suma valores en lugar de reemplazarlos."""
+        current = [question, *RouteQueryService._pending_requests(messages)]
+        own = [
+            item
+            for item in mentions
+            if any(RouteQueryService._literal(item.text, text) for text in current)
+        ]
+        if not messages:
+            return own, []
+
+        asked = {item.kind for item in own}
+        # Responder una aclaración completa la solicitud pendiente: nunca empieza otra.
+        continues = (
+            "variable" not in asked
+            or starts_with_phrase(question, CONTINUATION_CUES)
+            or any(item.clarification for item in messages)
+        )
+        additive = contains_any_phrase(question, ADDITIVE_CUES)
+        known = {(normalize_text(item.text), item.kind) for item in own}
+        conserved = {}
+        for item in (item for message in messages for item in message.scope):
+            key = (normalize_text(item.text), item.kind)
+            if key not in known and RouteQueryService._conserves(item.kind, asked, continues, additive):
+                conserved.setdefault(key, item.model_copy())
+        return own, list(conserved.values())
+
+    @staticmethod
+    def _conserves(kind, asked, continues, additive):
+        if kind not in _CONSERVED_KINDS:
+            return False
+        if kind == "variable":
+            return kind not in asked
+
+        replaced = kind in asked and not (additive and kind == "value")
+        return continues and not replaced
 
     @staticmethod
     def _model_clarification(result, decision, route, messages, question):
@@ -265,8 +393,15 @@ class RouteQueryService:
         return explicit, aliases
 
     @staticmethod
-    def _historical_result(result, messages):
-        analytical = [item for item in messages if item.analysis is not None]
+    def _historical_result(result, messages, history):
+        # Una respuesta que reprodujo otra remite al original, con sus párrafos y citas.
+        provided = {item.message_id: item for item in history}
+        originals = {}
+        for item in messages:
+            if item.analysis is not None:
+                original = provided.get(item.replay_of, item)
+                originals.setdefault(original.message_id, original)
+        analytical = list(originals.values())
         recoverable = len(analytical) == 1 and analytical[0].text.strip()
         if not recoverable:
             return RouteQueryService._clarify(result, "¿Qué resultado anterior querés recuperar?")
@@ -312,7 +447,12 @@ class RouteQueryService:
                 "¿Podés indicar de nuevo la variable, el sitio y el período?",
             )
 
-        question, requests = contextual_question(state.question, messages)
+        if self._changes_topic(result, state.question, messages, resolved):
+            messages = self._without_context(result)
+
+        question, requests = contextual_question(
+            state.question, messages, redefined=self._redefines(result, state.question)
+        )
         self._record_tentative_value(result, state.question, messages, resolved)
         if len(question) > 6000 or len(requests) > 8:
             return self._clarify(
@@ -322,6 +462,8 @@ class RouteQueryService:
         result.contextualized_question = question
         result.request_history = requests
         result.question_contextualized = question != state.question
+        if self._lacks_variable(result, [state.question, *self._pending_requests(messages)]):
+            return self._clarify(result, "¿Qué variable querés analizar?")
 
         if not resolved:
             bindings = self._historical_bindings(messages)
@@ -333,6 +475,56 @@ class RouteQueryService:
             )
 
         return result
+
+    @staticmethod
+    def _changes_topic(result, question, messages, resolved):
+        """Otra fuente y otra variable en una pregunta propia es un tema nuevo aunque el modelo cite el anterior:
+        no hereda filtros, agrupaciones ni datasets («¿Cuál es la conductividad máxima en la base FQ?»)."""
+        own_variable = any(
+            item.kind == "variable"
+            for item in result.data_mentions
+            if item not in result.conserved_mentions
+        )
+        answers_clarification = any(item.clarification for item in messages)
+        continues = starts_with_phrase(question, CONTINUATION_CUES)
+
+        return bool(messages and resolved and own_variable) and not (
+            answers_clarification or continues
+        )
+
+    @staticmethod
+    def _redefines(result, question):
+        """Una estadística, una agrupación o un período propios definen otro cálculo sobre la misma selección."""
+        regroups = any(
+            item.kind in {"dimension", "date"}
+            for item in result.data_mentions
+            if item not in result.conserved_mentions
+        )
+        return bool(
+            requested_statistics(question)
+            or contains_any_phrase(question, MEASURED_STATISTICS)
+            or requested_time_grain(question)
+            or regroups
+        )
+
+    @staticmethod
+    def _without_context(result):
+        result.data_mentions = [
+            item for item in result.data_mentions if item not in result.conserved_mentions
+        ]
+        result.conserved_mentions = []
+        result.history_message_ids = []
+        result.context_used = False
+        result.warnings.append(
+            "La pregunta nombra otra fuente y otra variable: se trató como una consulta nueva."
+        )
+        return []
+
+    @staticmethod
+    def _lacks_variable(result, texts):
+        """Un promedio o un máximo sin variable no tiene qué calcular: el Planner elegiría una por su cuenta."""
+        measured = any(contains_any_phrase(text, MEASURED_STATISTICS) for text in texts)
+        return measured and not any(item.kind == "variable" for item in result.data_mentions)
 
     @staticmethod
     def _record_tentative_value(result, question, messages, resolved):
@@ -622,18 +814,22 @@ class RouteQueryService:
         aliases = []
 
         # Un «valor» ausente de los registros que aparece en el nombre de una única fuente, o de una de
-        # sus hojas («la base FQ»), la nombra.
-        for item in mentions:
-            if item.kind != "value":
-                continue
-            if any(contains_phrase(name, item.text) for name in [*explicit, *found]):
+        # sus hojas («la base FQ»), la nombra; también la palabra que sigue a «los datos de» o «la base»
+        # aunque el modelo no la haya copiado («En los datos de ABSA, …»).
+        values = [item.text for item in mentions if item.kind == "value"]
+        for text in dict.fromkeys([*values, *self._cued_names(question)]):
+            if any(contains_phrase(name, text) for name in [*explicit, *found]):
                 continue
 
-            owners = self._value_owners(item.text, catalog)
-            if len(owners) == 1 and not await self._stored_anywhere(item.text, catalog):
+            owners = self._value_owners(text, catalog)
+            if len(owners) == 1 and not await self._stored_anywhere(text, catalog):
                 found.append(next(iter(owners.values()))["name"])
-                aliases.append(item.text)
+                aliases.append(text)
         return found, aliases
+
+    @staticmethod
+    def _cued_names(question):
+        return [match.group("name") for match in SOURCE_ALIAS.finditer(question)]
 
     @staticmethod
     def _multiword_sources_in(question, catalog, known):

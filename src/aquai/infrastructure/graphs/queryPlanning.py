@@ -133,6 +133,7 @@ def build_query_planning_graph(
             previous_analysis=cited_analysis(
                 state.conversation_history, state.routing.history_message_ids
             ),
+            conserved_mentions=state.routing.conserved_mentions,
         )
 
         return {

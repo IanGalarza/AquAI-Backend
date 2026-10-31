@@ -99,6 +99,9 @@ SOURCE_NAME_CONNECTORS = (
     "called",
 )
 SOURCE_CUE_WINDOW = 100
+# Palabras tras las que un nombre corto puede abreviar una fuente («los datos de ABSA», «la base FQ»); sólo
+# cuentan si esa palabra está en el nombre de una única fuente y no es un valor de los registros.
+SOURCE_ALIAS_CUES = ("datos", "base", "archivo", "planilla", "fuente", "data", "file")
 
 # Observaciones puntuales: «la última medición» pide un dato, «el último año» pide un intervalo.
 # OBSERVATION_NOUNS_ES/EN son fragmentos de regex que se insertan sin escapar («medici[oó]n»).
@@ -290,4 +293,86 @@ REQUESTED_STATISTICS = {
 CHART_WORDS = (
     r"(?:gr[aá]fic\w*|plot\w*|chart\w*|diagrama\w*|histograma\w*|visualiz\w*|dibuj\w*|"
     r"barras|l[ií]neas|dispersi[oó]n|distribuci[oó]n|scatter)"
+)
+
+# Inicio de una pregunta que continúa el análisis anterior: «¿Y la turbiedad?», «Ahora lo mismo para el pH».
+# Frases normalizadas (sin acentos).
+CONTINUATION_CUES = (
+    "y",
+    "e",
+    "ahora",
+    "tambien",
+    "lo mismo",
+    "la misma",
+    "and",
+    "now",
+    "also",
+    "the same",
+)
+
+# Conectores que suman condiciones en lugar de reemplazarlas: «compará con Punta Piedras».
+ADDITIVE_CUES = (
+    "tambien",
+    "ademas",
+    "compara",
+    "comparalo",
+    "comparar",
+    "comparacion",
+    "junto",
+    "versus",
+    "vs",
+    "also",
+    "compare",
+)
+
+# Agrupaciones temporales pedidas por su nombre: «promedio por mes» agrupa la fecha con time_grain=month.
+TIME_GRAIN_CUES = {
+    "month": (
+        "por mes",
+        "por meses",
+        "cada mes",
+        "mensual",
+        "mensuales",
+        "mes a mes",
+        "per month",
+        "monthly",
+        "by month",
+    ),
+    "year": (
+        "por ano",
+        "por anos",
+        "cada ano",
+        "anual",
+        "anuales",
+        "per year",
+        "yearly",
+        "annual",
+        "by year",
+    ),
+    "day": ("por dia", "por dias", "cada dia", "diario", "diaria", "per day", "daily", "by day"),
+}
+
+# Tipo de gráfico que nombra una pregunta; frases normalizadas.
+CHART_TYPE_WORDS = {
+    "bar": ("barra", "barras", "bar", "bars"),
+    "line": ("linea", "lineas", "line", "lines", "evolucion"),
+    "scatter": ("dispersion", "scatter"),
+    "histogram": ("histograma", "histogram"),
+}
+
+# Estadísticas de una variable medida: sin la variable no hay qué calcular («¿Cuál es el promedio en Punta Lara?»).
+MEASURED_STATISTICS = (
+    "promedio",
+    "media",
+    "mediana",
+    "maximo",
+    "maxima",
+    "minimo",
+    "minima",
+    "desvio estandar",
+    "average",
+    "mean",
+    "median",
+    "maximum",
+    "minimum",
 )

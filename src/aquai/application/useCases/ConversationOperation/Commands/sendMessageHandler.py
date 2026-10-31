@@ -122,7 +122,7 @@ class SendMessageHandler:
             before_sequence=turn.user_sequence_number,
         )
 
-        return build_history(rows)
+        return build_history(rows, turn.question)
 
     async def _cancel(self, turn):
         try:
@@ -135,7 +135,8 @@ class SendMessageHandler:
 
 
 def _with_history(turn, history):
-    visible_history = [item for item in history if item.text.strip()]
+    # El redactor recibe sólo la ventana reciente; un análisis recuperado llega por su referencia estructurada.
+    visible_history = [item for item in history if item.text.strip() and not item.recalled]
 
     return replace(
         turn,

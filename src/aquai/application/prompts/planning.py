@@ -28,6 +28,8 @@ aparecen en ningún candidato: no las sustituyas por otro valor ni filtres otra 
 respondé insufficient_coverage indicando que no hay registros de ese valor.
 Si la pregunta incluye verified_history_metadata, es un seguimiento: partí de esas
 operations (mismos datasets, columnas, filtros, orden y límite) y cambiá sólo lo pedido.
+query_mentions son las condiciones vigentes: un filtro anterior por un valor que no figura
+en query_mentions fue reemplazado y no se conserva.
 'Mostralo en un gráfico' repite esas operaciones y agrega un visualize sobre el último
 paso; no agrega promedios, agrupaciones ni otras filas.
 user_named_sources son los nombres con los que el usuario eligió la fuente (por ejemplo,
@@ -35,8 +37,9 @@ una sigla del archivo): ya determinan los datasets candidatos y nunca son valore
 filtrar registros ni motivo para pedir una aclaración.
 previous_attempt_feedback, si existe, explica por qué se rechazó tu plan anterior:
 corregí exactamente esos problemas.
-Agregá visualize sólo si la pregunta pide un gráfico; requested_chart=true exige uno
-(para 'promedio por mes' agrupá la fecha con time_grain=month). Usá latest sólo si existe
+Agregá visualize sólo si la pregunta pide un gráfico; requested_chart=true exige uno.
+requested_time_grain (day, month, year) exige agrupar la fecha DATE/TIMESTAMP con ese
+time_grain ('promedio por mes' es group_by de la fecha con time_grain=month). Usá latest sólo si existe
 temporal_requirements o si verified_history_metadata ya lo usa; latest nunca publica
 un resultado. Un read y un latest son suficientes para la última medición de una
 variable en una localidad.

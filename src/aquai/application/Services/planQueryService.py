@@ -31,6 +31,16 @@ from aquai.application.planning.context import (
     requested_thresholds,
 )
 from aquai.application.planning.filterValues import resolve_filter_values
+from aquai.application.planning.followUp import (
+    conserved_statistics,
+    conserved_time_grain,
+    previous_operations,
+    requested_time_grain,
+    reused_decision,
+    stale_values,
+    with_time_grain,
+    without_stale_filters,
+)
 from aquai.application.planning.limits import (
     conserved_limits,
     countable_mentions,
@@ -90,6 +100,12 @@ class _Requested(NamedTuple):
     # Una dimensión, una cantidad o varios valores piden varias filas: una única fila ordenada delata un
     # group_by omitido y no se trata como republicación.
     several_rows: bool
+    # Agrupación temporal pedida ahora («por mes»), que se exige, y la que el plan debe usar al agrupar una
+    # fecha, que también puede venir del resultado citado.
+    time_grain: str | None = None
+    grouping: str | None = None
+    # Valores que filtraban el resultado citado y la consulta vigente reemplazó o quitó.
+    stale: tuple = ()
 
 
 _UNRESTRICTED = _Requested(
@@ -149,9 +165,11 @@ class PlanQueryService:
         request_history=(),
         source_mentions=(),
         previous_analysis=None,
+        conserved_mentions=(),
     ) -> PlanningResult:
         question = PlanningInput(question=question).question
-        data_mentions = self._planning_mentions(data_mentions, retrieval)
+        own = [item for item in data_mentions if item not in conserved_mentions]
+        data_mentions = self._planning_mentions(data_mentions, retrieval, conserved_mentions)
         limits = requested_limit(data_mentions), conserved_limits(data_mentions, previous_analysis)
         if question != retrieval.question.strip():
             raise PlannerValidationError(
@@ -162,15 +180,25 @@ class PlanQueryService:
         asked = original_question or question
         require_latest = latest_requested(asked)
         # Un seguimiento («¿Y de qué año es?») hereda la selección temporal sin exigirla.
-        temporal = require_latest or any(latest_requested(item) for item in request_history)
+        previous = previous_operations(previous_analysis)
+        temporal = (
+            require_latest
+            or "latest" in previous
+            or any(latest_requested(item) for item in request_history)
+        )
         catalog, excluded, periods = await self._temporal_scope(catalog, temporal, require_latest)
         evidence = await self._with_categories(
             self._catalog_evidence(retrieval.evidence, catalog), catalog
         )
 
-        thresholds, statistics = requested_thresholds(data_mentions), requested_statistics(asked)
+        thresholds, asked_statistics = requested_thresholds(data_mentions), requested_statistics(asked)
+        # Un seguimiento que no nombra otra estadística conserva la del resultado citado.
+        statistics = asked_statistics or conserved_statistics(previous_analysis, asked)
         # Sólo la pregunta actual exige un gráfico; uno pedido antes se conserva sin exigirse.
         chart_required = chart_requested(asked)
+        # Lo mismo con la agrupación temporal: otra dimensión pedida ahora la reemplaza.
+        grain = requested_time_grain(asked)
+        regrouped = grain or any(item.kind in {"dimension", "date"} for item in own)
         context = build_planning_context(
             question,
             catalog,
@@ -185,6 +213,7 @@ class PlanQueryService:
             thresholds=thresholds,
             statistics=statistics,
             chart=chart_required,
+            time_grain=grain,
         )
         common = {
             "context": context,
@@ -208,11 +237,16 @@ class PlanQueryService:
             thresholds=thresholds,
             statistics=statistics,
             dimensions=requested_dimensions(context.evidence, catalog),
-            chart=chart_required or any(chart_requested(item) for item in request_history),
+            chart=chart_required
+            or "visualize" in previous
+            or any(chart_requested(item) for item in request_history),
             chart_required=chart_required,
             values=values,
             categories=asks_dimension,
             several_rows=asks_dimension or limits[0] is not None or len(values) > 1,
+            time_grain=grain,
+            grouping=grain or (None if regrouped else conserved_time_grain(previous_analysis)),
+            stale=tuple(stale_values(previous_analysis, data_mentions)),
         )
         verify = partial(
             self._verify,
@@ -225,7 +259,11 @@ class PlanQueryService:
             limits=limits,
             requested=requested,
         )
-        proposal = await self._propose(context, verify)
+        reusable = chart_required and not (own or source_mentions or asked_statistics or grain)
+        reused = reused_decision(previous_analysis, catalog, asked) if reusable else None
+        proposal = await self._reuse(reused, verify) if reused else None
+        if proposal is None:
+            proposal = await self._propose(context, verify)
         if proposal.error is not None:
             return self._rejected_result(common, proposal, retrieval.warnings)
 
@@ -235,15 +273,39 @@ class PlanQueryService:
         )
 
     @staticmethod
-    def _planning_mentions(data_mentions, retrieval):
-        # Las menciones que el Retriever identificó como columnas no son filtros obligatorios.
+    def _planning_mentions(data_mentions, retrieval, conserved=()):
+        # Las menciones que el Retriever identificó como columnas no son filtros obligatorios, ni lo es un valor
+        # conservado de una columna por la que ahora se agrupa («¿Y por sitio?» después de Punta Lara).
+        regrouped = PlanQueryService._regrouped_values(conserved, retrieval)
         mentions = [
             item
             for item in data_mentions
-            if not (item.kind == "value" and item.text in retrieval.dimension_mentions)
+            if not (
+                item.kind == "value"
+                and (item.text in retrieval.dimension_mentions or item.text in regrouped)
+            )
         ]
         mentions += [DataMention(text=value, kind="value") for value in retrieval.confirmed_values]
         return mentions
+
+    @staticmethod
+    def _regrouped_values(conserved, retrieval):
+        dimensions = {
+            (item.dataset_id, column)
+            for item in retrieval.evidence
+            for columns in item.dimension_matches.values()
+            for column in columns
+        }
+        regrouped = set()
+        for mention in conserved:
+            matched = [
+                (item.dataset_id, match.column)
+                for item in retrieval.evidence
+                for match in item.value_matches.get(mention.text, [])
+            ]
+            if mention.kind == "value" and matched and all(key in dimensions for key in matched):
+                regrouped.add(mention.text)
+        return regrouped
 
     async def _verified_catalog(self, candidates):
         versions = {item.dataset_id: item.verified_version for item in candidates}
@@ -323,6 +385,18 @@ class PlanQueryService:
             clarification_question="La consulta abarca demasiadas fuentes a la vez. ¿Podés indicar qué variable o qué fuente querés analizar?",
             missing_information=["Un alcance que permita enviar todos sus metadatos al Planner."],
         )
+
+    async def _reuse(self, decision, verify):
+        """El plan del resultado citado se revalida como cualquier propuesta; con defectos, planifica el modelo."""
+        try:
+            verified = await verify(decision)
+        except PlannerValidationError as error:
+            _logger.warning("No se reutilizó el plan anterior: %s", error)
+            return None
+
+        if verified.decision.status != "plannable" or self._plan_defects(verified.issues):
+            return None
+        return _Proposal(0, None, [None, None], verified=verified)
 
     async def _propose(self, context, verify):
         feedback, attempt, model, tokens = [], 0, None, [None, None]
@@ -417,6 +491,11 @@ class PlanQueryService:
         warnings = self._result_warnings(excluded, periods, operations, decision, selected, issues)
         reason = self._result_reason(defects, decisions, status, selected, operations)
         plannable = status == "plannable"
+        if plannable and proposal.attempts == 0:
+            reason = (
+                "Se reutilizaron las operaciones verificadas del resultado citado "
+                "y se revalidaron contra el catálogo vigente."
+            )
         return PlanningResult(
             status=status,
             llm_status=decision.status,
@@ -560,6 +639,7 @@ class PlanQueryService:
                     dimensions=requested.dimensions,
                     categories=requested.categories,
                     chart=requested.chart_required,
+                    time_grain=requested.time_grain,
                 )
             )
 
@@ -571,6 +651,7 @@ class PlanQueryService:
         # Primero se quitan los pasos inventados; después se completan los omitidos.
         decision = PlanQueryService._merged_selections(decision)
         decision = PlanQueryService._read_selections(decision, catalog)
+        decision = without_stale_filters(decision, requested.stale)
         decision = PlanQueryService._dependency_order(decision)
         decision = PlanQueryService._unrequested_charts(decision, requested.chart)
         decision = PlanQueryService._publication_steps(decision)
@@ -579,6 +660,7 @@ class PlanQueryService:
         decision = PlanQueryService._result_references(decision)
         decision = PlanQueryService._missing_groupings(decision, catalog)
         decision = PlanQueryService._omitted_categories(decision, catalog, requested)
+        decision = with_time_grain(decision, requested.grouping, _column_types(catalog))
         decision = PlanQueryService._omitted_thresholds(decision, catalog, requested.thresholds)
         if not requested.several_rows:
             decision = PlanQueryService._single_row_republications(decision, {"sort"})

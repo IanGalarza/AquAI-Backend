@@ -70,16 +70,17 @@ class SqlAlchemyConversationQueries:
         if not self._settings.history_messages:
             return []
 
+        limit = max(self._settings.history_messages, self._settings.history_recall_messages)
         with conversation_session(self._context, self._settings, read_only=True) as session:
             completed = message_statuses(session)["completed"]
-            statement = _context_statement(
-                conversation_id, before_sequence, completed, self._settings.history_messages
-            )
+            statement = _context_statement(conversation_id, before_sequence, completed, limit)
             rows = [dict(row) for row in session.execute(statement).mappings()]
 
             associations = _source_associations(session, rows)
-            for row in rows:
+            for index, row in enumerate(rows):
                 row["associations"] = associations.get(row["id"], [])
+                # La ventana reciente llega siempre; los anteriores sólo si la pregunta los recupera.
+                row["recent"] = index < self._settings.history_messages
             return list(reversed(rows))
 
 
@@ -117,6 +118,7 @@ def _context_statement(conversation_id, before_sequence, completed, limit):
             data["response"]["routing"]["history_message_ids"].label("context_ids"),
             data["response"]["routing"]["data_mentions"].label("mentions"),
             data["response"]["segments"].label("segments"),
+            data["response"]["historical_message_ids"].label("replayed_ids"),
             data["operations"].label("operations"),
             data["validated_at"].label("verified_at"),
         )

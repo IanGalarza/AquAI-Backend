@@ -165,10 +165,16 @@ class QueryResponse(BaseModel):
     historical_message_ids: list[UUID] = Field(default_factory=list)
 
 
+# Ventana reciente de mensajes más los análisis anteriores que la pregunta recupera.
+MAX_HISTORY_MESSAGES = 10
+
+
 class QueryResponseInput(PlanningInput):
     conversation_context: list[ConversationMessage] = Field(default_factory=list, max_length=8)
     response_language: Language | None = None
-    conversation_history: list[HistoryMessage] = Field(default_factory=list, max_length=8)
+    conversation_history: list[HistoryMessage] = Field(
+        default_factory=list, max_length=MAX_HISTORY_MESSAGES
+    )
 
 
 class QueryResponseState(QueryExecutionState):
@@ -177,5 +183,7 @@ class QueryResponseState(QueryExecutionState):
     validation: EvidenceValidationResult | None = None
     response: QueryResponse | None = None
     stage_durations_ms: dict[str, float] = Field(default_factory=dict)
-    conversation_history: list[HistoryMessage] = Field(default_factory=list, max_length=8)
+    conversation_history: list[HistoryMessage] = Field(
+        default_factory=list, max_length=MAX_HISTORY_MESSAGES
+    )
     routing: RoutingResult | None = None

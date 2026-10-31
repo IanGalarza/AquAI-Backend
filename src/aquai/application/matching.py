@@ -173,3 +173,14 @@ def contains_phrase(text: str, phrase: str, *, plural_insensitive: bool = False)
         words[index : index + len(target)] == target
         for index in range(len(words) - len(target) + 1)
     )
+
+
+def starts_with_phrase(text: str, phrases) -> bool:
+    """El texto empieza con alguna de las frases normalizadas: «¿Y la turbiedad?» empieza con «y»."""
+    words = normalize_text(text).split()
+
+    return any(words[: len(phrase.split())] == phrase.split() for phrase in phrases if phrase)
+
+
+def contains_any_phrase(text: str, phrases) -> bool:
+    return any(contains_phrase(text, phrase) for phrase in phrases)

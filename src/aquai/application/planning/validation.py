@@ -25,6 +25,7 @@ _TEMPORAL_TYPES = {"DATE", "TIMESTAMP"}
 _ISO_PARSERS = {"DATE": date.fromisoformat, "TIMESTAMP": datetime.fromisoformat}
 _COMBINE_OPERATIONS = {"join", "append"}
 _PASSTHROUGH_OPERATIONS = {"sort", "latest"}
+_GRAIN_NAMES = {"day": "día", "month": "mes", "year": "año"}
 _AGGREGATE_FUNCTIONS = {
     "count",
     "count_distinct",
@@ -210,8 +211,9 @@ def validate_requested_scope(
     dimensions=None,
     categories=False,
     chart=False,
+    time_grain=None,
 ) -> list[ValidationIssue]:
-    """Cada umbral, estadística, dimensión y gráfico pedidos deben llegar a una salida publicada.
+    """Cada umbral, estadística, dimensión, agrupación temporal y gráfico pedidos deben llegar a una salida publicada.
 
     También se revalida antes de ejecutar: un plan que pierde un filtro pedido no responde la consulta."""
     steps = {step.id: step for step in operations}
@@ -229,6 +231,17 @@ def validate_requested_scope(
                 severity="clarification",
                 message="La consulta pide un gráfico, pero el plan no publica ningún visualize: agregá uno "
                 "que dependa del paso que ya responde.",
+            )
+        )
+
+    grouped = {grouping.time_grain for step in published for grouping in step.group_by}
+    if time_grain and time_grain not in grouped:
+        issues.append(
+            ValidationIssue(
+                code="missing_requested_time_grain",
+                severity="clarification",
+                message=f"La consulta pide agrupar por {_GRAIN_NAMES[time_grain]}: el aggregate debe agrupar "
+                f"la fecha con time_grain={time_grain}, no por fecha exacta.",
             )
         )
 
@@ -1041,6 +1054,7 @@ def validate_execution_plan(plan: PlanningResult, catalog: list[VerifiedDataset]
             dimensions=requested_dimensions(evidence, selected),
             categories=_asks_categories(evidence),
             chart=evidence.get("requested_chart", False),
+            time_grain=evidence.get("requested_time_grain"),
         )
     )
     _require(

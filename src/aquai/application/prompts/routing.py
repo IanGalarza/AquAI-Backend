@@ -26,8 +26,8 @@ Historial y seguimientos:
 history_message_ids sólo puede contener identificadores de history. En un seguimiento
 ('Ahora mostralo en un gráfico', '¿Y de qué año es?', '¿Y durante 2024?', 'Y ahora lo
 mismo para el pH') usá data, marcá context_required=true y
-citá el mensaje assistant con analysis correspondiente: sus sources/operations describen
-variables, filtros, períodos y agrupaciones verificadas. El nuevo pedido tiene prioridad.
+citá el mensaje assistant con analysis correspondiente: su request, sources, conditions y
+operations resumen lo que se analizó y verificó. El nuevo pedido tiene prioridad.
 Un mensaje assistant con clarification=true pidió una aclaración. Si la pregunta actual
 la responde (un sitio, una fuente, una variable, una opción o una confirmación), usá la
 ruta de su solicitud pendiente (pending_requests, normalmente data), citá ese mensaje y

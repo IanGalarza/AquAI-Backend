@@ -17,6 +17,18 @@ class HistoricalAnalysis(BaseModel):
     complete: bool = True
 
 
+class DataMention(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    text: str = Field(
+        min_length=1,
+        max_length=200,
+        description="Texto copiado literalmente de la pregunta actual o de una solicitud pendiente.",
+    )
+    kind: Literal["variable", "value", "dimension", "threshold", "date", "limit"] = Field(
+        description="variable: parámetro medido; value: valor de columna que acota registros, como una localidad o estación; dimension: categoría que se pregunta o por la que se agrupa, como 'qué sitios'; threshold: comparación con un número, como 'mayor que 500'; date: fecha o período solicitado; limit: cantidad de registros o resultados que se pide ver."
+    )
+
+
 class HistoryMessage(BaseModel):
     message_id: UUID
     role: Literal["user", "assistant"]
@@ -28,23 +40,16 @@ class HistoryMessage(BaseModel):
     clarification: bool = False
     pending_requests: list[str] = Field(default_factory=list, max_length=8)
     context_message_ids: list[UUID] = Field(default_factory=list, max_length=4)
-    # Variables ya interpretadas en ese turno; un seguimiento sin variable nueva las conserva.
-    variables: list[str] = Field(default_factory=list, max_length=12)
+    # Condiciones ya interpretadas en ese turno (variable, valores, dimensiones, fechas), con el texto del usuario:
+    # un seguimiento conserva las que no cambia.
+    scope: list[DataMention] = Field(default_factory=list, max_length=12)
+    # Una respuesta que reprodujo otra remite a ese resultado verificado.
+    replay_of: UUID | None = None
+    # Mensaje anterior a la ventana reciente, recuperado porque la pregunta actual lo menciona.
+    recalled: bool = False
     # Párrafos con citas y columnas de cada fuente (por dataset_id); sólo se reproducen, nunca se envían al Router.
     segments: list[dict[str, JsonValue]] = Field(default_factory=list)
     source_columns: dict[str, list[dict[str, JsonValue]]] = Field(default_factory=dict)
-
-
-class DataMention(BaseModel):
-    model_config = ConfigDict(extra="forbid", strict=True)
-    text: str = Field(
-        min_length=1,
-        max_length=200,
-        description="Texto copiado literalmente de la pregunta actual o de una solicitud pendiente.",
-    )
-    kind: Literal["variable", "value", "dimension", "threshold", "date", "limit"] = Field(
-        description="variable: parámetro medido; value: valor de columna que acota registros, como una localidad o estación; dimension: categoría que se pregunta o por la que se agrupa, como 'qué sitios'; threshold: comparación con un número, como 'mayor que 500'; date: fecha o período solicitado; limit: cantidad de registros o resultados que se pide ver."
-    )
 
 
 class RoutingDraft(BaseModel):
@@ -100,6 +105,8 @@ class RoutingResult(BaseModel):
     dataset_bindings: list[DatasetBinding] = Field(default_factory=list)
     source_mentions: list[str] = Field(default_factory=list)
     data_mentions: list[DataMention | str] = Field(default_factory=list)
+    # Condiciones del análisis citado que el seguimiento conserva; también figuran en data_mentions.
+    conserved_mentions: list[DataMention] = Field(default_factory=list)
     # Respuesta breve a una aclaración sin menciones: sólo cuenta si existe en los registros.
     tentative_values: list[str] = Field(default_factory=list)
     context_used: bool = False

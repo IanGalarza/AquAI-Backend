@@ -10,5 +10,8 @@ class ConversationSettings(BaseSettings):
     max_table_bytes: int = Field(default=262144, ge=1024, le=1048576)
     max_source_details_bytes: int = Field(default=65536, ge=2048, le=262144)
     history_messages: int = Field(default=8, ge=0, le=8)
+    # Mensajes anteriores que se leen de PostgreSQL para recuperar análisis que la pregunta menciona;
+    # al modelo sólo llegan los pocos seleccionados, nunca toda la ventana.
+    history_recall_messages: int = Field(default=40, ge=0, le=200)
     lock_timeout_ms: int = Field(default=2000, ge=1, le=10000)
     statement_timeout_ms: int = Field(default=10000, ge=1, le=60000)

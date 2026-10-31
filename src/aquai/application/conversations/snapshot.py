@@ -63,6 +63,12 @@ _DIRECT_RESPONSE_TYPES = {
 }
 
 
+def _reproduces(answer, original):
+    """Cada párrafo reproducido figura tal cual en la respuesta original."""
+    paragraphs = [item for item in answer.split("\n\n") if item.strip()]
+    return bool(paragraphs) and all(item in original for item in paragraphs)
+
+
 def _bytes(value):
     content = json.dumps(value, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
 
@@ -231,7 +237,7 @@ class ConversationSnapshotBuilder:
 
         message_id = routing.history_message_ids[0]
         original = history[message_id]
-        if original.analysis is None or response.answer != original.text:
+        if original.analysis is None or not _reproduces(response.answer, original.text):
             raise ConversationStorageError("La respuesta alteró el resultado histórico.")
 
         sources = [SourceReference.model_validate(item) for item in original.analysis.sources]

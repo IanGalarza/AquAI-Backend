@@ -87,6 +87,7 @@ def build_planning_context(
     thresholds=(),
     statistics=(),
     chart=False,
+    time_grain=None,
 ) -> PlanningContextRecord:
     observed = [_observed_dataset(item) for item in dataset_evidence]
     warnings = list(dict.fromkeys(warning for dataset in datasets for warning in dataset.warnings))
@@ -116,6 +117,9 @@ def build_planning_context(
         evidence["requested_statistics"] = list(statistics)
     if chart:
         evidence["requested_chart"] = True
+    if time_grain:
+        # «Promedio por mes» agrupa la fecha por mes; un group_by de la fecha exacta no lo responde.
+        evidence["requested_time_grain"] = time_grain
     if observed:
         # Hechos observados en PostgreSQL: valores TEXT almacenados que contienen cada mención.
         evidence["observed_evidence"] = observed
