@@ -1,5 +1,3 @@
-"""Conecta Alembic con la configuración y los mapeos existentes de AquAI."""
-
 import re
 from logging.config import fileConfig
 
@@ -14,20 +12,23 @@ config = context.config
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
-# Alembic necesita todas las tablas registradas antes de comparar el esquema.
 configure_mappings()
 target_metadata = metadata
 
 
+#
+# Excluye de la comparación las tablas físicas de datasets creadas durante la ingesta.
+#
 def include_name(name: str | None, type_: str, parent_names: dict) -> bool:
-    """Las tablas físicas del catálogo se crean durante la ingesta, fuera de Alembic."""
     return not (
         type_ == "table" and name is not None and re.fullmatch(r"dataset_[0-9a-f]{32}", name)
     )
 
 
+#
+# Ejecuta las migraciones generando SQL sin conectarse a la base de datos.
+#
 def run_migrations_offline() -> None:
-    """Genera SQL sin abrir una conexión a la base de datos."""
     context.configure(
         url=DatabaseSettings().sqlalchemy_url,
         target_metadata=target_metadata,
@@ -41,8 +42,10 @@ def run_migrations_offline() -> None:
         context.run_migrations()
 
 
+#
+# Configura Alembic sobre una conexión y ejecuta las migraciones en su transacción.
+#
 def run_migrations_on_connection(connection: Connection) -> None:
-    """Configura Alembic sobre una conexión y respeta su transacción existente."""
     context.configure(
         connection=connection,
         target_metadata=target_metadata,
@@ -54,8 +57,10 @@ def run_migrations_on_connection(connection: Connection) -> None:
         context.run_migrations()
 
 
+#
+# Ejecuta las migraciones con la conexión de la aplicación o una propia.
+#
 def run_migrations_online() -> None:
-    """Ejecuta el comando solicitado usando la conexión de la aplicación."""
     connection = config.attributes.get("connection")
     if connection is not None:
         run_migrations_on_connection(connection)

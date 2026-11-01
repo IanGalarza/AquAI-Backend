@@ -43,21 +43,17 @@ _LETTER_DIGIT_BOUNDARY = re.compile(r"(?<=\d)(?=[^\W\d_])|(?<=[^\W\d_])(?=\d)")
 _SEPARATORS = re.compile(r"[\W_]+")
 _THOUSANDS_SEPARATORS = re.compile(r"[.,]")
 _WORD = re.compile(r"\w+")
-# Palabras tras el número en las que se busca la estadística comparada: «500 de conductividad en promedio».
 _MAX_FOLLOWING_WORDS = 5
 _EXPLICIT_DAY = re.compile(
     r"\b(?:(?P<iso>\d{4}-\d{1,2}-\d{1,2})|(?P<dmy>\d{1,2}/\d{1,2}/\d{4}))\b"
 )
-# Un mes con su año en cifras: «2021-03», «03/2021».
 _EXPLICIT_MONTH = re.compile(r"\b(?:(?P<year>\d{4})-(?P<month>\d{1,2})|(?P<m>\d{1,2})/(?P<y>\d{4}))\b")
-# Fórmula química escrita en una pregunta: «NO3», «no3».
 _FORMULA_NAMES = {
     formula.casefold(): name for name, formulas in CHEMICAL_FORMULAS.items() for formula in formulas
 }
 _FORMULA = re.compile(
     rf"(?<![^\W\d_])(?:{'|'.join(map(re.escape, _FORMULA_NAMES))})(?!\d)", re.IGNORECASE
 )
-# Dos fechas unidas como rango: «2019-2021», «01/03/2021 al 15/04/2021», «marzo a junio».
 _MONTH_WORDS = "|".join(MONTH_NAMES)
 _DATE_RANGE = re.compile(
     rf"(?:\d|\b(?:{_MONTH_WORDS}))\s*{RANGE_CONNECTORS}\s*(?:el\s+)?(?:\d|(?:{_MONTH_WORDS})\b)",
@@ -79,6 +75,9 @@ class Comparison(NamedTuple):
     compares_statistic: bool
 
 
+#
+# Devuelve el valor numérico de cada palabra que expresa una cantidad.
+#
 def _word_counts() -> dict[str, int]:
     counts = {}
 
@@ -92,8 +91,10 @@ def _word_counts() -> dict[str, int]:
 _WORD_COUNTS = _word_counts()
 
 
+#
+# Normaliza un texto: minúsculas, sin acentos, separando letras de dígitos y símbolos.
+#
 def normalize_text(value: str) -> str:
-    """'5Punta piedras' -> '5 punta piedras'; 'Tabla_RdlP.xlsx' -> 'tabla rdlp xlsx'."""
     text = unicodedata.normalize("NFKD", str(value).casefold())
     text = "".join(char for char in text if not unicodedata.combining(char))
     text = _LETTER_DIGIT_BOUNDARY.sub(" ", text)
@@ -101,12 +102,17 @@ def normalize_text(value: str) -> str:
     return " ".join(_SEPARATORS.sub(" ", text).split())
 
 
+#
+# Normaliza un nombre de archivo o fuente sin su extensión de planilla.
+#
 def normalize_name(value: str) -> str:
     return normalize_text(SPREADSHEET_EXTENSION.sub("", str(value).strip()))
 
 
+#
+# Devuelve el singular de una palabra para igualar plurales regulares.
+#
 def _singular(word: str) -> str:
-    # Sólo iguala plurales regulares (totales/total, sitios/sitio); no traduce ni sinonimiza.
     if len(word) > 4 and word.endswith("es") and not word.endswith("ses"):
         return word[:-2]
 
@@ -116,26 +122,32 @@ def _singular(word: str) -> str:
     return word
 
 
+#
+# Devuelve las palabras normalizadas de un texto en singular.
+#
 def singular_words(text: str) -> tuple[str, ...]:
-    """Palabras normalizadas en singular: «Sitios» y «sitio» nombran lo mismo."""
     return tuple(_singular(word) for word in normalize_text(text).split())
 
 
+#
+# Devuelve los grupos de sinónimos de variables, con los nombres más largos primero.
+#
 def _synonym_groups() -> list[list[tuple[str, ...]]]:
-    # Los nombres más largos se buscan primero: «conductividad eléctrica» antes que «conductividad».
     return [
         sorted((singular_words(term) for term in group), key=len, reverse=True)
         for group in VARIABLE_SYNONYMS
     ]
 
 
+#
+# Reúne las palabras en singular de varios textos.
+#
 def _word_set(texts) -> set[str]:
     return {word for text in texts for word in singular_words(text)}
 
 
 _SYNONYM_GROUPS = _synonym_groups()
 _CONNECTORS = _word_set(MENTION_CONNECTORS)
-# Palabras entre un extremo y su fecha: «desde el año 2020», «antes de marzo».
 _PERIOD_FILLERS = _CONNECTORS | {"ano", "year"}
 _WATER = _word_set(WATER_WORDS)
 _OTHER_MEDIUM = _word_set(OTHER_MEDIUM_WORDS)
@@ -143,11 +155,16 @@ _SUM = _word_set(SUM_WORDS)
 _SECONDARY = _word_set(SECONDARY_QUANTITY_WORDS)
 
 
+#
+# Devuelve las palabras que precisan una variable, sin conectores ni palabras del agua.
+#
 def _content(words) -> tuple[str, ...]:
-    """Palabras que precisan una variable: sin conectores ni el agua, el medio por defecto."""
     return tuple(word for word in words if word not in _CONNECTORS and word not in _WATER)
 
 
+#
+# Devuelve los nombres equivalentes de cada variable registrada.
+#
 def _variable_terms() -> dict[str, set[tuple[str, ...]]]:
     terms = {name: {_content(singular_words(name))} for name in UNIT_CONFIRMED_SYMBOLS}
     for group in VARIABLE_SYNONYMS:
@@ -159,21 +176,25 @@ def _variable_terms() -> dict[str, set[tuple[str, ...]]]:
 _VARIABLE_TERMS = _variable_terms()
 
 
+#
+# Reemplaza las fórmulas químicas de una frase por el nombre del compuesto.
+#
 def _formula_names(phrase: str) -> str:
-    """«NO3 promedio» → «nitrato promedio»."""
     return _FORMULA.sub(lambda match: _FORMULA_NAMES[match.group().casefold()], phrase)
 
 
+#
+# Devuelve la variable y sus nombres equivalentes, incluida su fórmula química.
+#
 def variable_variants(phrase: str) -> list[str]:
-    """La variable y sus nombres equivalentes: «turbidez promedio» → «turbiedad promedio», «turb promedio», …; una
-    fórmula química también por su nombre: «NO3» → «nitrato», «nitrate».
-
-    Sólo reemplaza un nombre registrado como equivalente; no traduce ni compara raíces."""
     variants = [phrase, *_synonym_variants(phrase), *_synonym_variants(_formula_names(phrase))]
 
     return list(dict.fromkeys(variants))
 
 
+#
+# Devuelve las frases que resultan de sustituir un nombre de variable por sus sinónimos.
+#
 def _synonym_variants(phrase: str) -> list[str]:
     words = singular_words(phrase)
     variants = []
@@ -197,17 +218,19 @@ def _synonym_variants(phrase: str) -> list[str]:
     return variants
 
 
+#
+# Devuelve la variable registrada que la frase nombra sin más precisión que el agua.
+#
 def _exact_variable(phrase: str) -> str | None:
-    """Variable registrada que la frase nombra sin otra precisión que el agua: «la temperatura del agua» y «NO3»
-    nombran temperatura y nitrato; «temperatura del aire» o «temperatura promedio», ninguna."""
     words = _content(singular_words(_formula_names(phrase)))
 
     return next((name for name, terms in _VARIABLE_TERMS.items() if words in terms), None)
 
 
+#
+# Indica si el encabezado nombra con su fórmula química el nutriente pedido.
+#
 def formula_named(name: str, phrase: str) -> bool:
-    """El encabezado nombra con su fórmula el nutriente pedido: «nitratos» o «NO3» → «N-NO3 [mg N L-1]»; nunca a
-    «Muestra Nº 3», porque la fórmula se busca tal cual en el nombre original, ni a un cociente («DIN/PO4»)."""
     formulas = CHEMICAL_FORMULAS.get(_exact_variable(phrase), ())
 
     return any(
@@ -216,9 +239,10 @@ def formula_named(name: str, phrase: str) -> bool:
     )
 
 
+#
+# Indica si un símbolo ambiguo nombra la variable pedida según su unidad documentada.
+#
 def symbol_named(name: str, unit: str | None, phrase: str) -> bool:
-    """Un símbolo ambiguo nombra la variable pedida si su unidad documentada lo confirma: «temperatura» → «T (°C)»;
-    un «T» sin unidad o en otra unidad, no."""
     variable = _exact_variable(phrase)
     if variable not in UNIT_CONFIRMED_SYMBOLS or not unit:
         return False
@@ -227,9 +251,10 @@ def symbol_named(name: str, unit: str | None, phrase: str) -> bool:
     return normalize_text(unitless_name(name)) in symbols and unit_key(unit) in units
 
 
+#
+# Quita de la variable el medio que la precisa para buscar sus columnas.
+#
 def without_medium(phrase: str) -> str:
-    """La variable sin el medio que la precisa, para buscar sus columnas: «temperatura del aire» → «temperatura».
-    Qué medio mide cada columna lo decide other_quantity."""
     words = normalize_text(phrase).split()
     kept = [word for word in words if _singular(word) not in _OTHER_MEDIUM]
     while kept and kept[-1] in _CONNECTORS:
@@ -238,10 +263,10 @@ def without_medium(phrase: str) -> str:
     return " ".join(kept) if kept and len(kept) < len(words) else phrase
 
 
+#
+# Devuelve la variable con el calificativo que la sigue en la pregunta y cambia su magnitud.
+#
 def qualified_variable(mention: str, question: str) -> str:
-    """La variable con el calificativo que la sigue en la pregunta y la vuelve otra magnitud (otro medio, una
-    proporción, otra unidad de recuento), que el modelo a veces omite: «¿Y la temperatura del aire?» con la mención
-    «temperatura» → «temperatura del aire»."""
     words, target = normalize_text(question).split(), normalize_text(mention).split()
     qualifiers = _OTHER_MEDIUM | _SECONDARY
 
@@ -258,17 +283,18 @@ def qualified_variable(mention: str, question: str) -> str:
     return mention
 
 
+#
+# Indica si un valor es solo el calificativo que la variable ya incluye.
+#
 def qualifies_variable(value: str, variable: str) -> bool:
-    """El valor es sólo el calificativo que la variable ya incluye («aire» en «temperatura del aire»): no es un valor
-    registrado por el que filtrar."""
     words = set(singular_words(value))
     return bool(words) and words <= (_OTHER_MEDIUM | _SECONDARY) and words <= set(singular_words(variable))
 
 
+#
+# Indica si un encabezado mide otra magnitud que la pedida: otro medio o una suma.
+#
 def other_quantity(name: str, phrase: str) -> str | None:
-    """El encabezado nombra la variable pero mide otra cosa: otro medio que el pedido («meteorológicos |
-    Temperatura» si no se pide el aire, o el agua si se lo pide: «medium») o una suma de magnitudes que no se pide
-    («Clorofila "a" + Feofitina "a"», «sum»)."""
     words, asked = set(singular_words(name)), set(singular_words(phrase))
 
     if bool(words & _OTHER_MEDIUM) != bool(asked & _OTHER_MEDIUM):
@@ -278,9 +304,10 @@ def other_quantity(name: str, phrase: str) -> str | None:
     return None
 
 
+#
+# Indica si un encabezado es una variante secundaria que la frase no pide, como un porcentaje.
+#
 def secondary_quantity(name: str, unit: str | None, phrase: str) -> bool:
-    """Variante de la variable que no es su valor absoluto y la frase no pide: una proporción o saturación
-    («% sat de oxígeno», «Abundancia relativa») o un recuento de colonias o individuos en vez de células."""
     described = f"{name} {unit or ''}"
     marked = PERCENT_SIGN in described or bool(set(singular_words(described)) & _SECONDARY)
     asked = PERCENT_SIGN in phrase or bool(set(singular_words(phrase)) & _SECONDARY)
@@ -288,8 +315,10 @@ def secondary_quantity(name: str, unit: str | None, phrase: str) -> bool:
     return marked and not asked
 
 
+#
+# Devuelve la variable normalizada sin las estadísticas que la acompañan.
+#
 def variable_core(phrase: str) -> str:
-    """Variable sin la estadística que la acompaña: «pH promedio» → «ph», «valor máximo de turbidez» → «turbidez»."""
     words = normalize_text(phrase).split()
 
     while words and words[0] in STATISTIC_WORDS:
@@ -300,8 +329,10 @@ def variable_core(phrase: str) -> str:
     return " ".join(words)
 
 
+#
+# Devuelve la variable como la escribió el usuario, sin su estadística.
+#
 def variable_name(phrase: str) -> str:
-    """La variable como la escribió el usuario, sin su estadística: «pH promedio» → «pH»."""
     words = phrase.split()
 
     while words and normalize_text(words[0]) in STATISTIC_WORDS:
@@ -312,10 +343,10 @@ def variable_name(phrase: str) -> str:
     return " ".join(words) or phrase
 
 
+#
+# Devuelve la cantidad entera mencionada en cifras o palabras, si es única.
+#
 def mentioned_count(phrase: str) -> int | None:
-    """Cantidad entera escrita con cifras o palabras: «los primeros 5» → 5, «top cinco» → 5, «1.000 registros» → 1000.
-
-    Un decimal («2,5») no es una cantidad de filas; sin una única cantidad, None."""
     counts = set()
 
     for token in str(phrase).split():
@@ -330,10 +361,10 @@ def mentioned_count(phrase: str) -> int | None:
     return counts.pop() if len(counts) == 1 else None
 
 
+#
+# Extrae las comparaciones numéricas (umbrales) literales de un texto.
+#
 def numeric_comparisons(text: str) -> list[Comparison]:
-    """Umbrales literales: «una conductividad promedio mayor que 500» → «promedio mayor que 500» (gt 500).
-
-    El texto empieza en la estadística comparada cuando la precede; un número sin comparación no es un umbral."""
     comparisons = []
 
     for match in _COMPARISON.finditer(str(text)):
@@ -352,9 +383,10 @@ def numeric_comparisons(text: str) -> list[Comparison]:
     return comparisons
 
 
+#
+# Devuelve el final de la estadística que sigue a un número comparado, si la hay.
+#
 def _following_statistic(text: str, start: int) -> int | None:
-    """Fin de una estadística que sigue al número, salteando a lo sumo dos palabras (la variable o su unidad):
-    «superan los 500 de conductividad en promedio», «mayor que 8 en promedio»."""
     skipped = 0
 
     for word in list(_WORD.finditer(text[start:]))[:_MAX_FOLLOWING_WORDS]:
@@ -373,20 +405,18 @@ def _following_statistic(text: str, start: int) -> int | None:
     return None
 
 
+#
+# Devuelve el único intervalo de fechas que nombra el texto, o None si hay varios o ninguno.
+#
 def period_range(text: str) -> tuple[date | None, date | None] | None:
-    """El único intervalo que nombra una fecha pedida (ver period_ranges); None si nombra varios o ninguno."""
     ranges = period_ranges(text)
     return ranges[0] if len(ranges) == 1 else None
 
 
+#
+# Devuelve los intervalos de fechas que nombra un texto, abiertos o cerrados.
+#
 def period_ranges(text: str) -> list[tuple[date | None, date | None]]:
-    """Intervalos que nombra una fecha pedida: «2021» → todo 2021; «entre 2019 y 2021» o «2019-2021» → de 2019 a
-    2021; «marzo de 2022» o «2022-03» → ese mes; «15/03/2021» → ese día; «en 2019 y en 2021» → cada año por separado;
-    «marzo y junio de 2022» → cada mes. Un extremo abre el intervalo: «desde 2020» → (2020-01-01, None), «antes de
-    2021» → (None, 2020-12-31).
-
-    Sin una fecha legible, con una estación (sus meses cambian con el hemisferio) o una combinación que no se lee sin
-    ambigüedad, ninguno: no hay un intervalo que exigir."""
     text = str(text)
     anchors = [] if contains_any_phrase(text, SEASON_WORDS) else _period_anchors(text)
     if not anchors:
@@ -406,6 +436,9 @@ def period_ranges(text: str) -> list[tuple[date | None, date | None]]:
     return [] if sides else anchors
 
 
+#
+# Aplica los extremos «desde», «hasta», «antes» o «después» a una fecha de referencia.
+#
 def _bounded(anchor, sides) -> list[tuple[date | None, date | None]]:
     start, end = anchor
     lower = start if "from" in sides else end + _DAY if "after" in sides else None
@@ -413,13 +446,15 @@ def _bounded(anchor, sides) -> list[tuple[date | None, date | None]]:
     if lower is None and upper is None:
         return [anchor] if not sides else []
     if lower is not None and upper is not None:
-        return []  # «desde 2020 hasta 2020» con una sola fecha no se interpreta.
+        return []
 
     return [(lower, upper)]
 
 
+#
+# Devuelve las fechas que nombra el texto como días, meses o años, en orden.
+#
 def _period_anchors(text) -> list[tuple[date, date]]:
-    """Fechas que nombra el texto, en orden: días explícitos; si no, meses (con su año); si no, años."""
     days = sorted({day for match in _EXPLICIT_DAY.finditer(text) if (day := _explicit_day(match))})
     if days:
         return [(day, day) for day in days]
@@ -436,7 +471,7 @@ def _period_anchors(text) -> list[tuple[date, date]]:
     if named and len(years) == 1:
         explicit = sorted({*explicit, *((years[0], month) for month in named)})
     elif named:
-        return []  # «marzo de 2019 y abril de 2021»: los meses no se atribuyen a cada año sin ambigüedad.
+        return []
 
     if explicit:
         return [
@@ -446,8 +481,10 @@ def _period_anchors(text) -> list[tuple[date, date]]:
     return [(date(year, 1, 1), date(year, 12, 31)) for year in years]
 
 
+#
+# Devuelve el nombre legible de un período cerrado: año, mes, día o rango.
+#
 def period_text(start: date, end: date) -> str:
-    """Nombre de un período cerrado: 2019, marzo de 2022 o 15/03/2021."""
     if (start.month, start.day, end.month, end.day) == (1, 1, 12, 31) and start.year == end.year:
         return str(start.year)
     if start.day == 1 and end == date(start.year, start.month, calendar.monthrange(start.year, start.month)[1]):
@@ -460,9 +497,10 @@ def period_text(start: date, end: date) -> str:
 _SPANISH_MONTHS = list(MONTH_NAMES)[:12]
 
 
+#
+# Devuelve la fecha con el extremo o rango que la precede en la pregunta y se omitió.
+#
 def qualified_period(mention: str, question: str) -> str:
-    """La fecha con el extremo o el rango que la precede en la pregunta y el modelo omitió: con la mención «2020»,
-    «¿El pH desde el año 2020?» → «desde el ano 2020»; sin él, «2020» se exigiría como el año entero."""
     words, target = normalize_text(question).split(), normalize_text(mention).split()
     cues = [cue.split() for phrases in PERIOD_BOUND_CUES.values() for cue in phrases]
     cues += [cue.split() for cue in RANGE_CUES]
@@ -483,22 +521,28 @@ def qualified_period(mention: str, question: str) -> str:
     return mention
 
 
+#
+# Devuelve las últimas palabras antes de una mención, tal como las escribió el usuario.
+#
 def _original_words(question: str, mention: str, count: int) -> list[str]:
-    """Las últimas palabras antes de la mención, como las escribió el usuario («después de», «año»)."""
     position = question.casefold().find(mention.casefold())
     words = [word.strip(SURROUNDING_PUNCTUATION) for word in question[:position].split()]
     words = [word for word in words if word]
     return words[-count:] if position >= 0 and len(words) >= count else []
 
 
+#
+# Devuelve el mes de una fecha en formato AAAA-MM o MM/AAAA, si es válido.
+#
 def _explicit_month(match) -> int | None:
-    """AAAA-MM o MM/AAAA; un mes inexistente («2020-21») no cuenta."""
     month = int(match.group("month") or match.group("m"))
     return month if 1 <= month <= 12 else None
 
 
+#
+# Devuelve el día de una fecha explícita AAAA-MM-DD o DD/MM/AAAA, si es válida.
+#
 def _explicit_day(match) -> date | None:
-    """AAAA-MM-DD o, como se escribe en castellano, DD/MM/AAAA."""
     try:
         if match.group("iso"):
             return date(*(int(part) for part in match.group("iso").split("-")))
@@ -508,8 +552,10 @@ def _explicit_day(match) -> date | None:
         return None
 
 
+#
+# Convierte el número de una comparación, distinguiendo miles de decimales.
+#
 def _comparison_number(token: str) -> int | float | None:
-    """«1.000» y «1,000» son miles; «7,5» y «7.5», decimales."""
     unsigned = token.lstrip("-")
     sign = -1 if token.startswith("-") else 1
 
@@ -522,8 +568,10 @@ def _comparison_number(token: str) -> int | float | None:
         return None
 
 
+#
+# Devuelve el inicio de la estadística comparada que precede a una comparación.
+#
 def _compared_statistic(text: str, end: int) -> int | None:
-    """Inicio de la estadística comparada, salteando a lo sumo una palabra (la variable) y artículos."""
     skipped = 0
 
     for word in reversed(list(_WORD.finditer(text[:end]))):
@@ -542,8 +590,10 @@ def _compared_statistic(text: str, end: int) -> int | None:
     return None
 
 
+#
+# Indica si la frase aparece en el texto como secuencia completa de palabras.
+#
 def contains_phrase(text: str, phrase: str, *, plural_insensitive: bool = False) -> bool:
-    """La frase aparece como secuencia completa de palabras, nunca como fragmento."""
     words = normalize_text(text).split()
     target = normalize_text(phrase).split()
 
@@ -560,12 +610,17 @@ def contains_phrase(text: str, phrase: str, *, plural_insensitive: bool = False)
     )
 
 
+#
+# Indica si el texto empieza con alguna de las frases dadas.
+#
 def starts_with_phrase(text: str, phrases) -> bool:
-    """El texto empieza con alguna de las frases normalizadas: «¿Y la turbiedad?» empieza con «y»."""
     words = normalize_text(text).split()
 
     return any(words[: len(phrase.split())] == phrase.split() for phrase in phrases if phrase)
 
 
+#
+# Indica si el texto contiene alguna de las frases dadas.
+#
 def contains_any_phrase(text: str, phrases) -> bool:
     return any(contains_phrase(text, phrase) for phrase in phrases)

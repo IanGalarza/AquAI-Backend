@@ -16,23 +16,34 @@ from aquai.application.contracts.planning import OutputField
 from aquai.application.contracts.routing import HistoryMessage
 
 
+#
+# Cuerpo de la solicitud para crear una conversación: título opcional.
+#
 class CreateConversationRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
     title: str | None = Field(default=None, min_length=1, max_length=200)
 
 
+#
+# Cuerpo de la solicitud para renombrar una conversación: nuevo título.
+#
 class RenameConversationRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
-    # Título de una sola línea: sin caracteres de control (C0, C1) ni separadores de línea Unicode.
     title: str = Field(min_length=1, max_length=200, pattern=r"^[^\p{Cc}]+$")
 
 
+#
+# Cuerpo de la solicitud para enviar un mensaje: pregunta e idioma de respuesta.
+#
 class SendMessageRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
     content: str = Field(min_length=1, max_length=6000)
     response_language: Language | None = None
 
 
+#
+# Respuesta con los datos de una conversación.
+#
 class ConversationView(BaseModel):
     id: UUID
     title: str
@@ -41,6 +52,9 @@ class ConversationView(BaseModel):
     updated_at: datetime | None
 
 
+#
+# Respuesta con una página de conversaciones y sus totales.
+#
 class ConversationPage(BaseModel):
     items: list[ConversationView]
     total: int
@@ -48,11 +62,17 @@ class ConversationPage(BaseModel):
     page_size: int
 
 
+#
+# Respuesta con el estado de un mensaje.
+#
 class MessageStatusView(BaseModel):
     id: int
     name: str
 
 
+#
+# Respuesta con la fuente asociada a un mensaje.
+#
 class MessageSourceView(BaseModel):
     id: UUID
     source_id: UUID
@@ -61,6 +81,9 @@ class MessageSourceView(BaseModel):
     details: dict[str, JsonValue]
 
 
+#
+# Variable leída y su ubicación en la planilla original.
+#
 class CitationVariable(BaseModel):
     """Variable leída y su ubicación en la planilla original (columna G, celdas G2:G1113)."""
 
@@ -70,6 +93,9 @@ class CitationVariable(BaseModel):
     cells: str | None = None
 
 
+#
+# Respuesta con la fuente citada de una afirmación: archivo, hoja, filas y variables.
+#
 class CitationView(BaseModel):
     """Fuente legible de una afirmación: archivo, hoja, filas de datos y variables utilizadas."""
 
@@ -86,41 +112,53 @@ class CitationView(BaseModel):
     variables: list[CitationVariable] = Field(default_factory=list)
 
 
+#
+# Respuesta con un fragmento del mensaje, sus citas y su tabla o gráfico asociado.
+#
 class SegmentView(BaseModel):
     kind: Literal["paragraph", "note"] = "paragraph"
     text: str
     items: list[str] = Field(default_factory=list)
     citations: list[str] = Field(default_factory=list)
-    # Claves estructuradas de la tabla (evidence_id) o el gráfico (operation_id) que siguen al párrafo.
     table: str | None = None
     chart: str | None = None
 
 
+#
+# Respuesta con los datos de una columna de una tabla de resultados.
+#
 class ColumnView(BaseModel):
     name: str
     label: str
     unit: str | None = None
     unit_documented: bool = False
     numeric: bool = False
-    # Agrupación temporal: una fecha de mes o año no se presenta como un día concreto.
     time_grain: Literal["day", "month", "year"] | None = None
 
 
+#
+# Respuesta con una tabla de resultados y sus citas.
+#
 class TableView(BaseModel):
     evidence_id: str
     columns: list[ColumnView]
     citations: list[str] = Field(default_factory=list)
 
 
+#
+# Respuesta con un gráfico, sus citas y sus títulos legibles.
+#
 class ChartView(BaseModel):
     operation_id: str
     citations: list[str] = Field(default_factory=list)
-    # Rótulos legibles: la figura guardada conserva los originales que validó el backend.
     x_title: str | None = None
     y_title: str | None = None
     legend_title: str | None = None
 
 
+#
+# Respuesta con la presentación estructurada de un mensaje.
+#
 class MessagePresentation(BaseModel):
     """Lectura del mensaje sin interpretar texto en el cliente; el detalle técnico queda en content_data."""
 
@@ -133,6 +171,9 @@ class MessagePresentation(BaseModel):
     duration_ms: int | None = None
 
 
+#
+# Respuesta con los datos de un mensaje de la conversación.
+#
 class MessageView(BaseModel):
     id: UUID
     conversation_id: UUID
@@ -147,6 +188,9 @@ class MessageView(BaseModel):
     presentation: MessagePresentation | None = None
 
 
+#
+# Respuesta con una página de mensajes de una conversación.
+#
 class MessagePage(BaseModel):
     conversation_id: UUID
     items: list[MessageView]
@@ -169,7 +213,6 @@ class StoredTable(BaseModel):
     rows_filtered: int = 0
     exclusions: list[ValueExclusion] = Field(default_factory=list)
     exclusions_complete: bool = True
-    # No location a execution.operations: los datos efímeros no son recursos HTTP.
 
 
 class StoredGeneration(GenerationRecord):

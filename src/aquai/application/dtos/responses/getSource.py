@@ -8,6 +8,9 @@ from aquai.application.dtos.responses.sourceState import SourceStateResponse
 from aquai.application.units import documented_unit
 
 
+#
+# Detalle de una columna de un dataset: nombre, tipo, unidad y significado.
+#
 class ColumnDetail(BaseModel):
     original_name: str
     sql_name: str
@@ -20,21 +23,28 @@ class ColumnDetail(BaseModel):
     excluded_count: int | None = Field(default=None, ge=0)
     header_missing: bool = False
 
+    #
+    # Completa la unidad de una medición con la que documenta su encabezado, si falta.
+    #
     @model_validator(mode="after")
     def header_documented_unit(self):
-        """Una medición cuyo encabezado documenta la unidad («Turbiedad (NTU)», «Cond | mS cm-1») la conserva
-        aunque la ingesta que la cargó no la haya reconocido; nunca se deduce del nombre de la variable."""
         if self.unit is None and self.numeric_eligible:
             self.unit = documented_unit(self.original_name)
 
         return self
 
 
+#
+# Ubicación de un dataset dentro del archivo fuente: hoja, rango y posible solapamiento.
+#
 class SourceLocator(BaseModel):
     sheet: str | None = None
     range: str | None = None
     has_possible_overlap: bool = False
 
+    #
+    # Normaliza el indicador de posible solapamiento de la ubicación de la fuente.
+    #
     @model_validator(mode="before")
     @classmethod
     def project_overlap(cls, value: Any) -> Any:
@@ -48,17 +58,26 @@ class SourceLocator(BaseModel):
         return value
 
 
+#
+# Error ocurrido durante el procesamiento de una fuente: código y mensaje.
+#
 class ProcessingError(BaseModel):
     code: str | None = None
     message: str | None = None
 
 
+#
+# Informe del procesamiento de una fuente: advertencias y errores.
+#
 class ProcessingReport(BaseModel):
     warnings: list[str] = Field(default_factory=list)
     warning_count: int = Field(default=0, ge=0)
     errors: list[str | ProcessingError] = Field(default_factory=list)
 
 
+#
+# Detalle de un dataset de una fuente: ubicación, filas, columnas y avisos de calidad.
+#
 class DatasetDetail(BaseModel):
     id: UUID
     name: str
@@ -70,6 +89,9 @@ class DatasetDetail(BaseModel):
     is_active: bool
     queryable: bool
 
+    #
+    # Usa la descripción semántica del dataset como su descripción cuando existe.
+    #
     @model_validator(mode="before")
     @classmethod
     def project_description(cls, value: Any) -> Any:
@@ -80,6 +102,9 @@ class DatasetDetail(BaseModel):
         return value
 
 
+#
+# Respuesta con el detalle completo de una fuente y sus datasets.
+#
 class SourceDetailResponse(SourceStateResponse):
     model_config = ConfigDict(populate_by_name=True)
     original_filename: str

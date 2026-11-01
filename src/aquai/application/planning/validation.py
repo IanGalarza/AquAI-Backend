@@ -27,9 +27,7 @@ _EQUALITY_OPERATORS = {"eq", "ieq", "in"}
 _RANGE_OPERATORS = {"lt", "le", "gt", "ge"}
 _NUMERIC_TYPES = {"BIGINT", "NUMERIC"}
 _TEMPORAL_TYPES = {"DATE", "TIMESTAMP"}
-# Orden de día y mes demostrado por una columna TEXT de períodos (None: no hay fechas D/M/AAAA ambiguas).
 _TEXT_PERIOD_KINDS = {None: "text", True: "text-dmy", False: "text-mdy"}
-# Palabras de una columna de fecha inventada («fecha», «anio», «date»), en singular.
 _DATE_WORDS = {"fecha", "date", "ano", "anio", "year", "mes", "month", "dia", "day"}
 _ISO_PARSERS = {"DATE": date.fromisoformat, "TIMESTAMP": datetime.fromisoformat}
 _COMBINE_OPERATIONS = {"join", "append"}
@@ -48,7 +46,6 @@ _AGGREGATE_FUNCTIONS = {
 }
 _PYTHON_ONLY_FUNCTIONS = {"median", "stddev", "quantile"}
 _COUNT_FUNCTIONS = {"count", "count_distinct"}
-# Una estadística pedida por su nombre puede calcularse con cualquiera de estas funciones.
 _STATISTIC_FUNCTIONS = {"count": _COUNT_FUNCTIONS}
 _EXTREME_FUNCTIONS = {"min", "max"}
 _AUTHORIZED_METADATA = (
@@ -62,15 +59,24 @@ _AUTHORIZED_METADATA = (
 )
 
 
+#
+# Lanza un error de validación del planificador si no se cumple la condición.
+#
 def _require(condition: bool, message: str) -> None:
     if not condition:
         raise PlannerValidationError(message)
 
 
+#
+# Indica si el campo es numérico elegible para cálculos.
+#
 def _is_numeric(field: OutputField) -> bool:
     return field.numeric_eligible and field.sql_type in _NUMERIC_TYPES
 
 
+#
+# Devuelve los valores de texto de los filtros de igualdad de un paso.
+#
 def _equality_text_values(step) -> set[str]:
     values = set()
 
@@ -81,15 +87,19 @@ def _equality_text_values(step) -> set[str]:
     return values
 
 
+#
+# Indica si el alcance conserva el valor pedido, directamente o por una resolución de valores.
+#
 def _keeps_value(scope, value) -> bool:
-    # Una resolución a valores almacenados («5Punta piedras») conserva la mención pedida.
     return any(
         item.casefold() == value.casefold() or contains_phrase(item, value) for item in scope
     )
 
 
+#
+# Valida que el plan conserve la recencia y los valores de filtro pedidos en sus salidas.
+#
 def validate_temporal_scope(operations, output_steps, *, require_latest=False, requested_values=()):
-    """El alcance temporal se revalida también antes de ejecutar y publicar."""
     steps = {step.id: step for step in operations}
     relevant = _reachable_step_ids(steps, output_steps)
     targets = [step for step in operations if step.id in relevant and step.operation == "latest"]
@@ -110,18 +120,16 @@ def validate_temporal_scope(operations, output_steps, *, require_latest=False, r
     if not requested_values or targets:
         return issues
 
-    # Sin recencia: cada salida publicada debe acotarse a alguno de los valores pedidos y
-    # cada valor pedido debe aparecer en alguna salida (p. ej., un sitio nuevo tras una aclaración).
     outputs = [(key, _output_scope(steps[key], steps)) for key in output_steps if key in steps]
     issues.extend(_unscoped_output_issues(outputs, requested_values))
 
     return issues
 
 
+#
+# Detecta los latest que la consulta no pidió y restringen el resultado a la última fecha.
+#
 def validate_unrequested_latest(operations, output_steps, *, follow_up=False) -> list[ValidationIssue]:
-    """Un latest que la consulta no pidió restringe el resultado a la última fecha sin que la respuesta lo diga:
-    un promedio pasa a ser el de un solo día. Publicado directamente se lee como «la medición más reciente», salvo
-    en un seguimiento de un resultado que no lo usaba («¿Y el pH?» después de un máximo), que cambia lo pedido."""
     steps = {step.id: step for step in operations}
     relevant = _reachable_step_ids(steps, output_steps)
     calculated = {
@@ -146,6 +154,9 @@ def validate_unrequested_latest(operations, output_steps, *, follow_up=False) ->
     ]
 
 
+#
+# Devuelve los pasos de los que dependen las salidas publicadas.
+#
 def _reachable_step_ids(steps, output_steps) -> set[str]:
     relevant, visit = set(), list(output_steps)
 
@@ -159,6 +170,9 @@ def _reachable_step_ids(steps, output_steps) -> set[str]:
     return relevant
 
 
+#
+# Devuelve los valores de texto que filtran un latest y sus dependencias.
+#
 def _latest_scope(target, steps) -> set[str]:
     values, visit = set(), [target]
 
@@ -170,6 +184,9 @@ def _latest_scope(target, steps) -> set[str]:
     return values
 
 
+#
+# Devuelve los valores de texto que filtran una salida y sus dependencias.
+#
 def _output_scope(output, steps) -> set[str]:
     values, visit, seen = set(), [output], set()
 
@@ -184,6 +201,9 @@ def _output_scope(output, steps) -> set[str]:
     return values
 
 
+#
+# Devuelve las incidencias de los latest que no conservan los valores de filtro pedidos.
+#
 def _unscoped_latest_issues(targets, scopes, requested_values) -> list[ValidationIssue]:
     issues = []
 
@@ -211,6 +231,9 @@ def _unscoped_latest_issues(targets, scopes, requested_values) -> list[Validatio
     return issues
 
 
+#
+# Devuelve las incidencias de las salidas que no se acotan a los valores de filtro pedidos.
+#
 def _unscoped_output_issues(outputs, requested_values) -> list[ValidationIssue]:
     issues = []
 
@@ -239,6 +262,9 @@ def _unscoped_output_issues(outputs, requested_values) -> list[ValidationIssue]:
     return issues
 
 
+#
+# Valida que umbrales, períodos, estadísticas, dimensiones, agrupación y gráfico pedidos lleguen a una salida.
+#
 def validate_requested_scope(
     operations,
     output_steps,
@@ -252,10 +278,6 @@ def validate_requested_scope(
     periods=(),
     dated_columns=None,
 ) -> list[ValidationIssue]:
-    """Cada umbral, período, estadística, dimensión, agrupación temporal y gráfico pedidos deben llegar a una salida
-    publicada; dated_columns son las columnas de fecha o año de los datasets (period_columns).
-
-    También se revalida antes de ejecutar: un plan que pierde un filtro pedido no responde la consulta."""
     steps = {step.id: step for step in operations}
     relevant = _reachable_step_ids(steps, output_steps)
     published = [step for step in operations if step.id in relevant]
@@ -278,17 +300,16 @@ def validate_requested_scope(
     if time_grain:
         issues.extend(_time_grain_issues(steps, output_steps, time_grain))
 
-    # Contar una categoría («cuántos sitios») no la enumera.
     if categories and "count" not in statistics:
         issues.extend(_dimension_issues(steps, output_steps, dimensions or {}))
 
     return issues
 
 
+#
+# Devuelve las columnas que ubican cada registro en el tiempo, con su clase.
+#
 def period_columns(datasets, text_periods=()) -> dict[tuple[UUID, str], str]:
-    """Columnas que ubican cada registro en el tiempo: fechas DATE/TIMESTAMP («date»), años numéricos («year») y
-    columnas TEXT cuyos valores nombran períodos verificados («text», «text-dmy» o «text-mdy» según el orden de día y
-    mes que demuestra la columna). Una columna TEXT sólo cuenta si se leyeron todos sus valores."""
     columns = {
         (dataset.dataset_id, column.sql_name): (
             "date" if column.sql_type in _TEMPORAL_TYPES else "year"
@@ -310,20 +331,23 @@ def period_columns(datasets, text_periods=()) -> dict[tuple[UUID, str], str]:
     return columns
 
 
+#
+# Devuelve el orden día/mes que implica una clase de columna de período TEXT.
+#
 def text_period_day_first(kind) -> bool | None:
     return {value: key for key, value in _TEXT_PERIOD_KINDS.items()}[kind]
 
 
 class _Applied(NamedTuple):
-    """Cómo acota su fecha una rama: extremos (None si queda abierto) y los períodos que nombran sus valores TEXT."""
-
     start: date | None
     end: date | None
     named: tuple = ()
 
 
+#
+# Devuelve el intervalo al que los filtros de una rama acotan su fecha o año.
+#
 def _applied_period(chain, steps, columns) -> _Applied | None:
-    """Intervalo al que los filtros de una rama acotan su fecha o su año; None si no la acotan."""
     return _period_of(
         (predicate, _period_kind(_filtered_field(step, predicate, steps), columns))
         for step in chain
@@ -331,8 +355,10 @@ def _applied_period(chain, steps, columns) -> _Applied | None:
     )
 
 
+#
+# Devuelve el período al que acotan unos filtros sobre columnas, antes de validar los pasos.
+#
 def filters_period(filters, columns) -> _Applied | None:
-    """Período al que acotan filtros sobre columnas, antes de validar los pasos: sirve para reparar un plan."""
     return _period_of(
         (predicate, columns.get((predicate.field.dataset_id, predicate.field.column)))
         for predicate in filters
@@ -340,10 +366,16 @@ def filters_period(filters, columns) -> _Applied | None:
     )
 
 
+#
+# Indica si el período aplicado coincide con el pedido.
+#
 def period_matches(applied, period) -> bool:
     return _bounds_period(applied, period)
 
 
+#
+# Combina los filtros de fecha, año o período TEXT en un intervalo aplicado.
+#
 def _period_of(pairs) -> _Applied | None:
     lower, upper, named = [], [], []
     for predicate, kind in pairs:
@@ -365,6 +397,9 @@ def _period_of(pairs) -> _Applied | None:
     return _Applied(max(lower) if lower else None, min(upper) if upper else None, tuple(named))
 
 
+#
+# Devuelve el campo de salida sobre el que actúa el filtro.
+#
 def _filtered_field(step, predicate, steps) -> OutputField | None:
     ref = predicate.field
     if isinstance(ref, ColumnRef):
@@ -374,6 +409,9 @@ def _filtered_field(step, predicate, steps) -> OutputField | None:
     return next((item for item in source.output_fields if item.name == ref.field), None)
 
 
+#
+# Devuelve la clase de período (fecha, año o texto) de un campo filtrado, si la tiene.
+#
 def _period_kind(field, columns) -> str | None:
     if field is None:
         return None
@@ -384,14 +422,15 @@ def _period_kind(field, columns) -> str | None:
 
     source = field.sources[0]
     kind = columns.get((source.dataset_id, source.column))
-    # Un entero que proviene de una fecha es su año agrupado (time_grain=year).
     if field.sql_type == "BIGINT":
         return "year" if kind else None
     return kind if field.sql_type == "TEXT" and kind and kind.startswith("text") else None
 
 
+#
+# Devuelve las cotas inferiores y superiores de días que admite un filtro.
+#
 def _predicate_bounds(predicate, kind) -> tuple[list[date], list[date]]:
-    """Días extremos que admite un filtro: «< 2022-01-01» termina el 31/12/2021 y «> 2020» empieza en 2021."""
     values = [
         parsed for value in predicate.values if (parsed := _period_value(value, kind)) is not None
     ]
@@ -412,9 +451,10 @@ def _predicate_bounds(predicate, kind) -> tuple[list[date], list[date]]:
     return bounds.get(predicate.operator, ([], []))
 
 
+#
+# Devuelve el primer y último día que nombra un valor de filtro según la clase de período.
+#
 def _period_value(value, kind) -> tuple[date, date] | None:
-    """Primer y último día que nombra un valor de filtro: un año entero, el día de una fecha o el período que nombra
-    un texto («3/2013», «10-11/2007»)."""
     if kind == "year":
         plausible = type(value) is int and 1000 <= value <= 9999
         return (date(value, 1, 1), date(value, 12, 31)) if plausible else None
@@ -432,10 +472,10 @@ def _period_value(value, kind) -> tuple[date, date] | None:
     return day, day
 
 
+#
+# Devuelve las incidencias de las salidas que no acotan su fecha exactamente al período pedido.
+#
 def _period_issues(steps, output_steps, periods, columns) -> list[ValidationIssue]:
-    """Como un umbral, cada salida debe acotar su fecha exactamente al período pedido; un extremo abierto («desde
-    2020») no admite otra cota. Con varios períodos cada salida acota uno de ellos y ninguno queda sin salida; si son
-    contiguos («2019 y 2020»), también vale una salida que los abarque juntos."""
     if not periods:
         return []
 
@@ -462,9 +502,10 @@ def _period_issues(steps, output_steps, periods, columns) -> list[ValidationIssu
     return issues
 
 
+#
+# Indica si el intervalo aplicado acota el período pedido.
+#
 def _bounds_period(applied, period) -> bool:
-    """Valores TEXT acotan el período si todos los períodos que nombran caen dentro de él (el Planner los elige
-    así); una fecha o un año, si sus cotas son exactamente las pedidas."""
     if applied is None:
         return False
     if applied.named:
@@ -480,8 +521,10 @@ def _bounds_period(applied, period) -> bool:
     return (applied.start, applied.end) == (period.start, period.end)
 
 
+#
+# Devuelve el período que abarca varios períodos cerrados y consecutivos.
+#
 def _contiguous_span(periods) -> list[RequestedPeriod]:
-    """Períodos cerrados y seguidos («2019 y 2020») también se responden juntos; separados («2019 y 2021»), no."""
     if len(periods) < 2 or any(period.start is None or period.end is None for period in periods):
         return []
 
@@ -493,6 +536,9 @@ def _contiguous_span(periods) -> list[RequestedPeriod]:
     return [RequestedPeriod(text=text, start=ordered[0].start, end=ordered[-1].end)]
 
 
+#
+# Construye la incidencia que indica que ninguna salida acota la fecha al período pedido.
+#
 def _missing_period(key, periods) -> ValidationIssue:
     requested = " o ".join(f"{period.text} ({_interval_text(period)})" for period in periods)
     target = f"la salida {key} no" if key is not None else "ninguna salida"
@@ -505,6 +551,9 @@ def _missing_period(key, periods) -> ValidationIssue:
     )
 
 
+#
+# Devuelve el texto descriptivo del intervalo de un período.
+#
 def _interval_text(period) -> str:
     if period.start is None:
         return f"hasta el {period.end.isoformat()}"
@@ -513,9 +562,10 @@ def _interval_text(period) -> str:
     return f"del {period.start.isoformat()} al {period.end.isoformat()}"
 
 
+#
+# Devuelve las incidencias de las salidas que no agrupan la fecha con el período temporal pedido.
+#
 def _time_grain_issues(steps, output_steps, time_grain) -> list[ValidationIssue]:
-    """«Promedio por mes»: cada salida que calcula debe agrupar una fecha por ese período; que otra rama lo haga no
-    alcanza. Sin cálculos (registros leídos), la agrupación no aplica a esa salida."""
     issues = []
     for key in output_steps:
         chain = [steps[item] for item in _reachable_step_ids(steps, [key])]
@@ -548,8 +598,10 @@ def _time_grain_issues(steps, output_steps, time_grain) -> list[ValidationIssue]
     return issues
 
 
+#
+# Devuelve las columnas no numéricas por las que se pregunta, por dataset.
+#
 def requested_dimensions(evidence, datasets) -> dict[UUID, set[str]]:
-    """Columnas no numéricas de lo que se pregunta («qué sitios»), por dataset."""
     types = {
         (dataset.dataset_id, column.sql_name): column.sql_type
         for dataset in datasets
@@ -571,8 +623,10 @@ def requested_dimensions(evidence, datasets) -> dict[UUID, set[str]]:
     return dimensions
 
 
+#
+# Devuelve las incidencias de las salidas que no conservan cada umbral pedido.
+#
 def _threshold_issues(steps, output_steps, thresholds) -> list[ValidationIssue]:
-    """Como los valores pedidos, cada salida publicada debe conservar cada umbral."""
     issues = []
 
     for key in output_steps:
@@ -583,6 +637,9 @@ def _threshold_issues(steps, output_steps, thresholds) -> list[ValidationIssue]:
     return issues
 
 
+#
+# Devuelve las incidencias de una salida que no aplica un umbral o lo filtra antes de calcular.
+#
 def _output_threshold_issues(key, chain, steps, threshold) -> list[ValidationIssue]:
     applied = [
         predicate
@@ -616,13 +673,18 @@ def _output_threshold_issues(key, chain, steps, threshold) -> list[ValidationIss
     return []
 
 
+#
+# Indica si un filtro aplica exactamente la comparación del umbral: mismo operador y valor.
+#
 def applies_threshold(predicate, threshold: RequestedThreshold) -> bool:
-    """El filtro aplica exactamente la comparación pedida: mismo operador y mismo número."""
     return predicate.operator == threshold.operator and any(
         type(value) in {int, float} and value == threshold.value for value in predicate.values
     )
 
 
+#
+# Indica si un filtro actúa sobre el resultado de un cálculo.
+#
 def _filters_calculation(predicate, steps) -> bool:
     ref = predicate.field
     if ref.kind != "result":
@@ -637,6 +699,9 @@ def _filters_calculation(predicate, steps) -> bool:
     )
 
 
+#
+# Devuelve las incidencias de las estadísticas pedidas que ninguna salida calcula.
+#
 def _statistic_issues(published, statistics) -> list[ValidationIssue]:
     computed = {calculation.function for step in published for calculation in step.calculations}
 
@@ -652,8 +717,10 @@ def _statistic_issues(published, statistics) -> list[ValidationIssue]:
     ]
 
 
+#
+# Devuelve las incidencias de las salidas que no muestran la categoría preguntada.
+#
 def _dimension_issues(steps, output_steps, dimensions) -> list[ValidationIssue]:
-    """La categoría preguntada debe verse en cada salida: su columna, si se identificó, o al menos varias filas."""
     issues = []
 
     for key in output_steps:
@@ -691,6 +758,9 @@ def _dimension_issues(steps, output_steps, dimensions) -> list[ValidationIssue]:
     return issues
 
 
+#
+# Indica si el paso es un aggregate sin agrupar, tras saltar los sort y latest.
+#
 def _is_ungrouped(step, steps) -> bool:
     while step.operation in _PASSTHROUGH_OPERATIONS and step.depends_on and step.depends_on[0] in steps:
         step = steps[step.depends_on[0]]
@@ -698,14 +768,19 @@ def _is_ungrouped(step, steps) -> bool:
     return step.operation == "aggregate" and not step.group_by
 
 
+#
+# Devuelve el paso cuyas filas publica una salida; un gráfico publica las de su entrada.
+#
 def _published_rows(step, steps):
-    """Un gráfico publica las filas de su entrada."""
     if step is not None and step.operation == "visualize" and step.depends_on:
         return steps.get(step.depends_on[0])
 
     return step
 
 
+#
+# Devuelve los datasets que leen un paso y sus dependencias.
+#
 def _read_datasets(step, steps) -> set[UUID]:
     datasets, visit = set(), [step] if step is not None else []
 
@@ -718,6 +793,9 @@ def _read_datasets(step, steps) -> set[UUID]:
     return datasets
 
 
+#
+# Indica si el paso expone alguna columna no numérica de las pedidas.
+#
 def _exposes(step, requested) -> bool:
     return any(
         not field.numeric_eligible
@@ -726,6 +804,9 @@ def _exposes(step, requested) -> bool:
     )
 
 
+#
+# Valida los datasets seleccionados por el modelo contra el catálogo verificado.
+#
 def validate_selections(
     decision: PlannerDecision, catalog: list[VerifiedDataset]
 ) -> list[SelectedDataset]:
@@ -747,8 +828,10 @@ def validate_selections(
     return result
 
 
+#
+# Construye el mensaje de rechazo que nombra las columnas inventadas y las parecidas reales.
+#
 def _invented_columns(dataset: VerifiedDataset, invented: list[str]) -> str:
-    """Rechazo que nombra las columnas inventadas y las reales más parecidas, para el reintento y la trazabilidad."""
     names = [column.sql_name for column in dataset.columns_metadata]
     similar = list(
         dict.fromkeys(match for name in invented for match in get_close_matches(name, names, n=3, cutoff=0.6))
@@ -763,10 +846,16 @@ def _invented_columns(dataset: VerifiedDataset, invented: list[str]) -> str:
     return message
 
 
+#
+# Indica si el nombre corresponde a una columna de fecha, año, mes o día.
+#
 def _names_date(name: str) -> bool:
     return bool(set(singular_words(name)) & _DATE_WORDS)
 
 
+#
+# Valida la versión y columnas de una selección y devuelve el dataset seleccionado.
+#
 def _selected_dataset(selection: DatasetSelection, dataset: VerifiedDataset) -> SelectedDataset:
     _require(
         selection.version == dataset.verified_version,
@@ -786,6 +875,9 @@ def _selected_dataset(selection: DatasetSelection, dataset: VerifiedDataset) -> 
     )
 
 
+#
+# Agrega a las columnas seleccionadas las columnas de origen de sus proyecciones numéricas.
+#
 def _with_projection_origins(selected: list[str], columns: dict) -> list[str]:
     names = list(selected)
 
@@ -802,6 +894,9 @@ def _with_projection_origins(selected: list[str], columns: dict) -> list[str]:
     return names
 
 
+#
+# Valida las operaciones de la decisión del planificador y devuelve los pasos e incidencias.
+#
 def validate_operations(
     decision: PlannerDecision, selected: list[SelectedDataset], temporal_text=()
 ) -> tuple[list[ValidatedStep], list[ValidationIssue]]:
@@ -809,6 +904,9 @@ def validate_operations(
 
 
 class _OperationValidator:
+    #
+    # Guarda la decisión, los datasets seleccionados y las columnas de períodos TEXT a validar.
+    #
     def __init__(self, decision: PlannerDecision, selected: list[SelectedDataset], temporal_text):
         self._decision = decision
         self._datasets = {dataset.dataset_id: dataset for dataset in selected}
@@ -820,6 +918,9 @@ class _OperationValidator:
         self._limited_steps: set[str] = set()
         self._issues: list[ValidationIssue] = []
 
+    #
+    # Valida cada paso del plan y devuelve los pasos validados con las incidencias.
+    #
     def validate(self) -> tuple[list[ValidatedStep], list[ValidationIssue]]:
         for step in self._decision.steps:
             self._check_dependencies(step)
@@ -839,11 +940,17 @@ class _OperationValidator:
 
         return list(self._steps.values()), self._issues
 
+    #
+    # Registra una incidencia de validación.
+    #
     def _issue(self, code, message, step_id, severity="clarification") -> None:
         self._issues.append(
             ValidationIssue(code=code, message=message, step_id=step_id, severity=severity)
         )
 
+    #
+    # Verifica que las dependencias del paso existan, sean únicas y precedan al paso.
+    #
     def _check_dependencies(self, step) -> None:
         _require(step.id not in self._steps, "Los identificadores de pasos deben ser únicos.")
         _require(len(set(step.depends_on)) == len(step.depends_on), "Un paso repite dependencias.")
@@ -852,6 +959,9 @@ class _OperationValidator:
             f"El plan contiene un ciclo o dependencia futura/inexistente: el paso {step.id} depende de {step.depends_on}.",
         )
 
+    #
+    # Registra la incidencia de una combinación de resultados, que no se puede garantizar.
+    #
     def _check_combination(self, step) -> None:
         _require(len(step.depends_on) >= 2, "Combinar requiere al menos dos resultados previos.")
 
@@ -865,6 +975,9 @@ class _OperationValidator:
             step.id,
         )
 
+    #
+    # Devuelve el campo de salida de una columna directa, que debe estar seleccionada.
+    #
     def _raw_field(self, ref: ColumnRef) -> OutputField:
         _require(
             ref.dataset_id in self._requested and ref.column in self._requested[ref.dataset_id],
@@ -885,6 +998,9 @@ class _OperationValidator:
             sources=[ref],
         )
 
+    #
+    # Devuelve el campo de salida al que apunta una referencia a una columna o a un resultado.
+    #
     def _resolve(self, step, ref) -> OutputField:
         if isinstance(ref, ColumnRef):
             _require(
@@ -906,6 +1022,9 @@ class _OperationValidator:
 
         return self._outputs[ref.step_id][ref.field]
 
+    #
+    # Devuelve los campos de salida de un paso según su operación.
+    #
     def _step_fields(self, step) -> list[OutputField]:
         _require(not step.join_on, "Las claves de unión sólo corresponden a join.")
         _require(
@@ -918,6 +1037,9 @@ class _OperationValidator:
 
         return self._dependent_fields(step)
 
+    #
+    # Valida un read y devuelve los campos de las columnas de un único dataset.
+    #
     def _read_fields(self, step) -> list[OutputField]:
         _require(
             step.tool == "sql" and not step.depends_on and bool(step.columns),
@@ -939,6 +1061,9 @@ class _OperationValidator:
 
         return [self._raw_field(ref) for ref in step.columns]
 
+    #
+    # Devuelve los campos de salida de un paso que depende de un resultado previo.
+    #
     def _dependent_fields(self, step) -> list[OutputField]:
         source = self._single_source(step)
         inherited = list(self._outputs[source].values())
@@ -963,6 +1088,9 @@ class _OperationValidator:
 
         return self._calculated_fields(step, source)
 
+    #
+    # Valida que el paso dependa de un único resultado previo y devuelve su identificador.
+    #
     def _single_source(self, step) -> str:
         _require(
             len(step.depends_on) == 1 and not step.columns,
@@ -984,6 +1112,9 @@ class _OperationValidator:
 
         return source
 
+    #
+    # Valida el gráfico: herramienta, ejes y serie, y avisa si representa una lectura limitada.
+    #
     def _check_visualization(self, step, source: str) -> None:
         _require(
             step.tool == "python"
@@ -1033,13 +1164,15 @@ class _OperationValidator:
                 "warning",
             )
 
+    #
+    # Valida un sort y avisa si ordena una única fila.
+    #
     def _check_sort(self, step, source: str) -> None:
         _require(
             not step.group_by and not step.calculations and bool(step.order_by),
             "sort sólo debe ordenar/filtrar/limitar un resultado previo.",
         )
 
-        # Filtrar una única fila (¿supera el umbral?) tiene sentido; ordenarla, no.
         if not step.filters and self._is_single_row(source):
             self._issue(
                 "degenerate_sort",
@@ -1049,6 +1182,9 @@ class _OperationValidator:
                 step.id,
             )
 
+    #
+    # Indica si el resultado de un paso es una única fila sin agrupar.
+    #
     def _is_single_row(self, key: str) -> bool:
         step = self._steps[key]
         while step.operation in _PASSTHROUGH_OPERATIONS and step.depends_on:
@@ -1056,6 +1192,9 @@ class _OperationValidator:
 
         return step.operation == "aggregate" and not step.group_by
 
+    #
+    # Valida que un latest use una fecha descendente real, sin límites que corten empates.
+    #
     def _check_latest(self, step, source: str) -> None:
         _require(
             not step.group_by
@@ -1080,15 +1219,19 @@ class _OperationValidator:
                 step.id,
             )
 
+    #
+    # Indica si el campo es una columna TEXT perfilada como períodos verificados.
+    #
     def _is_verified_period(self, field: OutputField) -> bool:
-        # Un TEXT sólo ordena si su columna fue perfilada como períodos explícitos;
-        # Python interpreta cada valor con las mismas reglas y descarta los ambiguos.
         return (
             field.sql_type == "TEXT"
             and len(field.sources) == 1
             and (field.sources[0].dataset_id, field.sources[0].column) in self._periods
         )
 
+    #
+    # Valida un cálculo y devuelve los campos de agrupación y de cálculo.
+    #
     def _calculated_fields(self, step, source: str) -> list[OutputField]:
         _require(
             bool(step.calculations),
@@ -1105,6 +1248,9 @@ class _OperationValidator:
 
         return fields
 
+    #
+    # Avisa si el cálculo reagrega una sola fila o depende de una lectura limitada.
+    #
     def _check_calculation_input(self, step, source: str) -> None:
         reaggregates_single_row = (
             step.operation == "aggregate"
@@ -1112,7 +1258,6 @@ class _OperationValidator:
             and not self._steps[source].group_by
         )
         if reaggregates_single_row:
-            # Agregar una única fila ya agregada (contarla, promediarla) no responde nada.
             self._issue(
                 "degenerate_aggregate",
                 f"El paso {step.id} vuelve a agregar el resultado de {source}, que ya es "
@@ -1127,6 +1272,9 @@ class _OperationValidator:
                 step.id,
             )
 
+    #
+    # Valida que un calculate no tenga agrupaciones ni mezcle correlación con otros cálculos.
+    #
     def _check_scalar_calculation(self, step) -> None:
         _require(not step.group_by, "calculate no admite agrupaciones implícitas.")
 
@@ -1136,6 +1284,9 @@ class _OperationValidator:
             "No mezclar una correlación escalar con cálculos por registro.",
         )
 
+    #
+    # Devuelve el campo de salida de una agrupación, ajustando su tipo si es temporal.
+    #
     def _grouping_field(self, step, grouping) -> OutputField:
         _require(step.operation == "aggregate", "Las agrupaciones pertenecen a aggregate.")
         field = self._resolve(step, grouping.field).model_copy(deep=True)
@@ -1156,6 +1307,9 @@ class _OperationValidator:
 
         return field
 
+    #
+    # Valida un cálculo y devuelve el campo de salida con su tipo y unidad.
+    #
     def _calculation_field(self, step, calculation) -> OutputField:
         function = calculation.function
         _require(
@@ -1181,6 +1335,9 @@ class _OperationValidator:
             sources=list({(ref.dataset_id, ref.column): ref for ref in refs}.values()),
         )
 
+    #
+    # Devuelve el tipo, la unidad y su estado del resultado de una función de cálculo.
+    #
     def _calculation_result(self, step, function: str, operands: list[OutputField]):
         if function in _COUNT_FUNCTIONS:
             return "BIGINT", None, "dimensionless"
@@ -1205,6 +1362,9 @@ class _OperationValidator:
 
         return sql_type, unit, unit_status
 
+    #
+    # Avisa si algún operando del cálculo no es numérico elegible.
+    #
     def _check_operands_eligible(self, step, function: str, operands: list[OutputField]) -> None:
         for operand in operands:
             temporal_extreme = (
@@ -1218,6 +1378,9 @@ class _OperationValidator:
                 step.id,
             )
 
+    #
+    # Devuelve la unidad comparable de un campo según su nombre original y su unidad.
+    #
     def _comparable(self, field: OutputField) -> tuple[str, str | None]:
         source = field.sources[0] if len(field.sources) == 1 else None
         dataset = self._datasets.get(source.dataset_id) if source else None
@@ -1226,9 +1389,10 @@ class _OperationValidator:
         ) if dataset else None
         return comparable_unit(column.original_name if column else field.name, field.unit)
 
+    #
+    # Avisa si los operandos no tienen unidades comparables documentadas.
+    #
     def _check_comparable_units(self, step, operands: list[OutputField]) -> None:
-        # La misma unidad con otra grafía («mg/L» y «mg L-1») es comparable si también lo es su base química (mg N/L
-        # y mg/L sin base no lo son); no se convierte entre unidades.
         compatible = (
             operands[0].unit is not None
             and operands[1].unit is not None
@@ -1243,6 +1407,9 @@ class _OperationValidator:
                 step.id,
             )
 
+    #
+    # Valida los filtros de un paso: operadores, tipos de campo y valores.
+    #
     def _check_filters(self, step) -> None:
         self._check_contradictory_filters(step)
 
@@ -1263,6 +1430,9 @@ class _OperationValidator:
             for value in predicate.values:
                 _check_filter_value(field, value)
 
+    #
+    # Avisa si un paso exige valores incompatibles en el mismo campo.
+    #
     def _check_contradictory_filters(self, step) -> None:
         equalities = {}
 
@@ -1283,6 +1453,9 @@ class _OperationValidator:
 
             equalities[key] = equalities.get(key, values) & values or values
 
+    #
+    # Valida que el orden no combine un límite de una fila con fechas.
+    #
     def _check_ordering(self, step) -> None:
         for ordering in step.order_by:
             field = self._resolve(step, ordering.field)
@@ -1291,6 +1464,9 @@ class _OperationValidator:
                 "Un límite de una fila sobre fechas puede elegir arbitrariamente un empate; usá latest para conservar todas las mediciones.",
             )
 
+    #
+    # Valida que un límite no recorte las mediciones empatadas de un latest.
+    #
     def _check_limit(self, step) -> None:
         if step.limit is None:
             return
@@ -1304,6 +1480,9 @@ class _OperationValidator:
             )
             ancestors.extend(ancestor.depends_on)
 
+    #
+    # Registra los campos de salida de un paso y marca si queda limitado.
+    #
     def _register(self, step, fields: list[OutputField]) -> None:
         _require(
             len({field.name for field in fields}) == len(fields),
@@ -1317,6 +1496,9 @@ class _OperationValidator:
         if step.limit is not None or inherits_limit:
             self._limited_steps.add(step.id)
 
+    #
+    # Valida que las salidas finales existan, no se repitan y usen todos los datasets.
+    #
     def _check_plan_outputs(self) -> None:
         output_steps = self._decision.output_steps
         _require(
@@ -1333,6 +1515,9 @@ class _OperationValidator:
         )
 
 
+#
+# Valida que el valor de un filtro corresponda al tipo del campo.
+#
 def _check_filter_value(field: OutputField, value) -> None:
     if field.sql_type in _NUMERIC_TYPES:
         _require(type(value) in {int, float}, "Un filtro numérico requiere constantes numéricas.")
@@ -1354,8 +1539,10 @@ def _check_filter_value(field: OutputField, value) -> None:
         raise PlannerValidationError("El filtro temporal no usa una fecha ISO completa.") from error
 
 
+#
+# Revalida un plan antes de ejecutarlo contra un catálogo fresco y devuelve datasets y pasos.
+#
 def validate_execution_plan(plan: PlanningResult, catalog: list[VerifiedDataset]):
-    """Reutiliza las verificaciones del Planner con un catálogo fresco y confiable."""
     _require_execution_authorized(plan)
 
     decision = _revalidation_decision(plan)
@@ -1401,6 +1588,9 @@ def validate_execution_plan(plan: PlanningResult, catalog: list[VerifiedDataset]
     return selected, operations
 
 
+#
+# Verifica que el plan esté autorizado para ejecutarse y sin aclaraciones pendientes.
+#
 def _require_execution_authorized(plan: PlanningResult) -> None:
     authorized = plan.status == "plannable" and not any(
         issue.severity == "clarification" for issue in plan.validation_issues
@@ -1408,6 +1598,9 @@ def _require_execution_authorized(plan: PlanningResult) -> None:
     _require(authorized, "El plan no está autorizado para ejecución.")
 
 
+#
+# Reconstruye la decisión del planificador a partir de un plan para revalidarlo.
+#
 def _revalidation_decision(plan: PlanningResult) -> PlannableDecision:
     return PlannableDecision(
         status="plannable",
@@ -1418,6 +1611,9 @@ def _revalidation_decision(plan: PlanningResult) -> PlannableDecision:
     )
 
 
+#
+# Reconstruye la selección de un dataset a partir del dataset seleccionado.
+#
 def _dataset_selection(dataset: SelectedDataset) -> DatasetSelection:
     return DatasetSelection(
         dataset_id=dataset.dataset_id,
@@ -1427,6 +1623,9 @@ def _dataset_selection(dataset: SelectedDataset) -> DatasetSelection:
     )
 
 
+#
+# Verifica que los metadatos autorizados de los datasets no hayan cambiado.
+#
 def _require_unchanged_metadata(proposed_datasets, actual_datasets) -> None:
     for proposed, actual in zip(proposed_datasets, actual_datasets, strict=True):
         changed = any(
@@ -1435,14 +1634,23 @@ def _require_unchanged_metadata(proposed_datasets, actual_datasets) -> None:
         _require(not changed, "Los metadatos autorizados cambiaron; hay que volver a planificar.")
 
 
+#
+# Indica si la evidencia exige seleccionar la medición más reciente.
+#
 def _latest_required(evidence) -> bool:
     return evidence.get("temporal_requirements", {}).get("operation") == "latest"
 
 
+#
+# Devuelve los valores de filtro pedidos en las menciones de la evidencia.
+#
 def _requested_values(evidence) -> list[str]:
     return [item["text"] for item in evidence.get("query_mentions", []) if item["kind"] == "value"]
 
 
+#
+# Indica si la evidencia muestra que se pregunta por categorías.
+#
 def _asks_categories(evidence) -> bool:
     observed = evidence.get("observed_evidence", [])
     return any(item["kind"] == "dimension" for item in evidence.get("query_mentions", [])) or any(
@@ -1450,6 +1658,9 @@ def _asks_categories(evidence) -> bool:
     )
 
 
+#
+# Devuelve los períodos pedidos guardados en la evidencia.
+#
 def _requested_periods(evidence) -> list[RequestedPeriod]:
     return [
         RequestedPeriod.model_validate(item, strict=False)
@@ -1457,6 +1668,9 @@ def _requested_periods(evidence) -> list[RequestedPeriod]:
     ]
 
 
+#
+# Devuelve los umbrales pedidos guardados en la evidencia.
+#
 def _requested_thresholds(evidence) -> list[RequestedThreshold]:
     return [
         RequestedThreshold.model_validate(item) for item in evidence.get("requested_thresholds", [])

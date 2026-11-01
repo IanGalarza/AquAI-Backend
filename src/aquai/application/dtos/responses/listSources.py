@@ -5,6 +5,9 @@ from pydantic import BaseModel, Field
 from aquai.application.dtos.responses.sourceState import SourceStateResponse
 
 
+#
+# Elemento de la lista de fuentes con sus datos básicos y cantidad de datasets.
+#
 class SourceListItem(SourceStateResponse):
     name: str
     file_type: str
@@ -14,6 +17,9 @@ class SourceListItem(SourceStateResponse):
     dataset_count: int = Field(default=0, ge=0)
 
 
+#
+# Respuesta paginada con la lista de fuentes.
+#
 class SourceListResponse(BaseModel):
     items: list[SourceListItem]
     total: int = Field(ge=0)

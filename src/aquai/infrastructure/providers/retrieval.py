@@ -6,6 +6,9 @@ from aquai.infrastructure.providers.tabular import get_tabular_settings
 from aquai.infrastructure.queries.sources import SqlAlchemySourceQueries
 
 
+#
+# Crea el servicio que recupera datasets mediante el índice semántico y las consultas de fuentes.
+#
 def create_dataset_retriever() -> RetrieveDatasetsService:
     initialize_application()
     queries = SqlAlchemySourceQueries(get_db_context())

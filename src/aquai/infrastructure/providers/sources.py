@@ -37,6 +37,9 @@ class SourceRuntime:
     worker: SourceWorker
 
 
+#
+# Ensambla los manejadores de fuentes y el worker a partir de sus dependencias.
+#
 def build_source_runtime(
     commands: SourceCommands,
     queries: SourceQueries,
@@ -65,6 +68,9 @@ def build_source_runtime(
     )
 
 
+#
+# Crea el entorno de ejecución de fuentes con el procesador, Ollama, Qdrant y la base de datos.
+#
 def create_source_runtime() -> SourceRuntime:
     from aquai.infrastructure.processing.tabular.processor import SimpleTabularProcessor
     from aquai.infrastructure.providers.llm.ollama import (

@@ -1,19 +1,22 @@
-"""Acota el multipart antes de que el parser escriba archivos temporales."""
-
 from collections.abc import Callable
 
 from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
 
-# El archivo tiene su propio límite; el sobre multipart admite 64 KiB.
 MULTIPART_ENVELOPE_BYTES = 65536
 
 
 class SourceUploadSizeLimit:
+    #
+    # Guarda la aplicación envuelta y la función que da el tamaño máximo de carga.
+    #
     def __init__(self, app: ASGIApp, max_upload_bytes: Callable[[], int | None]) -> None:
         self.app = app
         self.max_upload_bytes = max_upload_bytes
 
+    #
+    # Rechaza con 413 las cargas de fuentes que superan el tamaño máximo antes de procesarlas.
+    #
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if not _is_source_upload(scope):
             await self.app(scope, receive, send)
@@ -49,6 +52,9 @@ class SourceUploadSizeLimit:
         await self.app(scope, _replaying(body, receive), send)
 
 
+#
+# Indica si la solicitud es una carga de fuente (POST /sources).
+#
 def _is_source_upload(scope: Scope) -> bool:
     return (
         scope["type"] == "http"
@@ -57,6 +63,9 @@ def _is_source_upload(scope: Scope) -> bool:
     )
 
 
+#
+# Construye la respuesta 413 que indica que el archivo supera el tamaño máximo.
+#
 def _too_large_response() -> JSONResponse:
     return JSONResponse(
         status_code=413,
@@ -64,6 +73,9 @@ def _too_large_response() -> JSONResponse:
     )
 
 
+#
+# Devuelve una función de recepción que reentrega el cuerpo ya leído a la aplicación.
+#
 def _replaying(body: bytes, receive: Receive) -> Receive:
     delivered = False
 

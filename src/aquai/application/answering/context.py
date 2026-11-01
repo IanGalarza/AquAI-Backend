@@ -60,6 +60,9 @@ _ENGLISH_RELATIONS = {
 }
 
 
+#
+# Devuelve el idioma de la respuesta: el preferido o el que se deduce de la pregunta.
+#
 def response_language(question, preferred=None):
     if preferred is not None:
         return preferred
@@ -71,11 +74,17 @@ def response_language(question, preferred=None):
     return "en" if english > spanish else "es"
 
 
+#
+# Construye el contexto de evidencia y oraciones con que se redacta la respuesta.
+#
 def build_response_context(state, budget_bytes, max_preview_rows=3, max_sentences=24):
     return _ContextBuilder(state, budget_bytes, max_preview_rows, max_sentences).build()
 
 
 class _ContextBuilder:
+    #
+    # Guarda el estado, el presupuesto y los datos del plan que usa el constructor.
+    #
     def __init__(self, state, budget_bytes, max_preview_rows, max_sentences):
         plan = state.planning
         self._state = state
@@ -102,12 +111,14 @@ class _ContextBuilder:
 
         self._catalog = []
         self._body = self._initial_body()
-        # Identificadores únicos aunque luego se retiren las referencias genéricas de tablas descritas.
         self._sentence_ids = counter(1)
         self._summaries = {}
         self._omitted = {}
         self._meanings = {}
 
+    #
+    # Arma el contexto completo de la respuesta y lo devuelve junto con el idioma.
+    #
     def build(self):
         self._add_references()
         if self._period:
@@ -121,8 +132,10 @@ class _ContextBuilder:
 
         return self._finish()
 
+    #
+    # Agrega las oraciones que responden con el período de cada resultado.
+    #
     def _add_period_sentences(self):
-        """«¿Y de qué año es?» se contesta con el período de cada resultado, sin repetir sus párrafos."""
         periods = self._state.planning.temporal_text_columns
         for evidence in self._validation.usable_evidence:
             if evidence.kind != "table":
@@ -130,7 +143,7 @@ class _ContextBuilder:
 
             summary = self._summaries.get(evidence.evidence_id)
             if not evidence.is_requested_output:
-                self._catalog.remove(summary)  # Los pasos intermedios no tienen un período propio.
+                self._catalog.remove(summary)
                 continue
 
             step = self._steps[evidence.operation_id]
@@ -150,6 +163,9 @@ class _ContextBuilder:
                 text = self._writer.period_answer(rows, dated, self._period)
             self._drop_summary(evidence, self._add(evidence, text, attach=True, required=True))
 
+    #
+    # Crea el cuerpo inicial del contexto con pregunta, fuentes, avisos y filtros.
+    #
     def _initial_body(self):
         state = self._state
         validation = self._validation
@@ -191,14 +207,22 @@ class _ContextBuilder:
             ],
         }
 
+    #
+    # Devuelve el cuerpo del contexto serializado como JSON en bytes.
+    #
     def _serialized(self):
         return json.dumps(self._body, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
+    #
+    # Indica si el contexto serializado supera el presupuesto de bytes.
+    #
     def _over_budget(self):
         return len(self._serialized()) > self._budget_bytes
 
+    #
+    # Agrega una oración al catálogo si respeta el tope y el presupuesto, salvo que sea obligatoria.
+    #
     def _add(self, evidence, text, *, kind="result", attach=False, required=False, attribute=True):
-        # Alcances y referencias obligatorias nunca se descartan por el tope ni por el presupuesto.
         if not required and len(self._catalog) >= self._max_sentences:
             return None
 
@@ -222,8 +246,10 @@ class _ContextBuilder:
 
         return entry
 
+    #
+    # Agrega una referencia resumida por cada evidencia autorizada.
+    #
     def _add_references(self):
-        """Todas las ramas autorizadas tienen una referencia aunque no quepan sus enunciados."""
         for evidence in self._validation.usable_evidence:
             if evidence.kind == "visualization":
                 self._add_chart(evidence)
@@ -234,6 +260,9 @@ class _ContextBuilder:
                 evidence, summary, kind="summary", attach=True, required=True
             )
 
+    #
+    # Agrega la oración que describe un gráfico, con su límite y filas excluidas.
+    #
     def _add_chart(self, evidence):
         chart = next(
             item
@@ -252,8 +281,10 @@ class _ContextBuilder:
             required=True,
         )
 
+    #
+    # Agrega las oraciones de las tablas, primero los resultados derivados y luego las lecturas.
+    #
     def _add_table_sentences(self):
-        # Mismo orden que la respuesta: los resultados derivados antes que las filas leídas que los respaldan.
         ordered = sorted(
             self._validation.usable_evidence,
             key=lambda item: self._steps[item.operation_id].operation == "read",
@@ -262,6 +293,9 @@ class _ContextBuilder:
             if evidence.kind == "table":
                 self._add_table(evidence)
 
+    #
+    # Agrega las oraciones de una tabla: alcance, resultado, definiciones y detalles.
+    #
     def _add_table(self, evidence):
         step = self._steps[evidence.operation_id]
         chain = _lineage(step, self._steps)
@@ -285,6 +319,9 @@ class _ContextBuilder:
         self._collect_meanings(origin, rows, evidence)
         self._add_details(evidence, record, origin, fields)
 
+    #
+    # Elige y redacta la oración que describe el resultado de una tabla.
+    #
     def _table_sentence(self, evidence, record, rows, fields, origin, latest, ranking, chain):
         writer = self._writer
         calculations = {item.output_name: item for item in origin.calculations}
@@ -299,7 +336,6 @@ class _ContextBuilder:
             return writer.empty(evidence), False
 
         if latest and len(numeric) == 1:
-            # Muchos registros empatados en la fecha más reciente se resumen; nunca se omite que lo son.
             date_field = fields[latest.order_by[0].field.field]
             return writer.latest(
                 rows, numeric[0], date_field, fields, latest, chain, self._max_preview_rows
@@ -316,33 +352,45 @@ class _ContextBuilder:
             rows, fields, calculations, grouping, direction, self._max_preview_rows, chain
         )
 
+    #
+    # Quita el resumen genérico de una evidencia cuando ya tiene una oración propia.
+    #
     def _drop_summary(self, evidence, entry):
         summary = self._summaries.get(evidence.evidence_id)
         if entry is not None and summary in self._catalog:
             self._catalog.remove(summary)
 
+    #
+    # Registra el significado de las estadísticas que produjeron algún valor.
+    #
     def _collect_meanings(self, origin, rows, evidence):
-        # Una estadística sólo se define si produjo algún valor; se explica junto al primer resultado que la usa.
         for calculation in origin.calculations:
             meaning = self._writer.meaning(calculation)
             if meaning and _has_value(rows, calculation.output_name):
                 self._meanings.setdefault(meaning, evidence)
 
+    #
+    # Agrega los detalles de columnas numéricas derivadas y de filas excluidas.
+    #
     def _add_details(self, evidence, record, origin, fields):
         projections = self._writer.projections(record)
         exclusions = self._writer.exclusions(record, origin, fields)
         for detail in [*projections, *exclusions]:
             self._add(evidence, detail, kind="detail")
 
+    #
+    # Agrega al final las definiciones de las estadísticas usadas, si queda lugar.
+    #
     def _add_meanings(self):
-        # Las definiciones son contexto: entran al final y sólo si queda lugar, sin desplazar resultados ni exclusiones.
         for meaning, evidence in self._meanings.items():
             self._add(evidence, meaning, kind="meaning")
 
+    #
+    # Cierra el contexto: recorta el historial al presupuesto y calcula su huella.
+    #
     def _finish(self):
         self._body["omitted_rows"] = self._omitted
 
-        # El historial es contexto lingüístico opcional, nunca sustituye evidencia.
         history = self._body["conversation_context"]
         while history and self._over_budget():
             history.pop(0)
@@ -360,6 +408,9 @@ class _ContextBuilder:
 
 
 class _Writer:
+    #
+    # Guarda las fuentes, los pasos y el idioma con que se redactan las oraciones.
+    #
     def __init__(self, sources, steps, language, temporal, periods=()):
         self._sources = sources
         self._steps = steps
@@ -369,12 +420,18 @@ class _Writer:
         self.es = language == "es"
         self.names = FieldNames(steps, self.column, language)
 
+    #
+    # Devuelve la etiqueta legible de un campo.
+    #
     def label(self, field):
         source = _single_source(field)
         label = self.column(*source) if source else None
 
         return label or humanize(field.name)
 
+    #
+    # Devuelve la etiqueta de una columna de un dataset, o None si no existe.
+    #
     def column(self, dataset_id, sql_name):
         dataset = self._sources.get(dataset_id)
         column = _column_metadata(dataset, sql_name) if dataset else None
@@ -385,6 +442,9 @@ class _Writer:
 
         return label if len(label) <= _MAX_LABEL_LENGTH else column.sql_name
 
+    #
+    # Devuelve un valor formateado para el texto, con opción de conservarlo exacto.
+    #
     def value(self, value, *, exact=False):
         if value is None:
             return "sin dato" if self.es else "no value"
@@ -395,17 +455,22 @@ class _Writer:
         if not isinstance(value, (Decimal, int, float)):
             return str(value)
         if exact:
-            # Los umbrales definen el alcance exacto: > 7,149 no es > 7,15.
             return str(value).replace(".", ",") if self.es else str(value)
 
         return format_number(value, self.language)
 
+    #
+    # Devuelve «sí» o «no» (o «yes»/«no») para un valor booleano.
+    #
     def _yes_no(self, value):
         if self.es:
             return "sí" if value else "no"
 
         return "yes" if value else "no"
 
+    #
+    # Devuelve un valor con la unidad documentada de su campo.
+    #
     def measure(self, field, value):
         shown = self.value(value)
         if value is None:
@@ -413,12 +478,21 @@ class _Writer:
 
         return shown + unit_suffix(field, self.language)
 
+    #
+    # Devuelve una cantidad con su sustantivo en singular o plural.
+    #
     def count(self, total, singular, plural):
         return count_text(total, singular, plural, self.language)
 
+    #
+    # Devuelve el nombre de un cálculo precedido por su artículo.
+    #
     def subject(self, calculation):
         return with_article(*self.names.calculation(calculation), self.language)
 
+    #
+    # Devuelve la fecha o el período de un valor con su precisión, o None si no es temporal.
+    #
     def when(self, field, value, *, temporal=False):
         if isinstance(value, date):
             return date_text(value, self.language), "day"
@@ -430,8 +504,10 @@ class _Writer:
 
         return period(value, self.language, self._temporal.get(key))
 
+    #
+    # Devuelve el complemento que ubica un valor: lugar, fecha u otra categoría.
+    #
     def attribute(self, field, value):
-        """Lugar, fecha u otra categoría que ubica un valor: en Punta Lara, el 12/03/2008."""
         label = self.label(field)
 
         moment = self.when(field, value)
@@ -444,12 +520,21 @@ class _Writer:
 
         return f"con {label} {shown}" if self.es else f"with {label} {shown}"
 
+    #
+    # Devuelve el complemento «en» seguido de los lugares indicados.
+    #
     def _located(self, places):
         return ("en " if self.es else "in ") + places
 
+    #
+    # Devuelve un valor tal como se muestra: texto tal cual o medida formateada.
+    #
     def _displayed(self, field, value):
         return value if isinstance(value, str) else self.measure(field, value)
 
+    #
+    # Devuelve los atributos de una fila que la ubican, separados por comas.
+    #
     def context(self, row, fields, skip):
         attributes = [
             self.attribute(field, row[name])
@@ -459,8 +544,10 @@ class _Writer:
 
         return ", ".join(attributes)
 
+    #
+    # Devuelve el complemento que describe el grupo de una fila según su agrupación.
+    #
     def scope(self, spec, field, value):
-        """Complemento de un grupo: en Punta Lara, en 2008, con Especie Microcystis aeruginosa."""
         if value is None:
             label = self.label(field)
             return f"sin dato de {label}" if self.es else f"without a {label} value"
@@ -469,11 +556,17 @@ class _Writer:
 
         return self.attribute(field, value)
 
+    #
+    # Devuelve el complemento que describe todas las agrupaciones de una fila.
+    #
     def group_scope(self, grouping, fields, row):
         scopes = [self.scope(spec, fields[name], row[name]) for name, spec in grouping.items()]
 
         return join_words(scopes, self.language)
 
+    #
+    # Devuelve el par «etiqueta valor» de un campo, o su ausencia de dato.
+    #
     def pair(self, field, value):
         label = self.label(field)
         if value is None:
@@ -485,12 +578,17 @@ class _Writer:
 
         return f"{label} {self._displayed(field, value)}"
 
+    #
+    # Antepone el nombre del archivo a una oración cuando hay varias fuentes.
+    #
     def attributed(self, evidence, text):
-        """Con varias fuentes, cada resultado nombra la suya para no atribuirle un valor a otra."""
         preposition = "En" if self.es else "In"
 
         return f"{preposition} {self.files(evidence)}, {_lowercase_first(text)}"
 
+    #
+    # Devuelve el nombre de los archivos de una evidencia con su artículo.
+    #
     def files(self, evidence):
         names = _unique(self._file_name(key) for key in evidence.dataset_ids)
         single = len(names) == 1
@@ -499,8 +597,10 @@ class _Writer:
 
         return ("the file " if single else "the files ") + join_words(names, "en")
 
+    #
+    # Devuelve el nombre del archivo, con la hoja si otra tabla del mismo archivo participa.
+    #
     def _file_name(self, dataset_id):
-        """El archivo; con la hoja si otra tabla del mismo archivo también participa del resultado."""
         dataset = self._sources[dataset_id]
         source = dataset.provenance.source_name
         siblings = [item for item in self._sources.values() if item.provenance.source_name == source]
@@ -510,6 +610,9 @@ class _Writer:
         sheet = "hoja" if self.es else "sheet"
         return f"{file_stem(source)} ({sheet} {dataset_label(dataset.name)})"
 
+    #
+    # Devuelve la introducción que avisa que hay resultados en varios archivos.
+    #
     def introduction(self, files):
         if self.es:
             return (
@@ -522,11 +625,17 @@ class _Writer:
             "so I show the result of each one separately."
         )
 
+    #
+    # Devuelve la definición de la estadística usada en un cálculo.
+    #
     def meaning(self, calculation):
         return calculation_meaning(
             calculation.function, self.language, quantile=calculation.quantile
         )
 
+    #
+    # Devuelve el resumen genérico que remite a la tabla de resultados.
+    #
     def summary(self, rows):
         if self.es:
             if rows == 1:
@@ -540,12 +649,18 @@ class _Writer:
             return "I found one result; you can see it in the table."
         return f"I found {self.count(rows, 'result', 'results')}; you can see them in the table."
 
+    #
+    # Devuelve el aviso de que no hay registros que cumplan los criterios.
+    #
     def empty(self, evidence):
         if self.es:
             return f"No encontré registros que cumplan esos criterios en {self.files(evidence)}."
 
         return f"No records match those criteria in {self.files(evidence)}."
 
+    #
+    # Describe un gráfico, con la nota de límite y de filas excluidas si corresponde.
+    #
     def chart(self, chart, limit):
         rows = chart.input_rows
         excluded = chart.excluded_rows
@@ -558,6 +673,9 @@ class _Writer:
 
         return text
 
+    #
+    # Devuelve la descripción de un gráfico según su tipo.
+    #
     def _chart_description(self, chart_type, rows, excluded):
         if self.es:
             shown = (
@@ -590,6 +708,9 @@ class _Writer:
 
         return descriptions[chart_type]
 
+    #
+    # Devuelve la nota de que la consulta se limitó a cierta cantidad de resultados.
+    #
     def _limit_note(self, limit):
         if self.es:
             return (
@@ -602,6 +723,9 @@ class _Writer:
             "so it does not include every record."
         )
 
+    #
+    # Devuelve la nota de registros sin datos válidos que quedaron fuera del gráfico.
+    #
     def _excluded_note(self, excluded):
         single = excluded == 1
         if self.es:
@@ -621,10 +745,10 @@ class _Writer:
             "missing values were not replaced with zero."
         )
 
+    #
+    # Devuelve los filtros que acotan el resultado y que la oración no muestra aún.
+    #
     def qualifier(self, chain, shown=frozenset()):
-        """Filtros que acotan el resultado y la oración no muestra: en Punta Lara, con Turbidez mayor que 10 NTU.
-
-        Que un registro tenga dato de la variable medida es obvio para el lector y no se repite."""
         parts = []
         periods = self._date_periods(chain)
         for ancestor in reversed(chain):
@@ -643,10 +767,10 @@ class _Writer:
 
         return (" " + ", ".join(parts)) if parts else ""
 
+    #
+    # Agrupa las cotas de cada fecha filtrada y las expresa como período.
+    #
     def _date_periods(self, chain):
-        """Las cotas de una misma fecha se dicen juntas, como período: «en 2021», «del 01/03/2021 al 15/04/2021»,
-        «desde 2020». También un año numérico («Año igual a 2021» → «en 2021») y los valores de una fecha guardada
-        como texto, que se nombran con el período pedido que los contiene («en 2013»)."""
         bounds = {}
         for ancestor in chain:
             for predicate in ancestor.filters:
@@ -662,9 +786,10 @@ class _Writer:
 
         return {key: self._date_period(low, high) for key, (low, high) in bounds.items()}
 
+    #
+    # Devuelve el primer y último día que admite un filtro de fecha, año o fecha en texto.
+    #
     def _period_bounds(self, predicate, field):
-        """Primer y último día que admite un filtro sobre una fecha, un año o una fecha TEXT; None en un extremo
-        abierto. Una igualdad sobre una fecha DATE se dice como valor, no como período."""
         kind = self._period_kind(field)
         operator = predicate.operator
         if kind is None or (kind == "date" and operator not in _RANGE_OPERATORS):
@@ -690,6 +815,9 @@ class _Writer:
         }
         return bounds.get(operator)
 
+    #
+    # Devuelve el tipo de período de un campo: fecha, texto o año, o None.
+    #
     def _period_kind(self, field):
         if field.sql_type in _DATE_TYPES:
             return "date"
@@ -702,6 +830,9 @@ class _Writer:
             return "year"
         return None
 
+    #
+    # Devuelve el primer y último día de un valor de año o de fecha.
+    #
     @staticmethod
     def _period_days(value, kind):
         if kind == "year":
@@ -710,14 +841,18 @@ class _Writer:
         moment = _iso_date(value)
         return (moment, moment) if moment else None
 
+    #
+    # Devuelve el período pedido que contiene los valores de texto filtrados, si existe.
+    #
     def _requested_span(self, low, high):
-        """El período pedido que contiene los valores TEXT filtrados; sin uno, no se dicen como período (dos valores
-        sueltos no son un intervalo)."""
         for start, end in self._periods:
             if (start is None or start <= low) and (end is None or high <= end):
                 return start, end
         return None
 
+    #
+    # Redacta un período a partir de sus extremos, abierto o cerrado.
+    #
     def _date_period(self, low, high):
         if high is None:
             return ("desde " if self.es else "from ") + self._period_bound(low, first=True)
@@ -739,14 +874,19 @@ class _Writer:
         first, last = date_text(low, self.language), date_text(high, self.language)
         return f"del {first} al {last}" if self.es else f"from {first} to {last}"
 
+    #
+    # Redacta un extremo de un período abierto.
+    #
     def _period_bound(self, day, first):
-        """Un extremo abierto: «desde 2020», «hasta marzo de 2021», «desde el 05/03/2021»."""
         if (day.month, day.day) == ((1, 1) if first else (12, 31)):
             return str(day.year)
         if (day.day == 1) if first else ((day + timedelta(days=1)).day == 1):
             return grain(day, "month", self.language)[0]
         return ("el " if self.es else "") + date_text(day, self.language)
 
+    #
+    # Redacta la restricción que impone un filtro sobre una columna.
+    #
     def _restriction(self, predicate, ancestor):
         ref = predicate.field
         label = self.names.column(ref.dataset_id, ref.column)
@@ -758,8 +898,10 @@ class _Writer:
 
         return self.condition(predicate, label, field)
 
+    #
+    # Devuelve la oración que anuncia los filtros aplicados sobre resultados ya calculados.
+    #
     def result_filters(self, chain):
-        """Un filtro sobre resultados ya calculados cambia qué filas se ven: se dice siempre."""
         conditions = []
         for ancestor in reversed(chain):
             for predicate in ancestor.filters:
@@ -774,6 +916,9 @@ class _Writer:
 
         return f"I only included the results {join_words(conditions, 'en')}."
 
+    #
+    # Redacta la condición de un filtro sobre un resultado calculado.
+    #
     def _result_condition(self, predicate):
         ref = predicate.field
         field = _named_field(self._steps[ref.step_id], ref.field)
@@ -781,6 +926,9 @@ class _Writer:
 
         return self.condition(predicate, label, field)
 
+    #
+    # Redacta la condición de un filtro según su operador y sus valores.
+    #
     def condition(self, predicate, label, field):
         operator = predicate.operator
         values = self._condition_values(predicate, field)
@@ -805,6 +953,9 @@ class _Writer:
 
         return f"{preposition} {label} {relation}{values[0]}"
 
+    #
+    # Devuelve los valores de un filtro formateados, con la unidad documentada.
+    #
     def _condition_values(self, predicate, field):
         unit, documented = (
             display_unit(field, self.language) if field is not None else (None, False)
@@ -816,6 +967,9 @@ class _Writer:
             for value in predicate.values
         ]
 
+    #
+    # Redacta un límite sobre una fecha, o None si el filtro no es un rango de fechas.
+    #
     def _date_bound(self, predicate, field):
         is_date_range = (
             field is not None
@@ -847,6 +1001,9 @@ class _Writer:
 
         return bounds[predicate.operator]
 
+    #
+    # Devuelve la relación textual del operador de un filtro (mayor que, igual a, etc.).
+    #
     def _relation(self, predicate):
         relations = _SPANISH_RELATIONS if self.es else _ENGLISH_RELATIONS
         relation = relations.get(predicate.operator)
@@ -857,10 +1014,10 @@ class _Writer:
 
         return "igual a " if self.es else "equal to "
 
+    #
+    # Responde con el período que cubren las filas de un resultado, con la precisión pedida.
+    #
     def period_answer(self, rows, dated, asked):
-        """Período de las filas de un resultado con la precisión pedida: 2022, marzo de 2022 o el 31/03/2022.
-
-        dated son pares (campo, agrupación temporal) de los campos con fechas o períodos verificados."""
         moments = [
             moment
             for row in rows
@@ -884,8 +1041,10 @@ class _Writer:
 
         return self._covered(texts, asked) + self._exact_day(rows, moments, asked) + "."
 
+    #
+    # Indica el día exacto si se preguntó año o mes y todo corresponde a un mismo día.
+    #
     def _exact_day(self, rows, moments, asked):
-        """Si se preguntó el año o el mes y todo corresponde a un mismo día, se dice cuál."""
         distinct = set(moments)
         if asked == "day" or len(distinct) != 1:
             return ""
@@ -900,8 +1059,10 @@ class _Writer:
 
         return f" ({'record' if len(rows) == 1 else 'records'} from {day})"
 
+    #
+    # Responde con el período de los registros usados, de su primera a su última fecha.
+    #
     def period_span(self, rows, first, last, asked):
-        """Período de los registros con que se calculó un resultado: de su primera a su última fecha."""
         starts = [_as_day(row[first]) for row in rows if row[first] is not None]
         ends = [_as_day(row[last]) for row in rows if row[last] is not None]
         if not starts or not ends:
@@ -912,7 +1073,6 @@ class _Writer:
         if asked == "day":
             period = days
         else:
-            # 2021 a 2022 (del 01/09/2021 al 31/03/2022); marzo de 2022 (del 01/03/2022 al 31/03/2022).
             labels = dict.fromkeys(self._labels(day, day, "day", asked)[0][1] for day in (start, end))
             joined = (" a " if self.es else " to ").join(labels)
             period = f"de {joined} ({days})" if self.es else f"from {joined} ({days})"
@@ -921,6 +1081,9 @@ class _Writer:
             return f"El resultado anterior se calculó con registros {period}."
         return f"The previous result was calculated with records {period}."
 
+    #
+    # Devuelve el texto de un día o de un rango de días.
+    #
     def _day_span(self, start, end):
         first, last = date_text(start, self.language), date_text(end, self.language)
         if self.es:
@@ -928,8 +1091,10 @@ class _Writer:
 
         return f"on {first}" if start == end else f"from {first} to {last}"
 
+    #
+    # Devuelve el intervalo y la precisión que nombra un valor temporal, o None.
+    #
     def _moment(self, field, value, time_grain):
-        """Intervalo que nombra un valor: un día, el mes o el año agrupado, o un período guardado como texto."""
         if value is None:
             return None
         if time_grain == "year" and isinstance(value, int):
@@ -942,8 +1107,10 @@ class _Writer:
 
         return None
 
+    #
+    # Devuelve las etiquetas ordenables de un intervalo con la precisión pedida.
+    #
     def _labels(self, start, end, precision, asked):
-        """Etiquetas ordenables del intervalo con la precisión pedida, o la que tenga el dato si es menor."""
         if asked == "year" or precision == "year":
             return [((year,), str(year)) for year in range(start.year, end.year + 1)]
         if asked == "month" or precision in {"month", "months"}:
@@ -954,6 +1121,9 @@ class _Writer:
 
         return [((start.year, start.month, start.day), date_text(start, self.language))]
 
+    #
+    # Redacta qué período abarca o corresponde al resultado anterior.
+    #
     def _covered(self, texts, asked):
         subject = "El resultado anterior" if self.es else "The previous result"
         if len(texts) > 4:
@@ -971,8 +1141,10 @@ class _Writer:
 
         return f"{subject} corresponde a {listed}"
 
+    #
+    # Redacta el valor más reciente de una medición y su fecha.
+    #
     def latest(self, rows, field, date_field, fields, step, chain, inline_values):
-        """Si la fecha tiene varios registros, la tabla muestra a qué corresponde cada valor."""
         measured = self.names.result(step.id, field.name, field)
         label = measured + self.qualifier(chain, _shown(fields))
         when = rows[0][date_field.name]
@@ -985,6 +1157,9 @@ class _Writer:
 
         return self._latest_records(rows, field, label, where, moment, inline_values), True
 
+    #
+    # Devuelve los atributos de texto que comparten todas las filas.
+    #
     def _shared_attributes(self, rows, fields, skip):
         shared = []
         for name, item in fields.items():
@@ -996,6 +1171,9 @@ class _Writer:
 
         return shared
 
+    #
+    # Redacta la medición más reciente cuando hay un único registro.
+    #
     def _latest_value(self, value, field, label, where, moment):
         when = at(*moment, self.language)
         if value is None:
@@ -1012,6 +1190,9 @@ class _Writer:
 
         return f"The most recent {label} measurement{where} was {measured}, {when}."
 
+    #
+    # Redacta los registros más recientes cuando hay varios en la misma fecha.
+    #
     def _latest_records(self, rows, field, label, where, moment, inline_values):
         counts = Counter(row[field.name] for row in rows)
         origin = dated(*moment, self.language)
@@ -1037,6 +1218,9 @@ class _Writer:
 
         return f"The most recent {label} records{where} are {origin}: {join_words(parts, 'en')}."
 
+    #
+    # Devuelve cuántos registros tienen un valor, o ninguno.
+    #
     def _tally(self, field, value, times):
         if value is None:
             if self.es:
@@ -1051,6 +1235,9 @@ class _Writer:
 
         return f"{records} {preposition} {self.measure(field, value)}"
 
+    #
+    # Redacta el valor extremo de un ranking y los que le siguen, o None si no aplica.
+    #
     def ranking(self, rows, step, fields, inline_rows, chain):
         order = step.order_by[0]
         name = _ref_name(order.field)
@@ -1074,6 +1261,9 @@ class _Writer:
 
         return text + self._ranked_table(len(rows), highest), True
 
+    #
+    # Redacta el valor más alto o más bajo y dónde se registró.
+    #
     def _extreme(self, field, label, top, highest, ties, places):
         measured = self.measure(field, top)
         if self.es:
@@ -1092,6 +1282,9 @@ class _Writer:
 
         return text + "."
 
+    #
+    # Redacta los valores que siguen al extremo en un ranking.
+    #
     def _following(self, rest, field, fields):
         following = [self._described(row, field, fields) for row in rest]
         if self.es:
@@ -1100,6 +1293,9 @@ class _Writer:
 
         return f" Next: {join_words(following, 'en')}."
 
+    #
+    # Devuelve la frase que remite a la tabla con los registros ordenados.
+    #
     def _ranked_table(self, total, highest):
         direction = self._direction_text(highest)
         if self.es:
@@ -1110,18 +1306,27 @@ class _Writer:
 
         return f" The table lists all {self.count(total, 'record', 'records')} {direction}."
 
+    #
+    # Devuelve el texto del sentido de un orden: de mayor a menor o al revés.
+    #
     def _direction_text(self, descending):
         if self.es:
             return "de mayor a menor" if descending else "de menor a mayor"
 
         return "from highest to lowest" if descending else "from lowest to highest"
 
+    #
+    # Describe una fila con su medida y su contexto.
+    #
     def _described(self, row, field, fields):
         measured = self.measure(field, row[field.name])
         context = self.context(row, fields, {field.name})
 
         return " ".join(filter(None, [measured, context]))
 
+    #
+    # Elige y redacta la oración que describe las filas de un resultado.
+    #
     def rows(self, rows, fields, calculations, grouping, direction, inline_rows, chain):
         values = [name for name in fields if name not in grouping]
         grouped = self.qualifier(chain, _shown({name: fields[name] for name in grouping}))
@@ -1147,6 +1352,9 @@ class _Writer:
 
         return text, True
 
+    #
+    # Redacta un resultado de una sola fila, con cálculos o campos.
+    #
     def _single(self, row, fields, values, calculations, grouping, qualifier):
         scope = " ".join(filter(None, [qualifier.strip(), self.group_scope(grouping, fields, row)]))
         if not calculations:
@@ -1167,6 +1375,9 @@ class _Writer:
 
         return sentence(join_words(parts, self.language)) + "."
 
+    #
+    # Redacta el valor de un cálculo, o que no se pudo obtener.
+    #
     def _calculated(self, subject, field, value):
         if value is None:
             if self.es:
@@ -1177,6 +1388,9 @@ class _Writer:
 
         return f"{subject} fue {measured}" if self.es else f"{subject} was {measured}"
 
+    #
+    # Redacta un cálculo agrupado con su valor por cada grupo.
+    #
     def _grouped(self, rows, field, calculation, grouping, fields, qualifier):
         missing = "sin valor calculable" if self.es else "no computable value"
         items = []
@@ -1190,6 +1404,9 @@ class _Writer:
             f"{self.subject(calculation)}{qualifier} {verb} {join_words(items, self.language)}."
         )
 
+    #
+    # Redacta la lista de registros de una medición con su contexto.
+    #
     def _listed(self, rows, field, fields, qualifier):
         label = self.label(field) + qualifier
         items = [self._described(row, field, fields) for row in rows]
@@ -1205,6 +1422,9 @@ class _Writer:
             f"{join_words(items, 'en')}."
         )
 
+    #
+    # Redacta la oración inicial de un resultado que se completa en la tabla.
+    #
     def _lead(self, rows, fields, values, calculations, grouping, direction, qualifier):
         total = len(rows)
         order = self._direction_text(direction == "desc") if direction else ""
@@ -1223,6 +1443,9 @@ class _Writer:
 
         return self._found_records(fields, values, qualifier, total, table)
 
+    #
+    # Devuelve la frase que remite a la tabla, con su orden si lo hay.
+    #
     def _table_hint(self, order):
         if self.es:
             if order:
@@ -1233,6 +1456,9 @@ class _Writer:
             return f", listed in the table {order}."
         return "; you can see all of them in the table."
 
+    #
+    # Redacta la introducción de cálculos agrupados con la cantidad de resultados.
+    #
     def _grouped_lead(self, subjects, grouping, qualifier, total, table):
         groups = join_words([self._group_name(spec) for spec in grouping.values()], self.language)
         if self.es:
@@ -1243,12 +1469,18 @@ class _Writer:
 
         return f"I calculated {subjects} by {groups}{qualifier}. There are {results}{table}"
 
+    #
+    # Devuelve el nombre de una agrupación, temporal o por campo.
+    #
     def _group_name(self, spec):
         if spec.time_grain != "raw":
             return grain_label(spec.time_grain, self.language)
 
         return self.names.operand(spec.field)
 
+    #
+    # Redacta la oración de varios valores calculados en un solo registro.
+    #
     def _calculated_values(self, variables):
         if self.es:
             calculated = self.count(variables, "valor", "valores")
@@ -1258,6 +1490,9 @@ class _Writer:
 
         return f"I calculated {calculated}; you can see them in the table."
 
+    #
+    # Redacta la oración de cálculos hechos para cada registro.
+    #
     def _calculated_records(self, subjects, qualifier, total, table):
         if self.es:
             records = self.count(total, "registro", "registros")
@@ -1267,6 +1502,9 @@ class _Writer:
 
         return f"I calculated {subjects} for each of the {records}{qualifier}{table}"
 
+    #
+    # Redacta la oración de un registro con varias variables.
+    #
     def _one_record(self, variables):
         if self.es:
             measured = self.count(variables, "variable", "variables")
@@ -1276,6 +1514,9 @@ class _Writer:
 
         return f"I found one record with {measured}; you can see them in the table."
 
+    #
+    # Redacta la oración de los registros encontrados.
+    #
     def _found_records(self, fields, values, qualifier, total, table):
         numeric = [fields[name] for name in values if fields[name].sql_type in NUMERIC_TYPES]
         measured = ""
@@ -1291,8 +1532,10 @@ class _Writer:
 
         return f"I found {records}{measured}{qualifier}{table}"
 
+    #
+    # Devuelve las notas de columnas de texto leídas en su versión numérica.
+    #
     def projections(self, record):
-        """Columnas de texto leídas en su versión numérica; el recuento de valores no numéricos es del dataset."""
         texts = []
         for field in record.columns:
             for ref in field.sources:
@@ -1305,6 +1548,9 @@ class _Writer:
 
         return _unique(texts)
 
+    #
+    # Redacta la nota de una columna usada en su versión numérica y sus valores sin leer.
+    #
     def _projection(self, dataset, column):
         original = _column_metadata(dataset, column.derived_from)
         if original:
@@ -1332,6 +1578,9 @@ class _Writer:
 
         return f"{label} is used in its numeric version: in the source table, {unreadable} empty."
 
+    #
+    # Devuelve las notas sobre registros excluidos o divisiones por cero en los cálculos.
+    #
     def exclusions(self, record, origin, fields):
         calculations = {item.output_name: item for item in origin.calculations}
         totals = _exclusion_totals(record)
@@ -1353,6 +1602,9 @@ class _Writer:
 
         return texts
 
+    #
+    # Redacta una nota de exclusión con faltantes y divisiones por cero.
+    #
     def _exclusion(self, valid, nulls, zeros, policy, origin):
         parts = []
         if nulls:
@@ -1362,6 +1614,9 @@ class _Writer:
 
         return sentence(join_words(parts, self.language)) + "."
 
+    #
+    # Redacta qué se hizo con los valores faltantes según la política y la operación.
+    #
     def _missing_values(self, valid, nulls, policy, origin):
         if policy == "exclude":
             return self._excluded_missing(valid, nulls)
@@ -1370,6 +1625,9 @@ class _Writer:
 
         return self._kept_missing(nulls)
 
+    #
+    # Redacta que el cálculo dejó fuera los registros sin dato.
+    #
     def _excluded_missing(self, valid, nulls):
         if self.es:
             used = self.count(valid, "registro", "registros")
@@ -1381,8 +1639,10 @@ class _Writer:
 
         return f"the calculation used {used} with a value and left out {left_out} without one"
 
+    #
+    # Redacta que conservar faltantes dejó el resultado sin calcular.
+    #
     def _uncalculated_missing(self, nulls, origin):
-        # Conservar un faltante en una estadística la deja sin valor: no se calcula sobre datos incompletos.
         if self.es:
             kept = self.count(
                 nulls, "registro sin dato no se descartó", "registros sin dato no se descartaron"
@@ -1395,6 +1655,9 @@ class _Writer:
 
         return f"{kept} not discarded, so the result {groups}was not calculated"
 
+    #
+    # Redacta que los registros sin dato se conservaron vacíos.
+    #
     def _kept_missing(self, nulls):
         if self.es:
             kept = self.count(
@@ -1406,6 +1669,9 @@ class _Writer:
 
         return f"{kept} kept empty instead of being discarded"
 
+    #
+    # Redacta los casos en que el divisor fue cero y el cociente quedó sin valor.
+    #
     def _zero_divisions(self, zeros):
         if self.es:
             cases = self.count(zeros, "caso", "casos")
@@ -1422,18 +1688,30 @@ class _Writer:
         )
 
 
+#
+# Devuelve los elementos sin repetidos, en su orden original.
+#
 def _unique(items):
     return list(dict.fromkeys(items))
 
 
+#
+# Devuelve el texto con la primera letra en minúscula.
+#
 def _lowercase_first(text):
     return f"{text[:1].lower()}{text[1:]}"
 
 
+#
+# Devuelve la clave (dataset y columna) de una referencia a columna.
+#
 def _source_key(ref):
     return ref.dataset_id, ref.column
 
 
+#
+# Devuelve la clave de la única columna de origen de un campo, o None.
+#
 def _single_source(field):
     if len(field.sources) != 1:
         return None
@@ -1441,18 +1719,30 @@ def _single_source(field):
     return _source_key(field.sources[0])
 
 
+#
+# Devuelve el nombre del campo o columna al que apunta una referencia.
+#
 def _ref_name(ref):
     return ref.field if ref.kind == "result" else ref.column
 
 
+#
+# Devuelve los metadatos de una columna de un dataset, o None.
+#
 def _column_metadata(dataset, sql_name):
     return next((item for item in dataset.columns_metadata if item.sql_name == sql_name), None)
 
 
+#
+# Devuelve el campo de salida de un paso con ese nombre, o None.
+#
 def _named_field(step, name):
     return next((item for item in step.output_fields if item.name == name), None)
 
 
+#
+# Devuelve el campo de salida de un paso que proviene de una columna de origen.
+#
 def _source_field(step, ref):
     target = _source_key(ref)
     for field in step.output_fields:
@@ -1462,16 +1752,20 @@ def _source_field(step, ref):
     return None
 
 
+#
+# Indica si un filtro es obvio para el lector y no hace falta mencionarlo.
+#
 def _goes_without_saying(predicate, shown):
     ref = predicate.field
-    # Los filtros sobre resultados ya calculados los anuncia result_filters.
     if ref.kind != "column" or predicate.operator == "is_not_null":
         return True
 
-    # Una igualdad sobre una columna visible ya se lee en sus valores; un rango nunca.
     return _source_key(ref) in shown and predicate.operator in _EQUALITY_OPERATORS
 
 
+#
+# Indica si un filtro enumera lugares por igualdad.
+#
 def _lists_places(predicate, label):
     return (
         predicate.operator in _EQUALITY_OPERATORS
@@ -1480,12 +1774,17 @@ def _lists_places(predicate, label):
     )
 
 
+#
+# Indica si los años o días forman una secuencia consecutiva.
+#
 def _contiguous_days(days) -> bool:
-    """Años o días consecutivos («2019, 2020») forman un período; sueltos («2019, 2021»), no."""
     ordered = sorted(days)
     return all(after[0] == before[1] + timedelta(days=1) for before, after in zip(ordered, ordered[1:]))
 
 
+#
+# Devuelve el valor como fecha ISO, o None si no lo es.
+#
 def _iso_date(value):
     try:
         return date.fromisoformat(str(value)[:10])
@@ -1493,14 +1792,23 @@ def _iso_date(value):
         return None
 
 
+#
+# Devuelve las claves de origen de las columnas que ya se muestran.
+#
 def _shown(fields):
     return frozenset(_source_key(ref) for field in fields.values() for ref in field.sources)
 
 
+#
+# Indica si alguna fila tiene valor en la columna indicada.
+#
 def _has_value(rows, name):
     return any(row.get(name) is not None for row in rows)
 
 
+#
+# Devuelve el paso y todos los pasos de los que depende.
+#
 def _lineage(step, steps):
     chain = []
     visit = [step]
@@ -1512,9 +1820,10 @@ def _lineage(step, steps):
     return chain
 
 
+#
+# Devuelve las filas del valor extremo de un ranking y sus empates.
+#
 def _top_ranked(rows, ranking, fields):
-    """En un ranking por un valor medido («el valor más alto»), la fecha que se pregunta es la del extremo y sus
-    empates, no la de los demás puestos."""
     order = ranking.order_by[0] if ranking is not None and ranking.order_by else None
     name = _ref_name(order.field) if order is not None else None
     field = fields.get(name)
@@ -1524,12 +1833,17 @@ def _top_ranked(rows, ranking, fields):
     return [row for row in rows if row[name] == rows[0][name]]
 
 
+#
+# Devuelve el día de una fecha u hora.
+#
 def _as_day(value):
     return value.date() if isinstance(value, datetime) else value
 
 
+#
+# Devuelve los campos de primera y última fecha de una agregación de mínimo y máximo.
+#
 def _date_span(origin):
-    """Campos de la primera y la última fecha de un aggregate que sólo calcula el mínimo y el máximo de fechas."""
     if origin.operation != "aggregate" or origin.group_by or len(origin.calculations) != 2:
         return None
 
@@ -1543,6 +1857,9 @@ def _date_span(origin):
     return names["min"], names["max"]
 
 
+#
+# Devuelve el paso de origen, el de más reciente y el de ranking tras recorrer ordenamientos.
+#
 def _trace_origin(step, steps):
     origin = step
     latest = None
@@ -1557,6 +1874,9 @@ def _trace_origin(step, steps):
     return origin, latest, ranking
 
 
+#
+# Devuelve el sentido de orden de un ranking numérico, o None.
+#
 def _sort_direction(ranking, fields):
     if not ranking:
         return None
@@ -1569,6 +1889,9 @@ def _sort_direction(ranking, fields):
     return None
 
 
+#
+# Cuenta cuántos archivos distintos aportan evidencia.
+#
 def _file_count(evidence, sources):
     names = set()
     for item in evidence:
@@ -1578,6 +1901,9 @@ def _file_count(evidence, sources):
     return len(names)
 
 
+#
+# Suma por cálculo las exclusiones de valores de un resultado.
+#
 def _exclusion_totals(record):
     totals = {}
     for item in record.exclusions:
@@ -1592,6 +1918,9 @@ def _exclusion_totals(record):
     return totals
 
 
+#
+# Agrupa los nombres de cálculos que comparten los mismos totales de exclusión.
+#
 def _names_by_total(totals):
     names = {}
     for name, total in totals.items():

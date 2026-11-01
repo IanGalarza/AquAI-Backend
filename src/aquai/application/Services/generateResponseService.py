@@ -44,6 +44,9 @@ _MESSAGES = {
 }
 
 
+#
+# Calcula la posición de una oración según el orden de su evidencia y el tipo de enunciado.
+#
 def _position(entry, order):
     evidence_position = order.get(entry["evidence_ids"][0], len(order))
     kind_position = _RANK.get(entry.get("kind"), len(_RANK))
@@ -52,6 +55,9 @@ def _position(entry, order):
 
 
 class GenerateResponseService:
+    #
+    # Guarda el proveedor de redacción y los límites de filas y de oraciones deterministas.
+    #
     def __init__(
         self, provider: ResponseProvider, *, max_preview_rows=3, deterministic_sentences=24
     ):
@@ -59,6 +65,9 @@ class GenerateResponseService:
         self._max_preview_rows = max_preview_rows
         self._deterministic_sentences = deterministic_sentences
 
+    #
+    # Genera la respuesta final a partir de la validación y la evidencia, con textos verificados.
+    #
     async def generate(self, state: QueryResponseState) -> QueryResponse:
         started = perf_counter()
         validation = state.validation
@@ -102,8 +111,6 @@ class GenerateResponseService:
         if validation.status == "partial":
             self._publish_partial(response, state, language, introduction, entries)
         elif len(catalog) <= self._deterministic_sentences:
-            # El orden (resultado, alcance, detalles) ya está determinado y los textos son verificados;
-            # el modelo sólo elegía entre ellos y demoraba entre 4 y 24 s. Un umbral menor reactiva el proveedor.
             self._publish(response, [*introduction, *self._segments(entries)])
         else:
             await self._publish_model_draft(
@@ -116,11 +123,13 @@ class GenerateResponseService:
                 language=language,
             )
 
-        # Lo que el resultado no abarca se informa siempre después de lo que responde.
         if coverage:
             self._publish(response, [*response.segments, *coverage])
         return self._finish(response, started)
 
+    #
+    # Marca la respuesta como fallida porque la evidencia cambió después de validarse.
+    #
     def _reject_changed_evidence(self, response, language):
         response.status = "failed"
         response.errors.append(
@@ -130,6 +139,9 @@ class GenerateResponseService:
         )
         self._publish(response, [AnswerSegment(text=self._message("failed", language))])
 
+    #
+    # Publica la explicación de por qué no se pudo responder, con los motivos concretos.
+    #
     def _publish_unanswered(self, response, state, validation, language):
         reasons = blocked_explanations(state, language)
         explanation = AnswerSegment(
@@ -139,13 +151,18 @@ class GenerateResponseService:
 
         self._publish(response, [explanation, *notes])
 
+    #
+    # Publica una respuesta parcial indicando primero lo que no se pudo calcular.
+    #
     def _publish_partial(self, response, state, language, introduction, entries):
-        # Lo que no se pudo hacer se explica primero, con su motivo concreto cuando la ejecución lo informa.
         missing = blocked_explanations(state, language) or [self._message("partial", language)]
         notes = [AnswerSegment(kind="note", text=text) for text in missing]
 
         self._publish(response, [*notes, *introduction, *self._segments(entries)])
 
+    #
+    # Redacta la respuesta con el modelo y, si falla, publica los textos verificados con un aviso.
+    #
     async def _publish_model_draft(
         self, response, context, *, catalog, refs, introduction, entries, language
     ):
@@ -158,12 +175,14 @@ class GenerateResponseService:
             response.generation.status = "generated"
         except LLMProviderError as error:
             _record_generation_failure(response, error, context)
-            # El reemplazo seguro no publica texto del LLM y deja explícito el fallo.
             notice = AnswerSegment(kind="note", text=self._message("generation_failed", language))
             self._publish(response, [notice, *introduction, *self._segments(entries)])
 
         response.generation.duration_ms = round((perf_counter() - model_started) * 1000, 3)
 
+    #
+    # Pide al modelo la redacción y devuelve las oraciones de evidencia elegidas, ya comprobadas.
+    #
     async def _draft(self, generation, context, catalog, refs):
         if context.size_bytes > context.budget_bytes:
             raise LLMProviderError("La evidencia mínima supera el presupuesto de redacción.")
@@ -179,6 +198,9 @@ class GenerateResponseService:
 
         return self._drafted_entries(sentences, catalog, refs)
 
+    #
+    # Convierte las oraciones elegidas por el modelo en entradas ordenadas, rechazando citas no autorizadas.
+    #
     def _drafted_entries(self, sentences, catalog, refs):
         drafted = []
 
@@ -190,18 +212,27 @@ class GenerateResponseService:
 
         return drafted
 
+    #
+    # Ordena las oraciones del catálogo según la relevancia de su evidencia.
+    #
     @staticmethod
     def _ordered_entries(catalog, refs):
         order = {key: index for index, key in enumerate(refs)}
 
         return sorted(catalog.values(), key=lambda entry: _position(entry, order))
 
+    #
+    # Ordena las oraciones elegidas por el modelo según la relevancia de su evidencia.
+    #
     @staticmethod
     def _ordered(sentences, catalog, refs):
         order = {key: index for index, key in enumerate(refs)}
 
         return sorted(sentences, key=lambda item: _position(catalog[item.sentence_id], order))
 
+    #
+    # Agrupa las oraciones consecutivas con la misma evidencia en segmentos de respuesta.
+    #
     @staticmethod
     def _segments(entries):
         segments = []
@@ -223,14 +254,19 @@ class GenerateResponseService:
 
         return segments
 
+    #
+    # Guarda los segmentos en la respuesta y compone su texto completo.
+    #
     @staticmethod
     def _publish(response, segments):
         response.segments = segments
         response.answer = answer_text(segments)
 
+    #
+    # Compone el mensaje de una consulta sin respuesta, con sus motivos y preguntas pendientes.
+    #
     @classmethod
     def _unanswered(cls, validation, language, *, explained=False):
-        # Con un motivo concreto, la sugerencia genérica de reformular contradiría la explicación que sigue.
         status = "blocked" if explained and validation.status == "failed" else validation.status
         text = cls._message(status, language) or cls._message("failed", language)
 
@@ -248,12 +284,18 @@ class GenerateResponseService:
 
         return text
 
+    #
+    # Devuelve el mensaje fijo asociado a un estado de validación y a un idioma.
+    #
     @staticmethod
     def _message(status, language):
         messages = _MESSAGES[language]
 
         return messages.get(status, messages["failed"])
 
+    #
+    # Registra la duración de la generación en la respuesta y la devuelve.
+    #
     @staticmethod
     def _finish(response, started):
         response.timings_ms["response"] = round((perf_counter() - started) * 1000, 3)
@@ -261,6 +303,9 @@ class GenerateResponseService:
         return response
 
 
+#
+# Crea la respuesta inicial con el estado, las advertencias y los errores de la validación.
+#
 def _initial_response(state, validation, language) -> QueryResponse:
     return QueryResponse(
         status=validation.status,
@@ -282,6 +327,9 @@ def _initial_response(state, validation, language) -> QueryResponse:
     )
 
 
+#
+# Registra en la respuesta el modelo y los tokens usados por el Planner.
+#
 def _record_planner_usage(response, plan):
     if plan is None:
         return
@@ -291,12 +339,18 @@ def _record_planner_usage(response, plan):
     response.planner_output_tokens = plan.output_tokens
 
 
+#
+# Registra en la respuesta la duración de las ejecuciones SQL y Python.
+#
 def _record_tool_timings(response, state):
     for name, execution in (("sql", state.execution), ("python", state.python_execution)):
         if execution is not None:
             response.timings_ms[name] = execution.duration_ms
 
 
+#
+# Indica si la evidencia o la pregunta cambiaron respecto de lo que se validó.
+#
 def _evidence_changed(state, validation, plan) -> bool:
     current_fingerprint = evidence_fingerprint(plan, state.execution, state.python_execution)
     if validation.evidence_fingerprint != current_fingerprint:
@@ -305,12 +359,17 @@ def _evidence_changed(state, validation, plan) -> bool:
     return plan is not None and plan.context.evidence.get("question") != state.question
 
 
+#
+# Indica si la validación no deja evidencia utilizable para responder.
+#
 def _cannot_answer(validation) -> bool:
     return validation.status not in {"validated", "partial"} or not validation.usable_evidence
 
 
+#
+# Indexa la evidencia utilizable por id, con los resultados derivados antes que las lecturas.
+#
 def _references_by_relevance(validation, steps):
-    # Los resultados derivados (promedio, máximo, último) responden; las filas leídas los respaldan.
     def is_read(item):
         return steps[item.operation_id].operation == "read"
 
@@ -319,6 +378,9 @@ def _references_by_relevance(validation, steps):
     return {item.evidence_id: item for item in ordered}
 
 
+#
+# Adjunta a la respuesta las fuentes, las referencias de operaciones, las tablas y los gráficos.
+#
 def _attach_evidence(response, state, validation, steps):
     usable = validation.usable_evidence
 
@@ -328,6 +390,9 @@ def _attach_evidence(response, state, validation, steps):
     response.visualizations = _authorized_visualizations(state, validation)
 
 
+#
+# Construye la referencia a la operación que respalda una evidencia.
+#
 def _operation_reference(item, steps) -> ResponseOperationReference:
     return ResponseOperationReference(
         evidence_id=item.evidence_id,
@@ -338,6 +403,9 @@ def _operation_reference(item, steps) -> ResponseOperationReference:
     )
 
 
+#
+# Construye la referencia al resultado tabular de una evidencia, con sus filas y columnas.
+#
 def _result_reference(item, steps) -> ResponseResultReference:
     location = "execution.operations" if item.tool == "sql" else "python_execution.operations"
 
@@ -350,6 +418,9 @@ def _result_reference(item, steps) -> ResponseResultReference:
     )
 
 
+#
+# Devuelve los gráficos de la ejecución Python que la validación autorizó.
+#
 def _authorized_visualizations(state, validation):
     authorized_charts = {
         item.operation_id for item in validation.usable_evidence if item.kind == "visualization"
@@ -364,6 +435,9 @@ def _authorized_visualizations(state, validation):
     ]
 
 
+#
+# Adjunta el contexto de redacción a la respuesta y avisa si se resumieron filas extensas.
+#
 def _attach_context(response, context, language):
     response.generation.context = context
 
@@ -375,6 +449,9 @@ def _attach_context(response, context, language):
         )
 
 
+#
+# Devuelve la introducción del contexto como segmento, si la hay.
+#
 def _introduction(context):
     if not context.evidence.get("introduction"):
         return []
@@ -382,6 +459,9 @@ def _introduction(context):
     return [AnswerSegment(text=context.evidence["introduction"])]
 
 
+#
+# Verifica que el modelo haya elegido cada oración del catálogo exactamente una vez.
+#
 def _check_sentence_selection(sentences, catalog):
     selected = [item.sentence_id for item in sentences]
     repeated = len(selected) != len(set(selected))
@@ -390,6 +470,9 @@ def _check_sentence_selection(sentences, catalog):
         raise LLMProviderError("El modelo omitió, repitió o inventó enunciados de evidencia.")
 
 
+#
+# Indica si una oración cita evidencia distinta de la de su entrada o no autorizada.
+#
 def _cites_unauthorized_evidence(sentence, entry, refs) -> bool:
     if sentence.evidence_ids != entry["evidence_ids"]:
         return True
@@ -397,6 +480,9 @@ def _cites_unauthorized_evidence(sentence, entry, refs) -> bool:
     return any(key not in refs for key in sentence.evidence_ids)
 
 
+#
+# Registra el fallo de generación del modelo, con sus tokens y el error correspondiente.
+#
 def _record_generation_failure(response, error, context):
     response.status = "failed"
     generation = response.generation
@@ -412,6 +498,9 @@ def _record_generation_failure(response, error, context):
     response.errors.append(generation.error)
 
 
+#
+# Crea el error de generación según si el contexto llegó o no a enviarse al modelo.
+#
 def _generation_error(context) -> ExecutionError:
     if context.sent_to_model:
         return ExecutionError(
@@ -425,6 +514,8 @@ def _generation_error(context) -> ExecutionError:
     )
 
 
+#
+# Une los enunciados verificados de información faltante para añadirlos a la respuesta.
+#
 def _missing_information_text(validation):
-    # Cada carencia es un enunciado que el Planner verificó (registros, columnas o fechas), nunca texto del modelo.
     return "".join(f" {item.strip()}" for item in validation.missing_information)

@@ -122,7 +122,6 @@ class ResponseResultReference(BaseModel):
     rows: int
     columns: list[OutputField] = Field(default_factory=list)
     location: Literal["execution.operations", "python_execution.operations"]
-    # La respuesta no copia tablas extensas que ya permanecen en el estado.
     complete: Literal[True] = True
 
 
@@ -165,7 +164,6 @@ class QueryResponse(BaseModel):
     historical_message_ids: list[UUID] = Field(default_factory=list)
 
 
-# Ventana reciente de mensajes más los análisis anteriores que la pregunta recupera.
 MAX_HISTORY_MESSAGES = 10
 
 

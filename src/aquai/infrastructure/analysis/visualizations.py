@@ -17,6 +17,9 @@ from aquai.application.units import presentation_unit_status
 from aquai.infrastructure.analysis.plotlyFigures import build_plotly_figure
 
 
+#
+# Convierte un valor numérico a float de presentación, rechazando desbordes o pérdida de magnitud.
+#
 def _display_number(value):
     number = float(value)
 
@@ -29,6 +32,9 @@ def _display_number(value):
     return number
 
 
+#
+# Convierte el valor de X a su forma de presentación (número o fecha ISO).
+#
 def _display_x(value):
     if isinstance(value, (Decimal, int)) and not isinstance(value, bool):
         return _display_number(value)
@@ -39,6 +45,9 @@ def _display_x(value):
     return value
 
 
+#
+# Crea el resultado de visualización con sus series, advertencias y figura Plotly.
+#
 def create_visualization(
     step, rows, parent_fields, datasets, settings, budget, *, contextual_warnings=None
 ):
@@ -86,6 +95,9 @@ def create_visualization(
     return result
 
 
+#
+# Construye el campo de conteo que se usa cuando el gráfico no tiene eje Y.
+#
 def _count_field(x):
     return OutputField(
         name="count",
@@ -97,6 +109,9 @@ def _count_field(x):
     )
 
 
+#
+# Reúne las advertencias iniciales de los datasets, la conversión numérica y las unidades.
+#
 def _initial_warnings(x, y, datasets, contextual_warnings):
     warnings = list(contextual_warnings or [])
 
@@ -116,6 +131,9 @@ def _initial_warnings(x, y, datasets, contextual_warnings):
     return warnings
 
 
+#
+# Calcula la serie de un histograma con intervalos de igual anchura y sus exclusiones.
+#
 def _histogram_series(rows, x, request, settings, budget):
     values = []
     excluded = 0
@@ -146,11 +164,17 @@ def _histogram_series(rows, x, request, settings, budget):
     return series, excluded
 
 
+#
+# Calcula los extremos de los intervalos de igual anchura entre el mínimo y el máximo.
+#
 def _bin_edges(lower, upper, count):
     inner = [lower + (upper - lower) * Decimal(index) / Decimal(count) for index in range(count)]
     return inner + [upper]
 
 
+#
+# Cuenta cuántos valores caen en cada intervalo.
+#
 def _bin_frequencies(values, edges, count, budget):
     frequencies = [0] * count
 
@@ -162,6 +186,9 @@ def _bin_frequencies(values, edges, count, budget):
     return frequencies
 
 
+#
+# Construye los intervalos del histograma, rechazando los que no se distinguen en float.
+#
 def _histogram_bins(edges, frequencies, lower, upper):
     bins = []
     count = len(frequencies)
@@ -188,6 +215,9 @@ def _histogram_bins(edges, frequencies, lower, upper):
     return bins
 
 
+#
+# Construye las series de puntos de un gráfico de barras, líneas o dispersión.
+#
 def _cartesian_series(rows, x, y, series_field, request, settings, budget):
     grouped, excluded = _group_coordinates(rows, x, y, series_field, request, budget)
 
@@ -209,6 +239,9 @@ def _cartesian_series(rows, x, y, series_field, request, settings, budget):
     return series, excluded
 
 
+#
+# Agrupa los pares X/Y por serie y cuenta las filas excluidas.
+#
 def _group_coordinates(rows, x, y, series_field, request, budget):
     grouped = {}
     excluded = 0
@@ -227,6 +260,9 @@ def _group_coordinates(rows, x, y, series_field, request, budget):
     return grouped, excluded
 
 
+#
+# Construye una serie de puntos validando su granularidad y su orden.
+#
 def _chart_series(key, values, request):
     one_point_per_x = request.chart_type in {"bar", "line"}
 
@@ -255,6 +291,9 @@ def _chart_series(key, values, request):
     return ChartSeries(name=None if key is None else name, points=points)
 
 
+#
+# Verifica que el gráfico no exceda el límite de puntos.
+#
 def _check_point_limit(series, settings):
     size = sum(len(item.points) + len(item.bins) for item in series)
 
@@ -265,6 +304,9 @@ def _check_point_limit(series, settings):
         )
 
 
+#
+# Construye las referencias a las versiones de los datasets usados en el gráfico.
+#
 def _dataset_references(datasets):
     return [
         DatasetVersionReference(

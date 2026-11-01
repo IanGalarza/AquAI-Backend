@@ -21,7 +21,7 @@ _UNFORMATTED_FORMULA = "[Fórmula Excel no textual conservada en el original]"
 
 
 class LiteralText(str):
-    """Valor numérico que debe conservarse como texto por evidencia del Excel."""
+    pass
 
 
 @dataclass
@@ -62,18 +62,30 @@ class _ConversionTally:
     times: int = 0
 
 
+#
+# Indica si un valor de celda está vacío.
+#
 def is_empty(value: object) -> bool:
     return value is None or (isinstance(value, str) and value == "")
 
 
+#
+# Devuelve el nombre de una etiqueta XML sin su espacio de nombres.
+#
 def _local_name(tag: str) -> str:
     return tag.rsplit("}", 1)[-1]
 
 
+#
+# Devuelve los valores de los atributos de identificador de un elemento XML.
+#
 def _attribute_ids(element):
     return (value for key, value in element.attrib.items() if _local_name(key) == "id")
 
 
+#
+# Devuelve el identificador de relación de una parte de tabla del XLSX.
+#
 def _table_part_id(element) -> str:
     relation_id = next(_attribute_ids(element), None)
 
@@ -83,6 +95,9 @@ def _table_part_id(element) -> str:
     return relation_id
 
 
+#
+# Resuelve la ruta de una parte del XLSX a partir de su base y su destino.
+#
 def _part_path(base: str, target: str) -> str:
     if target.startswith("/"):
         return target.lstrip("/")
@@ -90,6 +105,9 @@ def _part_path(base: str, target: str) -> str:
     return posixpath.normpath(posixpath.join(base, target))
 
 
+#
+# Indica si una entrada del ZIP está cifrada o tiene una ruta insegura.
+#
 def _is_unsafe_entry(entry: ZipInfo) -> bool:
     encrypted = entry.flag_bits & 1
     absolute = entry.filename.startswith(("/", "\\"))
@@ -98,10 +116,16 @@ def _is_unsafe_entry(entry: ZipInfo) -> bool:
     return bool(encrypted or absolute or escapes_root)
 
 
+#
+# Indica si el nombre de archivo corresponde a una hoja de cálculo del XLSX.
+#
 def _is_worksheet_part(filename: str) -> bool:
     return filename.startswith("xl/worksheets/") and filename.endswith(".xml")
 
 
+#
+# Rechaza partes XML con bytes nulos o declaraciones DOCTYPE y ENTITY.
+#
 def _check_xml_part(data: bytes) -> None:
     upper = data.upper()
 
@@ -109,10 +133,16 @@ def _check_xml_part(data: bytes) -> None:
         raise TabularInputError("El XLSX contiene declaraciones XML no permitidas.")
 
 
+#
+# Completa una fila CSV hasta el ancho indicado y convierte las cadenas vacías en None.
+#
 def _padded_row(row: list[str], width: int) -> list[str | None]:
     return [None if value == "" else value for value in row] + [None] * (width - len(row))
 
 
+#
+# Devuelve el texto de una fórmula, o un marcador si no tiene representación textual.
+#
 def _formula_text(value: object) -> str:
     if isinstance(value, str):
         return value
@@ -122,6 +152,9 @@ def _formula_text(value: object) -> str:
     return _UNFORMATTED_FORMULA if text is None else text
 
 
+#
+# Convierte una fecha de celda según su formato, conservando como texto las fechas parciales.
+#
 def _date_value(value: date, number_format: str, raw: str | None, tally: _ConversionTally):
     format_text = re.sub(r'"[^"]*"|\[[^\]]*\]', "", number_format).lower()
 
@@ -137,6 +170,9 @@ def _date_value(value: date, number_format: str, raw: str | None, tally: _Conver
     return value
 
 
+#
+# Convierte un número crudo de celda a decimal, conservando los códigos con ceros a la izquierda.
+#
 def _numeric_value(raw: str, number_format: str, tally: _ConversionTally):
     numeric = Decimal(raw)
 
@@ -148,6 +184,9 @@ def _numeric_value(raw: str, number_format: str, tally: _ConversionTally):
     return LiteralText(str(int(numeric)).zfill(len(number_format)))
 
 
+#
+# Indica si el formato exige ceros a la izquierda en un entero no negativo.
+#
 def _is_zero_padded_code(numeric: Decimal, number_format: str) -> bool:
     return bool(
         re.fullmatch(r"0{2,}", number_format)
@@ -156,6 +195,9 @@ def _is_zero_padded_code(numeric: Decimal, number_format: str) -> bool:
     )
 
 
+#
+# Convierte una celda del Excel a su valor, contando fórmulas, errores y horarios.
+#
 def _cell_value(cell, raw: str | None, tally: _ConversionTally):
     value = cell.value
 
@@ -180,6 +222,9 @@ def _cell_value(cell, raw: str | None, tally: _ConversionTally):
     return value
 
 
+#
+# Genera las advertencias sobre las conversiones especiales realizadas al leer el Excel.
+#
 def _conversion_warnings(tally: _ConversionTally) -> list[str]:
     warnings = []
 
@@ -210,9 +255,15 @@ def _conversion_warnings(tally: _ConversionTally) -> list[str]:
 
 
 class TableReader:
+    #
+    # Guarda la configuración con los límites de lectura de archivos tabulares.
+    #
     def __init__(self, settings: TabularSettings) -> None:
         self.settings = settings
 
+    #
+    # Valida nombre, extensión, tamaño y estructura del archivo y devuelve el nombre seguro.
+    #
     def validate(self, filename: str, content: bytes) -> str:
         filename = self._safe_filename(filename)
         suffix = PurePath(filename).suffix.lower()
@@ -230,6 +281,9 @@ class TableReader:
 
         return filename
 
+    #
+    # Lee un archivo CSV o XLSX validado y devuelve sus hojas con los datos.
+    #
     def read(self, filename: str, content: bytes) -> LoadedFile:
         filename = self.validate(filename, content)
         file_type = PurePath(filename).suffix.lower()[1:]
@@ -244,6 +298,9 @@ class TableReader:
         except (ValueError, KeyError, OSError, ElementTree.ParseError, InvalidOperation) as error:
             raise TabularInputError("No se pudo leer el contenido del XLSX.") from error
 
+    #
+    # Valida el nombre de archivo y devuelve solo su nombre base.
+    #
     @staticmethod
     def _safe_filename(filename: str) -> str:
         has_valid_name = (
@@ -262,6 +319,9 @@ class TableReader:
 
         return filename
 
+    #
+    # Verifica que el contenido sea un CSV o un XLSX estructuralmente válido.
+    #
     def _check_structure(self, suffix: str, content: bytes) -> None:
         try:
             if suffix == ".csv":
@@ -281,6 +341,9 @@ class TableReader:
                 raise
             raise TabularInputError("El archivo no tiene un formato tabular válido.") from error
 
+    #
+    # Lee un CSV y lo devuelve como una única hoja de datos.
+    #
     def _read_csv(self, content: bytes) -> LoadedFile:
         rows, source_rows, encoding, delimiter, warnings = self._csv_rows(content)
         width = max(map(len, rows))
@@ -289,6 +352,9 @@ class TableReader:
 
         return LoadedFile("csv", [sheet], warnings, encoding, delimiter)
 
+    #
+    # Decodifica y analiza el CSV, y devuelve sus filas, la codificación, el separador y las advertencias.
+    #
     def _csv_rows(self, content: bytes) -> tuple[list[list[str]], list[int], str, str, list[str]]:
         warnings = []
         text, encoding = self._decode_csv(content, warnings)
@@ -307,6 +373,9 @@ class TableReader:
 
         return rows, source_rows, encoding, delimiter, warnings
 
+    #
+    # Decodifica el CSV con UTF-8 o UTF-16 y, si falla, con CP1252 con una advertencia.
+    #
     @staticmethod
     def _decode_csv(content: bytes, warnings: list[str]) -> tuple[str, str]:
         if content.startswith((b"\xff\xfe", b"\xfe\xff")):
@@ -321,6 +390,9 @@ class TableReader:
             warnings.append("El CSV se leyó con CP1252 porque no contiene UTF-8 válido.")
             return text, "cp1252"
 
+    #
+    # Detecta el separador del CSV por análisis o, si falla, por el ancho de las filas.
+    #
     @staticmethod
     def _csv_delimiter(text: str, warnings: list[str]) -> str:
         sample = text[:8192]
@@ -344,6 +416,9 @@ class TableReader:
 
         return delimiter
 
+    #
+    # Analiza el texto CSV en filas y registra la línea de origen de cada una.
+    #
     def _parse_csv(self, text: str, delimiter: str) -> tuple[list[list[str]], list[int]]:
         reader = csv.reader(io.StringIO(text, newline=""), delimiter=delimiter, strict=True)
         rows, source_rows = [], []
@@ -358,6 +433,9 @@ class TableReader:
 
         return rows, source_rows
 
+    #
+    # Verifica que el CSV no supere los límites de columnas y de celdas.
+    #
     def _check_csv_size(self, row_count: int, width: int) -> None:
         if width > self.settings.max_columns:
             raise FileTooLargeError("El CSV supera el límite de columnas permitido.")
@@ -365,6 +443,9 @@ class TableReader:
         if row_count * max(width, 1) > self.settings.max_cells:
             raise FileTooLargeError("El CSV supera el límite de celdas permitido.")
 
+    #
+    # Verifica que el XLSX sea un archivo ZIP válido con hojas dentro de los límites.
+    #
     def _check_archive(self, content: bytes) -> None:
         with ZipFile(io.BytesIO(content)) as archive:
             entries = archive.infolist()
@@ -378,6 +459,9 @@ class TableReader:
             if len(paths) > self.settings.max_sheets or not paths:
                 raise TabularInputError("El XLSX no declara un conjunto válido de hojas.")
 
+    #
+    # Verifica tamaño, duplicados, partes obligatorias, rutas seguras y ausencia de macros en el XLSX.
+    #
     def _check_entries(self, entries: list[ZipInfo]) -> None:
         names = [entry.filename for entry in entries]
         expanded_bytes = sum(entry.file_size for entry in entries)
@@ -397,6 +481,9 @@ class TableReader:
         if any(name.lower().endswith("vbaproject.bin") for name in names):
             raise TabularInputError("Sólo se admiten XLSX sin macros.")
 
+    #
+    # Cuenta las hojas del XLSX y verifica sus límites de hojas y de celdas.
+    #
     def _count_worksheets(self, archive: ZipFile, entries: list[ZipInfo]) -> int:
         total_cells, sheet_count = 0, 0
 
@@ -424,6 +511,9 @@ class TableReader:
 
         return sheet_count
 
+    #
+    # Lee un XLSX y devuelve sus hojas con los datos.
+    #
     def _read_excel(self, content: bytes) -> LoadedFile:
         workbook = load_workbook(
             io.BytesIO(content), data_only=False, read_only=True, keep_links=False
@@ -442,6 +532,9 @@ class TableReader:
         finally:
             workbook.close()
 
+    #
+    # Lee una hoja del XLSX con sus valores, celdas combinadas, tablas declaradas y advertencias.
+    #
     def _read_sheet(self, content: bytes, worksheet, path: str) -> SheetData:
         with ZipFile(io.BytesIO(content)) as archive:
             max_row, max_column, raw_numbers, merged_ranges, table_parts = self._worksheet_layout(
@@ -474,6 +567,9 @@ class TableReader:
             bool(table_parts),
         )
 
+    #
+    # Devuelve el mapa de nombre de hoja a ruta de su parte dentro del XLSX.
+    #
     def _worksheet_paths(self, archive: ZipFile) -> dict[str, str]:
         targets = self._worksheet_targets(archive)
         workbook = ElementTree.fromstring(archive.read("xl/workbook.xml"))
@@ -490,6 +586,9 @@ class TableReader:
 
         return paths
 
+    #
+    # Devuelve el mapa de identificador de relación a ruta de hoja, validando que sean internas.
+    #
     @staticmethod
     def _worksheet_targets(archive: ZipFile) -> dict[str, str]:
         relationships = ElementTree.fromstring(archive.read("xl/_rels/workbook.xml.rels"))
@@ -512,8 +611,10 @@ class TableReader:
 
         return targets
 
+    #
+    # Recorre una hoja para obtener sus dimensiones, valores crudos, celdas combinadas y tablas.
+    #
     def _worksheet_layout(self, archive: ZipFile, path: str, include_values: bool = False) -> tuple:
-        """Sólo las celdas con contenido delimitan la grilla; el estilo vacío no la agranda."""
         layout = _SheetLayout()
 
         with archive.open(path) as stream:
@@ -538,6 +639,9 @@ class TableReader:
             layout.table_parts,
         )
 
+    #
+    # Registra una celda con contenido en el diseño de la hoja y valida el límite de celdas.
+    #
     def _register_cell(self, element, layout: _SheetLayout, include_values: bool) -> None:
         content = [child for child in element.iter() if _local_name(child.tag) in {"v", "t", "f"}]
         has_content = any(
@@ -562,6 +666,9 @@ class TableReader:
         if raw is not None:
             layout.values[element.attrib["r"]] = raw
 
+    #
+    # Obtiene los rangos de las tablas declaradas en una hoja junto con sus advertencias.
+    #
     def _declared_tables(
         self,
         archive: ZipFile,
@@ -585,6 +692,9 @@ class TableReader:
 
         return ranges, warnings
 
+    #
+    # Devuelve el mapa de identificador de relación a ruta de las tablas declaradas en una hoja.
+    #
     @staticmethod
     def _table_targets(archive: ZipFile, sheet_path: str, table_parts: list[str]) -> dict:
         base = posixpath.dirname(sheet_path)
@@ -605,6 +715,9 @@ class TableReader:
 
         return targets
 
+    #
+    # Calcula el rango de una tabla declarada, excluyendo la fila de totales.
+    #
     @staticmethod
     def _declared_range(table, max_row: int, max_column: int, warnings: list[str]) -> tuple | None:
         name = table.attrib.get("displayName", "tabla")

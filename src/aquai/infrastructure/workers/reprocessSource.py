@@ -8,6 +8,9 @@ from aquai.infrastructure.providers.database import get_db_context
 from aquai.infrastructure.providers.sources import create_source_runtime
 
 
+#
+# Reprocesa el original de una fuente conservando sus identificadores desde la línea de comandos.
+#
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("source_id", type=UUID)

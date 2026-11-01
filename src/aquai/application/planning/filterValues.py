@@ -21,6 +21,9 @@ class _FilterTarget(NamedTuple):
     column: RetrievedColumn
 
 
+#
+# Indica si un valor almacenado y una mención se igualan o se contienen como palabras.
+#
 def _overlaps(value, mention) -> bool:
     return (
         value.casefold() == mention.casefold()
@@ -29,6 +32,9 @@ def _overlaps(value, mention) -> bool:
     )
 
 
+#
+# Devuelve la mención pedida que coincide con un valor, si existe.
+#
 def _mention_for(value, requested):
     for item in requested:
         if _overlaps(value, item):
@@ -37,6 +43,9 @@ def _mention_for(value, requested):
     return None
 
 
+#
+# Contrasta los filtros de texto de una decisión con los valores almacenados y los corrige.
+#
 async def resolve_filter_values(
     decision, selected, operations, mentions, queries, evidence=(), source_names=()
 ):
@@ -46,9 +55,9 @@ async def resolve_filter_values(
 
 
 class _FilterValueResolver:
-    """Toda constante de texto se contrasta con valores almacenados, provenga o no de una
-    mención: un filtro sobre un valor inexistente devolvería un resultado vacío «válido»."""
-
+    #
+    # Guarda los datasets, menciones y consultas necesarios para resolver filtros de texto.
+    #
     def __init__(self, selected, operations, mentions, queries, evidence, source_names):
         self._requested = list(
             dict.fromkeys(item.text for item in mentions if item.kind == "value")
@@ -62,6 +71,9 @@ class _FilterValueResolver:
         self._issues = []
         self._cache = {}
 
+    #
+    # Resuelve los filtros de texto de cada paso y devuelve la decisión, resoluciones y avisos.
+    #
     async def resolve(self, decision):
         normalized = decision.model_copy(deep=True)
         removed = []
@@ -84,6 +96,9 @@ class _FilterValueResolver:
 
         return normalized, self._resolutions, self._issues
 
+    #
+    # Devuelve el destino de un filtro de igualdad sobre una columna TEXT, si corresponde.
+    #
     def _text_target(self, step, predicate) -> _FilterTarget | None:
         if predicate.operator not in _EQUALITY_OPERATORS:
             return None
@@ -100,6 +115,9 @@ class _FilterValueResolver:
 
         return _FilterTarget(step.id, ref, dataset, column)
 
+    #
+    # Devuelve las columnas de origen a las que apunta la referencia de un filtro.
+    #
     def _column_refs(self, field_ref) -> list:
         if field_ref.kind == "column":
             return [field_ref]
@@ -112,6 +130,9 @@ class _FilterValueResolver:
 
         return field.sources if field.sql_type == "TEXT" else []
 
+    #
+    # Devuelve los valores almacenados que resuelven todos los valores de un filtro.
+    #
     async def _resolved_values(self, target: _FilterTarget, predicate) -> list:
         values = []
 
@@ -120,6 +141,9 @@ class _FilterValueResolver:
 
         return list(dict.fromkeys(values))
 
+    #
+    # Resuelve un valor de filtro con un valor almacenado y avisa si es ambiguo.
+    #
     async def _resolve_value(self, target: _FilterTarget, operator: str, value) -> list:
         if not isinstance(value, str):
             return [value]
@@ -153,6 +177,9 @@ class _FilterValueResolver:
 
         return await self._resolve_by_containment(target, value)
 
+    #
+    # Devuelve los valores almacenados de la columna que igualan al valor, usando caché.
+    #
     async def _exact_matches(self, target: _FilterTarget, value: str) -> list:
         ref = target.ref
         key = (ref.dataset_id, ref.column, value)
@@ -168,13 +195,15 @@ class _FilterValueResolver:
 
         return self._cache[key]
 
+    #
+    # Resuelve un valor de filtro por los valores almacenados que lo contienen como palabras.
+    #
     async def _resolve_by_containment(self, target: _FilterTarget, value: str) -> list:
         step_id, ref, dataset, column = target
         mention = _mention_for(value, self._requested) or value
         candidates = await self._containing_values(target, mention)
 
         if not candidates and any(contains_phrase(name, value) for name in self._source_names):
-            # El usuario nombró así la fuente: no es un valor de registros que deba filtrarse.
             self._issues.append(
                 ValidationIssue(
                     code="source_name_filter_removed",
@@ -220,9 +249,10 @@ class _FilterValueResolver:
 
         return candidates
 
+    #
+    # Devuelve los valores almacenados que contienen la mención como palabras completas.
+    #
     async def _containing_values(self, target: _FilterTarget, mention: str) -> list:
-        # Sin igualdad: valores almacenados que contienen la mención como palabras completas
-        # (p. ej. un código de campaña antepuesto al nombre del sitio).
         ref = target.ref
         stored = [
             match
@@ -241,6 +271,9 @@ class _FilterValueResolver:
             if isinstance(item, str) and contains_phrase(item, mention)
         ]
 
+    #
+    # Busca en la base los valores de texto de la columna que contienen la mención.
+    #
     async def _queried_values(self, target: _FilterTarget, mention: str) -> list:
         ref = target.ref
         found = await asyncio.to_thread(
@@ -256,6 +289,9 @@ class _FilterValueResolver:
             if row["column"] == ref.column
         ]
 
+    #
+    # Reemplaza en el filtro el operador y los valores por los resueltos.
+    #
     def _apply(self, predicate, values: list, ref) -> None:
         if values == list(predicate.values) and predicate.operator != "ieq":
             return
@@ -266,11 +302,14 @@ class _FilterValueResolver:
             and len(values) == 1
             and not self._was_resolved(predicate, ref)
         ):
-            return  # ieq sin valor almacenado verificado se conserva tal cual.
+            return
 
         predicate.operator = "eq" if len(values) == 1 else "in"
         predicate.values = values if literal else predicate.values
 
+    #
+    # Indica si el valor del filtro ya tiene una resolución registrada para la columna.
+    #
     def _was_resolved(self, predicate, ref) -> bool:
         return any(
             item.requested == predicate.values[0]

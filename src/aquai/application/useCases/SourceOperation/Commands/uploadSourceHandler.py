@@ -15,6 +15,9 @@ MIME_TYPES = {
 
 
 class UploadSourceHandler:
+    #
+    # Guarda los comandos, el procesador y el límite de tamaño de carga.
+    #
     def __init__(
         self,
         commands: SourceCommands,
@@ -28,6 +31,9 @@ class UploadSourceHandler:
         self._notify = notify
         self.max_upload_bytes = max_upload_bytes
 
+    #
+    # Valida y registra un archivo cargado como fuente, detectando duplicados.
+    #
     async def handle(self, request: UploadSourceRequest) -> SourceAcceptedResponse:
         filename = await asyncio.to_thread(
             self._processor.validate_upload,

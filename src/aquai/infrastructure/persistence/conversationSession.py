@@ -28,6 +28,9 @@ _MESSAGE_SOURCE_FIELDS = (
 )
 
 
+#
+# Abre una sesión de conversaciones con timeouts de bloqueo y consulta, opcionalmente de solo lectura.
+#
 @contextmanager
 def conversation_session(context, settings, *, read_only=False):
     with context.session() as session:
@@ -42,11 +45,17 @@ def conversation_session(context, settings, *, read_only=False):
         yield session
 
 
+#
+# Pone la transacción en modo solo lectura con aislamiento de lectura repetible.
+#
 def _begin_read_only(session):
     connection = session.connection(execution_options={"isolation_level": "REPEATABLE READ"})
     connection.exec_driver_sql("SET TRANSACTION READ ONLY")
 
 
+#
+# Devuelve el mapa nombre-id de estados de mensaje y exige que el catálogo esté completo.
+#
 def message_statuses(session):
     statuses = list(session.scalars(select(MessageStatus)))
     names = {item.name: item.id for item in statuses}
@@ -55,10 +64,16 @@ def message_statuses(session):
     return names
 
 
+#
+# Convierte una conversación persistida en un diccionario con los campos públicos.
+#
 def conversation_view(item):
     return {key: getattr(item, key) for key in _CONVERSATION_FIELDS}
 
 
+#
+# Construye la vista de un mensaje con su estado, sus fuentes y su presentación.
+#
 def message_view(item, statuses, sources=()):
     view = {
         **{key: getattr(item, key) for key in _MESSAGE_FIELDS},
@@ -68,5 +83,8 @@ def message_view(item, statuses, sources=()):
     return MessageView.model_validate({**view, "presentation": present_message(view)})
 
 
+#
+# Convierte una fuente asociada a un mensaje en un diccionario con los campos públicos.
+#
 def _source_view(source):
     return {key: getattr(source, key) for key in _MESSAGE_SOURCE_FIELDS}

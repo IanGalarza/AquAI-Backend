@@ -38,20 +38,24 @@ _DISCARD_REASONS = {
 }
 
 
+#
+# Devuelve las columnas del dataset cuyo nombre contiene el texto.
+#
 def _named_columns(dataset, text):
     return [column.sql_name for column in dataset.columns_metadata if _column_named(column, text)]
 
 
+#
+# Devuelve las columnas del dataset que corresponden a una variable, sin las descartadas.
+#
 def _variable_columns_named(dataset, text):
     return [column.sql_name for column in _variable_columns_found(dataset, text)[0]]
 
 
+#
+# Encuentra las columnas de una variable y las descartadas, con su motivo.
+#
 def _variable_columns_found(dataset, text):
-    """Columnas de la variable por su nombre o uno equivalente («turbidez» → Turbiedad, Turb), por su fórmula química
-    («nitrato» → N-NO3) o por un símbolo que su unidad confirma («temperatura» → T (°C)), y las descartadas con su
-    motivo: miden otra cosa con ese nombre (la temperatura del aire, una suma), o son una proporción o un recuento de
-    colonias y el dataset tiene el valor absoluto. El medio pedido («del aire») no forma parte del nombre buscado: lo
-    exige other_quantity."""
     base = without_medium(text)
     variants = variable_variants(base)
     named = [
@@ -78,8 +82,10 @@ def _variable_columns_found(dataset, text):
     return primary or kept, discarded
 
 
+#
+# Indica cómo se reconoció una columna que no lleva el nombre pedido.
+#
 def _match_reason(column, text):
-    """Cómo se reconoció una columna que no lleva el nombre pedido; None si lo lleva."""
     base = without_medium(text)
     if _column_named(column, base):
         return None
@@ -90,9 +96,10 @@ def _match_reason(column, text):
     return "reconocidas por su símbolo y su unidad"
 
 
+#
+# Devuelve las columnas que identifican la dimensión preguntada, priorizando la de nombre exacto.
+#
 def _dimension_columns(dataset, text):
-    """La columna llamada como la dimensión («Sitio» para «qué sitios») la identifica. Las que sólo contienen esa
-    palabra («Nombre Sitio Literal», «Código Sitio») son transcripciones o códigos y se usan si no existe aquélla."""
     named = [column for column in dataset.columns_metadata if _column_named(column, text)]
     asked = _content_words(text)
     exact = [column for column in named if _content_words(column.original_name) == asked]
@@ -100,8 +107,10 @@ def _dimension_columns(dataset, text):
     return [column.sql_name for column in exact or named]
 
 
+#
+# Devuelve las columnas de texto llamadas sólo como un lugar (sitio, localidad, estación).
+#
 def _place_columns(dataset):
-    """Columnas de texto llamadas sólo como un lugar: «Sitio», «Localidad», «Estación»."""
     return {
         column.sql_name
         for column in dataset.columns_metadata
@@ -109,18 +118,26 @@ def _place_columns(dataset):
     }
 
 
+#
+# Normaliza un texto a sus palabras de contenido en singular, sin conectores.
+#
 def _content_words(text):
-    """Palabras en singular sin conectores: «qué sitios» y «Sitio», «punto de muestreo» y «Punto muestreo»."""
     words = [word for word in normalize_text(text).split() if word not in MENTION_CONNECTORS]
     return singular_words(" ".join(words))
 
 
+#
+# Indica si el nombre original o el nombre SQL de la columna contiene el texto.
+#
 def _column_named(column, text):
     return contains_phrase(column.original_name, text, plural_insensitive=True) or contains_phrase(
         column.sql_name, text, plural_insensitive=True
     )
 
 
+#
+# Indica si un valor figura en los registros hallados como palabras completas.
+#
 def _stored_as_words(found, value):
     for rows in found.values():
         for row in rows.get(value, []):
@@ -130,34 +147,50 @@ def _stored_as_words(found, value):
 
 
 class _Coverage:
+    #
+    # Guarda la evidencia y las menciones de valores, variables y dimensiones a cubrir.
+    #
     def __init__(self, evidence, values, variables, dimensions):
         self._evidence = evidence
         self._values = values
         self._variables = variables
         self._dimensions = dimensions
 
+    #
+    # Indica si el dataset registra todos los valores pedidos.
+    #
     def has_values(self, dataset):
         matches = self._evidence[dataset.dataset_id].value_matches
         return bool(self._values) and len(matches) == len(self._values)
 
+    #
+    # Indica si el dataset tiene columnas de todas las variables pedidas.
+    #
     def has_variables(self, dataset):
         matches = self._evidence[dataset.dataset_id].variable_matches
         return bool(self._variables) and len(matches) == len(self._variables)
 
+    #
+    # Indica si el dataset tiene columnas para todas las dimensiones preguntadas.
+    #
     def has_dimensions(self, dataset):
         matches = self._evidence[dataset.dataset_id].dimension_matches
         return len(matches) == len(self._dimensions)
 
+    #
+    # Indica si el dataset registra las variables y los valores pedidos, aunque falte la dimensión.
+    #
     def covers_records(self, dataset):
-        """Registra las variables y los valores pedidos, aunque no identifique la dimensión preguntada."""
         return (
             bool(self._values or self._variables)
             and (self.has_variables(dataset) or not self._variables)
             and (self.has_values(dataset) or not self._values)
         )
 
+    #
+    # Indica si el dataset cubre los valores, las variables y las dimensiones pedidos.
+    #
     def complete(self, dataset):
-        # La dimensión preguntada («qué sitio») exige una columna que la identifique.
         return (
             (bool(self._values) or bool(self._variables))
             and (self.has_values(dataset) or not self._values)
@@ -165,16 +198,25 @@ class _Coverage:
             and self.has_dimensions(dataset)
         )
 
+    #
+    # Cuenta las coincidencias de valores y variables del dataset.
+    #
     def matches(self, dataset):
         item = self._evidence[dataset.dataset_id]
         return len(item.value_matches) + len(item.variable_matches)
 
 
 class RetrieveDatasetsService:
+    #
+    # Guarda el índice semántico y las consultas de fuentes que usa el servicio.
+    #
     def __init__(self, index: DatasetSemanticSearch, queries: SourceQueries) -> None:
         self._index = index
         self._queries = queries
 
+    #
+    # Recupera los datasets candidatos de una pregunta, por selección explícita o búsqueda semántica.
+    #
     async def retrieve(
         self,
         question: str,
@@ -189,28 +231,23 @@ class RetrieveDatasetsService:
             return await self._search(question, limit, data_mentions, tentative_values)
 
         result = await self._explicit(question, dataset_bindings)
-        # Una fuente nombrada por el usuario se respeta; los datasets heredados del
-        # historial sí se acotan por la evidencia de la nueva pregunta.
         inherited = all(item.historical_version is not None for item in dataset_bindings)
         ranked = await self._rank(
             result, data_mentions, limit=None, restrict=inherited, tentative=tentative_values
         )
-        # Otro sitio u otra variable («¿y en Bagliardi?») se busca en todo el catálogo aunque un dataset heredado
-        # también los registre: otros pueden tenerlos con datos.
         if not inherited or (self._answers(ranked, data_mentions) and not reselect):
             return ranked
 
-        # Un seguimiento sobre otra variable o sitio («¿y la turbiedad?») no queda atado a
-        # datasets que no los registran: se busca en todo el catálogo con la misma evidencia.
-        # La similitud se calcula sobre lo pedido, no sobre los metadatos históricos de la pregunta.
         requested = " ".join(dict.fromkeys(item.text for item in data_mentions))
         found = await self._search(
             question, limit, data_mentions, tentative_values, query=requested
         )
         return found if self._answers(found, data_mentions) else ranked
 
+    #
+    # Busca candidatos por similitud, los verifica en PostgreSQL y los ordena por evidencia.
+    #
     async def _search(self, question, limit, data_mentions, tentative_values, *, query=None):
-        # La similitud ordena un conjunto amplio; la evidencia de registros decide el recorte.
         hits = await self._index.search(query or question, limit=min(100, max(limit * 6, 30)))
         snapshots = await self._snapshots(hits)
         candidates = []
@@ -230,6 +267,9 @@ class RetrieveDatasetsService:
             result, data_mentions, limit=limit, restrict=True, tentative=tentative_values
         )
 
+    #
+    # Verifica en PostgreSQL las versiones de los datasets devueltos por la búsqueda.
+    #
     async def _snapshots(self, hits):
         versions = {UUID(hit["dataset_id"]): hit["version"] for hit in hits}
         if not hits:
@@ -242,6 +282,9 @@ class RetrieveDatasetsService:
         )
         return {dataset.dataset_id: dataset for dataset in verified}
 
+    #
+    # Convierte un resultado de búsqueda en candidato si coincide con el dataset verificado.
+    #
     def _candidate(self, hit, snapshots):
         dataset = snapshots.get(UUID(hit["dataset_id"]))
         if dataset is None or dataset.source_id != UUID(hit["source_id"]):
@@ -258,6 +301,9 @@ class RetrieveDatasetsService:
             warnings=list(dict.fromkeys(warnings)),
         )
 
+    #
+    # Reúne los avisos de un candidato: índice, solapamiento, texto truncado y unidades.
+    #
     @staticmethod
     def _candidate_warnings(dataset, hit):
         warnings = list(dataset.warnings)
@@ -288,6 +334,9 @@ class RetrieveDatasetsService:
             )
         return warnings
 
+    #
+    # Construye los avisos de la búsqueda sobre el alcance de la similitud y los descartes.
+    #
     @staticmethod
     def _search_warnings(hits, candidates):
         warnings = [
@@ -307,8 +356,10 @@ class RetrieveDatasetsService:
             )
         return warnings
 
+    #
+    # Ordena y recorta los candidatos por evidencia de valores, variables y dimensiones.
+    #
     async def _rank(self, result, mentions, *, limit, restrict, tentative=()):
-        """Ordena por evidencia verificable: valores almacenados, columnas y similitud."""
         values = list(dict.fromkeys(item.text for item in mentions if item.kind == "value"))
         variables = list(dict.fromkeys(item.text for item in mentions if item.kind == "variable"))
         dimensions = list(dict.fromkeys(item.text for item in mentions if item.kind == "dimension"))
@@ -351,6 +402,9 @@ class RetrieveDatasetsService:
         result.status = "candidates_available" if ranked else "no_available_candidates"
         return result
 
+    #
+    # Calcula, por dataset, las columnas que corresponden a cada variable pedida.
+    #
     @staticmethod
     def _variable_evidence(candidates, variables):
         columns = {
@@ -369,6 +423,9 @@ class RetrieveDatasetsService:
             )
         return evidence
 
+    #
+    # Devuelve las columnas de una variable en cada candidato.
+    #
     @staticmethod
     def _variable_columns(candidates, variable):
         text = RetrieveDatasetsService._matched_text(candidates, variable)
@@ -376,17 +433,20 @@ class RetrieveDatasetsService:
             dataset.dataset_id: _variable_columns_named(dataset, text) for dataset in candidates
         }
 
+    #
+    # Elige el texto de la variable a buscar: la mención entera o su núcleo sin estadística.
+    #
     @staticmethod
     def _matched_text(candidates, variable):
-        # La estadística de la mención («pH promedio») se descarta sólo si ningún candidato nombra la mención entera.
         if any(_variable_columns_named(dataset, variable) for dataset in candidates):
             return variable
         return variable_core(variable)
 
+    #
+    # Genera avisos de trazabilidad sobre columnas reconocidas por reglas o descartadas.
+    #
     @staticmethod
     def _rule_notes(ranked, variables):
-        """Trazabilidad de las reglas de dominio en los avisos: columnas reconocidas sin el nombre pedido (un nombre
-        equivalente, una fórmula, un símbolo con su unidad) y columnas que lo llevan pero se descartaron."""
         notes = []
         for variable in variables:
             text = RetrieveDatasetsService._matched_text(ranked, variable)
@@ -408,6 +468,9 @@ class RetrieveDatasetsService:
                 notes.append(f"Variable «{variable}»: " + "; ".join(described) + ".")
         return notes
 
+    #
+    # Separa las menciones que en realidad son dimensiones y registra sus columnas por dataset.
+    #
     @staticmethod
     def _split_dimensions(result, candidates, evidence, values, variables, dimensions):
         with_variables = [
@@ -415,14 +478,11 @@ class RetrieveDatasetsService:
             for dataset in candidates
             if variables and len(evidence[dataset.dataset_id].variable_matches) == len(variables)
         ]
-        # Una «mención de valor» que nombra una columna de un dataset con la variable pedida
-        # es la dimensión que se pregunta (sitio -> Sitios), no un valor para filtrar.
         reclassified = [
             value
             for value in values
             if any(_named_columns(dataset, value) for dataset in with_variables)
         ]
-        # Una dimensión que no nombra ninguna columna («punto de muestreo») no exige nada.
         asked = [
             dimension
             for dimension in dimensions
@@ -447,6 +507,9 @@ class RetrieveDatasetsService:
             )
         return values
 
+    #
+    # Busca en los registros de los candidatos los valores mencionados y los tentativos.
+    #
     async def _stored_values(self, result, candidates, values, tentative):
         if not ((values or tentative) and candidates):
             return values, tentative, {}
@@ -455,7 +518,7 @@ class RetrieveDatasetsService:
             found = await asyncio.to_thread(
                 self._queries.find_text_values, candidates, [*values, *tentative]
             )
-        except Exception as error:  # La recuperación semántica sigue disponible.
+        except Exception as error:
             _logger.warning(
                 "No se pudieron verificar valores mencionados: %s", type(error).__name__
             )
@@ -463,9 +526,11 @@ class RetrieveDatasetsService:
             return [], [], {}
         return values, tentative, found
 
+    #
+    # Confirma como valores los tentativos que aparecen como palabras completas en los registros.
+    #
     @staticmethod
     def _confirm_tentative(result, found, values, tentative):
-        # Un valor tentativo sólo se convierte en filtro si aparece como palabras completas.
         result.confirmed_values = [value for value in tentative if _stored_as_words(found, value)]
         if not result.confirmed_values:
             return values
@@ -478,6 +543,9 @@ class RetrieveDatasetsService:
         )
         return values
 
+    #
+    # Registra las columnas y filas donde cada candidato contiene los valores pedidos.
+    #
     @staticmethod
     def _record_value_matches(candidates, evidence, found, values):
         for dataset in candidates:
@@ -486,13 +554,14 @@ class RetrieveDatasetsService:
             for value in values:
                 rows = found.get(dataset.dataset_id, {}).get(value, [])
                 matches = RetrieveDatasetsService._value_matches(rows, value)
-                # Un lugar se filtra en la columna que lo nombra («Sitio»), no en transcripciones o códigos que
-                # también lo contienen («Nombre Sitio Literal»): cada una lo escribe distinto y acota otras filas.
                 canonical = [match for match in matches if match.column in places]
                 matches = canonical or matches
                 if matches:
                     item.value_matches[value] = matches
 
+    #
+    # Agrupa por columna las filas que contienen el valor pedido.
+    #
     @staticmethod
     def _value_matches(rows, value):
         columns = {}
@@ -506,6 +575,9 @@ class RetrieveDatasetsService:
             match.rows += row["rows"]
         return list(columns.values())
 
+    #
+    # Registra los valores que ningún candidato contiene y avisa de ello.
+    #
     @staticmethod
     def _record_unmatched(result, evidence, values):
         result.unmatched_values = [
@@ -520,10 +592,11 @@ class RetrieveDatasetsService:
                 + ". No se debe filtrar por un valor inexistente ni sustituirlo por otro."
             )
 
+    #
+    # Restringe los candidatos a los que reúnen los valores, variables o columnas pedidos.
+    #
     @staticmethod
     def _restricted(result, ranked, coverage):
-        # Un dataset sin el sitio o la variable pedidos no puede responder por ellos;
-        # si ninguno reúne todo, la variable medida define la pregunta.
         for rule, note in (
             (coverage.complete, "contienen en sus registros los valores y columnas mencionados"),
             (coverage.has_variables, "tienen columnas cuyo nombre coincide con la variable pedida"),
@@ -539,10 +612,11 @@ class RetrieveDatasetsService:
             return kept
         return ranked
 
+    #
+    # Lista los candidatos que cubren lo pedido pero quedaron fuera del recorte, con su motivo.
+    #
     @staticmethod
     def _omitted(candidates, ranked, coverage):
-        """Candidatos con la variable y los valores pedidos que no llegan al Planner: la respuesta los menciona
-        para no presentar como completa una cobertura parcial."""
         kept = {item.dataset_id for item in ranked}
         return [
             OmittedCandidate(
@@ -555,10 +629,16 @@ class RetrieveDatasetsService:
             if item.dataset_id not in kept and coverage.covers_records(item)
         ]
 
+    #
+    # Indica si un dataset tiene alguna evidencia de coincidencia.
+    #
     @staticmethod
     def _has_evidence(item):
         return bool(item.value_matches or item.variable_matches or item.dimension_matches)
 
+    #
+    # Indica si algún dataset evidencia todas las variables y valores pedidos.
+    #
     @staticmethod
     def _answers(result, mentions):
         variables = {item.text for item in mentions if item.kind == "variable"}
@@ -573,9 +653,11 @@ class RetrieveDatasetsService:
             for item in result.evidence
         )
 
+    #
+    # Descarta las hojas cuyas filas están completamente incluidas en otra candidata.
+    #
     @staticmethod
     def _prune_overlaps(result):
-        """Una hoja cuyas filas están todas en otra candidata no se cuenta dos veces."""
         names = {item.name: item for item in result.candidates}
         kept = []
         for dataset in result.candidates:
@@ -588,6 +670,9 @@ class RetrieveDatasetsService:
             kept.append(dataset)
         return kept
 
+    #
+    # Devuelve la candidata que contiene todas las filas de un dataset solapado, si existe.
+    #
     @staticmethod
     def _covering_candidate(dataset, names):
         for overlap in dataset.provenance.source_locator.get("possible_overlap") or []:
@@ -603,8 +688,10 @@ class RetrieveDatasetsService:
                 return other
         return None
 
+    #
+    # Verifica los datasets indicados por el usuario o el historial sin usar el índice.
+    #
     async def _explicit(self, question, bindings):
-        """Reutiliza la misma verificación física; no inventa similitudes del índice."""
         ids = list(dict.fromkeys(item.dataset_id for item in bindings))
         verified = await asyncio.to_thread(self._queries.verified_datasets, ids)
         by_id = {item.dataset_id: item for item in verified}

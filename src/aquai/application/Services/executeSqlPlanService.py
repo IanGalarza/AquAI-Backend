@@ -11,9 +11,15 @@ from aquai.application.interfaces.execution import SqlPlanExecutor
 
 
 class ExecuteSqlPlanService:
+    #
+    # Guarda el ejecutor SQL que usa el servicio.
+    #
     def __init__(self, executor: SqlPlanExecutor) -> None:
         self._executor = executor
 
+    #
+    # Ejecuta las operaciones SQL del plan o devuelve un resultado no ejecutado si no corresponden.
+    #
     async def execute(self, plan: PlanningResult) -> SqlExecutionResult:
         if plan.status != "plannable" or not any(step.tool == "sql" for step in plan.operations):
             return _not_executed(plan)
@@ -21,6 +27,9 @@ class ExecuteSqlPlanService:
         return await asyncio.to_thread(self._executor.execute, plan)
 
 
+#
+# Construye el resultado SQL no ejecutado, con las operaciones Python como pendientes.
+#
 def _not_executed(plan: PlanningResult) -> SqlExecutionResult:
     now = datetime.now(timezone.utc)
     pending = _pending_python_operations(plan)
@@ -40,6 +49,9 @@ def _not_executed(plan: PlanningResult) -> SqlExecutionResult:
     )
 
 
+#
+# Lista los ids de las operaciones Python que quedan pendientes en un plan ejecutable.
+#
 def _pending_python_operations(plan: PlanningResult) -> list[str]:
     if plan.status != "plannable":
         return []

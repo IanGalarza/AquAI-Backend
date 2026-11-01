@@ -18,14 +18,23 @@ from aquai.infrastructure.providers.llm.ollama import (
 _collection_locks: WeakKeyDictionary = WeakKeyDictionary()
 
 
+#
+# Crea una condición de filtro de Qdrant que exige igualdad en un campo.
+#
 def _field_equals(key: str, value: Any) -> models.FieldCondition:
     return models.FieldCondition(key=key, match=models.MatchValue(value=value))
 
 
+#
+# Indica si el valor es un número entero o decimal finito, excluyendo booleanos.
+#
 def _is_finite_number(value: Any) -> bool:
     return not isinstance(value, bool) and isinstance(value, (int, float)) and math.isfinite(value)
 
 
+#
+# Indica si el vector tiene la dimensión esperada, valores finitos y algún componente no nulo.
+#
 def _is_valid_vector(vector: list, dimension: int) -> bool:
     if len(vector) != dimension:
         return False
@@ -36,6 +45,9 @@ def _is_valid_vector(vector: list, dimension: int) -> bool:
 
 
 class QdrantSemanticIndex:
+    #
+    # Guarda la configuración y los proveedores de Qdrant, embeddings y consultas del índice.
+    #
     def __init__(
         self,
         settings: TabularSettings,
@@ -53,6 +65,9 @@ class QdrantSemanticIndex:
         self._embedding_model = model_identity(settings.embedding_model)
         self._vector_name = "embedding_" + sha256(self._embedding_model.encode()).hexdigest()[:24]
 
+    #
+    # Indexa en Qdrant las descripciones de los datasets de una fuente.
+    #
     async def index_source(self, source: dict) -> None:
         datasets = source.get("datasets", [])
         if not datasets:
@@ -78,6 +93,9 @@ class QdrantSemanticIndex:
             wait=True,
         )
 
+    #
+    # Actualiza en Qdrant si los datasets de una fuente están activos.
+    #
     async def set_source_active(self, source_id: UUID, active: bool) -> None:
         if not await self._collection_exists():
             return
@@ -90,6 +108,9 @@ class QdrantSemanticIndex:
             wait=True,
         )
 
+    #
+    # Busca los datasets más cercanos a una consulta, verificando que sigan vigentes.
+    #
     async def search(self, query: str, limit: int = 5) -> list[dict[str, Any]]:
         if self._queries is None:
             raise SemanticIndexError(
@@ -107,6 +128,9 @@ class QdrantSemanticIndex:
 
         return await self._usable_matches(vectors[0], limit)
 
+    #
+    # Pagina los resultados del índice hasta reunir los datasets vigentes sin repetir.
+    #
     async def _usable_matches(self, query_vector: list[float], limit: int) -> list[dict[str, Any]]:
         matches: list[dict[str, Any]] = []
         seen: set[UUID] = set()
@@ -135,6 +159,9 @@ class QdrantSemanticIndex:
 
         return matches
 
+    #
+    # Consulta una página de resultados de Qdrant filtrada por descripciones y modelo de embeddings.
+    #
     async def _query_page(self, query_vector: list[float], page_size: int, offset: int) -> Any:
         return await self._call(
             self._client.query_points,
@@ -153,6 +180,9 @@ class QdrantSemanticIndex:
             with_vectors=False,
         )
 
+    #
+    # Filtra los puntos con identificadores, versión y puntaje válidos.
+    #
     @classmethod
     def _valid_candidates(cls, points: list) -> list[tuple[UUID, Any, dict]]:
         candidates = []
@@ -170,6 +200,9 @@ class QdrantSemanticIndex:
 
         return candidates
 
+    #
+    # Devuelve el identificador de dataset del punto, o None si los identificadores son inválidos.
+    #
     @staticmethod
     def _valid_dataset_id(point: Any, payload: dict) -> UUID | None:
         try:
@@ -181,6 +214,9 @@ class QdrantSemanticIndex:
 
         return dataset_id
 
+    #
+    # Determina qué pares dataset y versión siguen vigentes en la base de datos.
+    #
     async def _usable_pairs(self, candidates: list) -> set[tuple[UUID, int]]:
         usable_pairs = set()
         candidate_versions = {payload["version"] for _, _, payload in candidates}
@@ -197,6 +233,9 @@ class QdrantSemanticIndex:
 
         return usable_pairs
 
+    #
+    # Construye el punto de Qdrant de un dataset con su vector y su contenido.
+    #
     def _point(
         self, source: dict, dataset: dict, vector: list[float], truncated: bool
     ) -> models.PointStruct:
@@ -212,6 +251,9 @@ class QdrantSemanticIndex:
             id=str(UUID(str(point_id))), vector={self._vector_name: vector}, payload=payload
         )
 
+    #
+    # Construye el contenido asociado al punto: fuente, versión, estado y descripción del dataset.
+    #
     def _point_payload(
         self, source: dict, dataset: dict, dataset_id: UUID, version: int, truncated: bool
     ) -> dict:
@@ -233,6 +275,9 @@ class QdrantSemanticIndex:
             "embedding_text_truncated": truncated,
         }
 
+    #
+    # Crea la colección de Qdrant si no existe y valida su configuración de vectores.
+    #
     async def _ensure_collection(self, dimension: int) -> None:
         async with self._collection_lock():
             if not await self._collection_exists():
@@ -243,15 +288,24 @@ class QdrantSemanticIndex:
             )
             self._validate_collection_vectors(collection.config.params.vectors, dimension)
 
+    #
+    # Devuelve el bloqueo que serializa la creación de la colección por loop y colección.
+    #
     def _collection_lock(self) -> asyncio.Lock:
         loop = asyncio.get_running_loop()
         locks = _collection_locks.setdefault(loop, {})
         key = (self._settings.qdrant_url, self._settings.qdrant_collection)
         return locks.setdefault(key, asyncio.Lock())
 
+    #
+    # Indica si la colección de Qdrant ya existe.
+    #
     async def _collection_exists(self) -> bool:
         return await self._call(self._client.collection_exists, self._settings.qdrant_collection)
 
+    #
+    # Crea la colección de Qdrant con distancia coseno, tolerando una creación concurrente.
+    #
     async def _create_collection(self, dimension: int) -> None:
         try:
             await self._call(
@@ -268,6 +322,9 @@ class QdrantSemanticIndex:
             if not created_concurrently:
                 raise
 
+    #
+    # Valida que la colección use el modelo, la dimensión y la distancia de embeddings esperados.
+    #
     def _validate_collection_vectors(self, config: Any, dimension: int) -> None:
         if not isinstance(config, dict) or set(config) != {self._vector_name}:
             raise SemanticIndexError(
@@ -283,6 +340,9 @@ class QdrantSemanticIndex:
         if vector_params.distance != models.Distance.COSINE:
             raise SemanticIndexError("La colección Qdrant requiere distancia coseno.")
 
+    #
+    # Ejecuta una operación de Qdrant en un hilo con tiempo máximo y errores del índice.
+    #
     async def _call(self, operation: Any, *args: Any, **kwargs: Any) -> Any:
         task = asyncio.create_task(asyncio.to_thread(operation, *args, **kwargs))
         try:
@@ -301,15 +361,19 @@ class QdrantSemanticIndex:
                 "No se pudo completar la operación de índice en Qdrant."
             ) from exc
 
+    #
+    # Espera a que termine el hilo en curso para no solapar escrituras pendientes.
+    #
     @staticmethod
     async def _wait_for_thread(task: asyncio.Task) -> None:
-        """Un thread no se cancela junto con el worker. Esperar evita que una
-        escritura pendiente sobrescriba el siguiente intento."""
         try:
             await asyncio.shield(task)
         except Exception:
             pass
 
+    #
+    # Agrega el prefijo de documento o de consulta que requiere el modelo nomic-embed-text.
+    #
     def _embedding_text(self, text: str, *, query: bool) -> str:
         model_name = self._settings.embedding_model.split(":", 1)[0]
         if model_name != "nomic-embed-text":
@@ -318,6 +382,9 @@ class QdrantSemanticIndex:
         prefix = "search_query: " if query else "search_document: "
         return prefix + text
 
+    #
+    # Arma el texto de un dataset a embeber con su descripción y columnas, acotado en tamaño.
+    #
     @classmethod
     def _document(cls, dataset: dict) -> tuple[str, bool]:
         description = (
@@ -339,6 +406,9 @@ class QdrantSemanticIndex:
 
         return text.strip(), truncated
 
+    #
+    # Construye la línea de texto de una columna con su significado y su unidad.
+    #
     @staticmethod
     def _column_line(column: dict) -> str:
         line = "\n" + str(column["original_name"])
@@ -351,6 +421,9 @@ class QdrantSemanticIndex:
 
         return line
 
+    #
+    # Valida que haya un vector válido por descripción y devuelve su dimensión.
+    #
     @staticmethod
     def _validate_vectors(vectors: list[list[float]], *, expected: int) -> int:
         if len(vectors) != expected or not vectors or not vectors[0]:

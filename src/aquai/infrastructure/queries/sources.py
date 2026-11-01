@@ -37,6 +37,9 @@ _COLUMN_SUMMARY_KEYS = ("sql_name", "original_name", "sql_type", "unit")
 _MISSING_OBJECT_SQLSTATES = {"42P01", "42703", "42501"}
 
 
+#
+# Devuelve las columnas de la tabla de fuentes que se exponen en consultas y listados.
+#
 def _source_columns() -> tuple:
     return (
         Source.id,
@@ -56,6 +59,9 @@ def _source_columns() -> tuple:
     )
 
 
+#
+# Obtiene una copia de una fuente con sus datasets, opcionalmente con el contenido original.
+#
 def source_snapshot(
     session: Session,
     source_id: UUID,
@@ -75,12 +81,17 @@ def source_snapshot(
 
 
 class SqlAlchemySourceQueries:
+    #
+    # Guarda el contexto de base de datos y la sesión opcional usada para verificar datasets.
+    #
     def __init__(self, context: DbContext, *, session: Session | None = None) -> None:
         self._context = context
         self._verification_session = session
 
+    #
+    # Busca datasets cuyo nombre, archivo o identificador coincide con una referencia dada.
+    #
     def matching_datasets(self, reference: str) -> list[CatalogDataset]:
-        """Resuelve identidades por nombres/UUID; las descripciones no son nombres."""
         reference = reference.strip()
         statement = (
             select(
@@ -106,8 +117,10 @@ class SqlAlchemySourceQueries:
             rows = session.execute(statement).mappings()
             return [_catalog_dataset(row, reference) for row in rows]
 
+    #
+    # Devuelve el catálogo de fuentes y datasets con sus columnas, sin leer registros.
+    #
     def catalog_overview(self) -> list[dict[str, Any]]:
-        """Nunca lee contenidos ni registros."""
         sources_statement = select(
             Source.id,
             Source.name,
@@ -142,6 +155,9 @@ class SqlAlchemySourceQueries:
         ]
         return deepcopy(overview)
 
+    #
+    # Provee la sesión de verificación inyectada o abre una nueva del contexto.
+    #
     @contextmanager
     def _verified_session(self):
         if self._verification_session is not None:
@@ -150,6 +166,9 @@ class SqlAlchemySourceQueries:
         with self._context.session() as session:
             yield session
 
+    #
+    # Abre una conexión de solo lectura con un límite de tiempo por consulta.
+    #
     @contextmanager
     def _read_only_connection(self, statement_timeout: str):
         with self._context.engine.connect() as connection, connection.begin():
@@ -159,10 +178,12 @@ class SqlAlchemySourceQueries:
             )
             yield connection
 
+    #
+    # Devuelve el valor de una columna de texto que coincide exactamente o sin distinguir mayúsculas.
+    #
     def matching_column_values(
         self, dataset_id: UUID, version: int, column: str, value: str
     ) -> list[str]:
-        """Nunca interpreta un valor como nombre de fuente."""
         datasets = self.verified_datasets([dataset_id], versions={dataset_id: version})
         if not datasets or not _has_text_column(datasets[0], column):
             return []
@@ -182,10 +203,12 @@ class SqlAlchemySourceQueries:
             )
             return list(connection.scalars(case_insensitive))
 
+    #
+    # Busca en las columnas de texto de los datasets los valores que contienen los términos dados.
+    #
     def find_text_values(
         self, datasets: list[VerifiedDataset], terms: list[str], *, per_column: int = 50
     ) -> dict[UUID, dict[str, list[dict[str, Any]]]]:
-        """Candidatos amplios: la aplicación confirma la coincidencia por palabras."""
         result: dict[UUID, dict[str, list[dict[str, Any]]]] = {}
         patterns = _contains_patterns(terms)
         if not patterns:
@@ -209,6 +232,9 @@ class SqlAlchemySourceQueries:
                         matches.setdefault(term, []).append(dict(row))
         return result
 
+    #
+    # Devuelve los valores distintos de columnas de texto de un dataset, con un tope por columna.
+    #
     def distinct_text_values(
         self, dataset: VerifiedDataset, columns: list[str], *, limit: int = 500
     ) -> dict[str, list[str]]:
@@ -227,10 +253,12 @@ class SqlAlchemySourceQueries:
                 result[name] = list(connection.scalars(statement))
         return result
 
+    #
+    # Devuelve los valores de una columna de texto con más registros, opcionalmente con una variable medida.
+    #
     def frequent_text_values(
         self, dataset: VerifiedDataset, column: str, *, measured: str | None = None, limit: int = 12
     ) -> list[dict[str, Any]]:
-        """Valores de una columna TEXT con más registros; con measured, sólo cuentan los que tienen esa variable."""
         columns_by_name = {item.sql_name: item for item in dataset.columns_metadata}
         if column not in columns_by_name or columns_by_name[column].sql_type != "TEXT":
             return []
@@ -255,6 +283,9 @@ class SqlAlchemySourceQueries:
         with self._read_only_connection("3000") as connection:
             return [dict(row) for row in connection.execute(statement).mappings()]
 
+    #
+    # Devuelve una fuente con sus datasets o falla si no existe.
+    #
     def get(self, source_id: UUID, *, include_content: bool = False) -> dict[str, Any]:
         with self._context.session() as session:
             snapshot = source_snapshot(session, source_id, include_content=include_content)
@@ -262,6 +293,9 @@ class SqlAlchemySourceQueries:
                 raise SourceNotFoundError("La fuente no existe.")
             return snapshot
 
+    #
+    # Lista las fuentes de forma paginada, con filtro por nombre y estado y con orden elegido.
+    #
     def list(
         self,
         *,
@@ -298,6 +332,9 @@ class SqlAlchemySourceQueries:
 
         return {"items": items, "total": total, "page": page, "page_size": page_size}
 
+    #
+    # Devuelve los identificadores de datasets que siguen vigentes y consultables.
+    #
     def usable_dataset_ids(
         self, dataset_ids: list[UUID], *, versions: dict[UUID, int] | None = None
     ) -> set[UUID]:
@@ -305,10 +342,12 @@ class SqlAlchemySourceQueries:
             dataset.dataset_id for dataset in self.verified_datasets(dataset_ids, versions=versions)
         }
 
+    #
+    # Devuelve los datasets vigentes, legibles y con esquema físico coherente con el catálogo.
+    #
     def verified_datasets(
         self, dataset_ids: list[UUID], *, versions: dict[UUID, int] | None = None
     ) -> list[VerifiedDataset]:
-        """Sólo devuelve datasets vigentes, legibles y con esquema físico coherente."""
         if not dataset_ids:
             return []
 
@@ -343,6 +382,9 @@ class SqlAlchemySourceQueries:
                 verified.append(_verified_dataset(*row))
             return verified
 
+    #
+    # Indica si la tabla física de un dataset existe, coincide con sus columnas y tiene registros.
+    #
     @staticmethod
     def _physical_dataset_available(session: Session, dataset: Dataset) -> bool:
         if not _is_managed_table(dataset.physical_table_name):
@@ -360,6 +402,9 @@ class SqlAlchemySourceQueries:
             raise
 
 
+#
+# Construye la consulta que obtiene los datasets de una fuente con sus metadatos.
+#
 def _source_datasets_statement(source_id: UUID):
     return (
         select(
@@ -385,10 +430,16 @@ def _source_datasets_statement(source_id: UUID):
     )
 
 
+#
+# Indica si un nombre corresponde a una tabla física gestionada por la aplicación.
+#
 def _is_managed_table(name: str) -> bool:
     return re.fullmatch(r"dataset_[0-9a-f]{32}", name) is not None
 
 
+#
+# Convierte un texto en UUID o devuelve None si no es válido.
+#
 def _as_uuid(value: str) -> UUID | None:
     try:
         return UUID(value)
@@ -396,6 +447,9 @@ def _as_uuid(value: str) -> UUID | None:
         return None
 
 
+#
+# Construye las condiciones para buscar una referencia en nombres de fuente, archivo y dataset.
+#
 def _reference_predicates(reference: str) -> list:
     fields = (
         Source.name,
@@ -410,6 +464,9 @@ def _reference_predicates(reference: str) -> list:
     return predicates
 
 
+#
+# Convierte una fila de catálogo en un dataset con su disponibilidad y tipo de coincidencia.
+#
 def _catalog_dataset(row, reference: str) -> CatalogDataset:
     exact_names = (
         row["source_name"],
@@ -431,6 +488,9 @@ def _catalog_dataset(row, reference: str) -> CatalogDataset:
     )
 
 
+#
+# Indica si un dataset del catálogo está activo, es consultable y su fuente está lista.
+#
 def _catalog_row_available(row):
     return (
         row["is_active"]
@@ -441,6 +501,9 @@ def _catalog_row_available(row):
     )
 
 
+#
+# Resume una fuente y sus datasets para la vista general del catálogo.
+#
 def _overview_source(source, datasets: list) -> dict[str, Any]:
     ready = source["processing_status"] in _READY_STATUSES
     return {
@@ -456,6 +519,9 @@ def _overview_source(source, datasets: list) -> dict[str, Any]:
     }
 
 
+#
+# Resume un dataset del catálogo con su disponibilidad y el resumen de sus columnas.
+#
 def _overview_dataset(row, source_active, source_ready: bool) -> dict[str, Any]:
     available = (
         row["is_active"]
@@ -478,16 +544,25 @@ def _overview_dataset(row, source_active, source_ready: bool) -> dict[str, Any]:
     }
 
 
+#
+# Indica si el dataset tiene una columna de texto con ese nombre.
+#
 def _has_text_column(dataset: VerifiedDataset, column: str) -> bool:
     return any(
         item.sql_name == column and item.sql_type == "TEXT" for item in dataset.columns_metadata
     )
 
 
+#
+# Devuelve los nombres de las columnas de texto de un dataset.
+#
 def _text_columns(dataset: VerifiedDataset) -> list[str]:
     return [item.sql_name for item in dataset.columns_metadata if item.sql_type == "TEXT"]
 
 
+#
+# Convierte términos de búsqueda en patrones LIKE sin acentos ni distinción de mayúsculas.
+#
 def _contains_patterns(terms: list[str]) -> dict[str, str]:
     accent_table = str.maketrans(_ACCENTED, _UNACCENTED)
     patterns = {}
@@ -498,6 +573,9 @@ def _contains_patterns(terms: list[str]) -> dict[str, str]:
     return patterns
 
 
+#
+# Construye la consulta que cuenta los valores de texto que coinciden con un patrón por columna.
+#
 def _matching_values_statement(table: Table, columns: list[str], pattern: str, per_column: int):
     parts = []
     for name in columns:
@@ -516,6 +594,9 @@ def _matching_values_statement(table: Table, columns: list[str], pattern: str, p
     return union_all(*parts)
 
 
+#
+# Construye las condiciones del listado de fuentes según búsqueda y estado de procesamiento.
+#
 def _list_predicates(search: str | None, processing_status: str | None) -> list:
     predicates = []
     if search and search.strip():
@@ -525,6 +606,9 @@ def _list_predicates(search: str | None, processing_status: str | None) -> list:
     return predicates
 
 
+#
+# Devuelve el criterio de ordenamiento SQL que corresponde al orden de listado pedido.
+#
 def _source_ordering(sort: SourceSort) -> tuple:
     orderings = {
         SourceSort.NEWEST: (Source.created_at.desc(), Source.id.desc()),
@@ -543,12 +627,18 @@ def _source_ordering(sort: SourceSort) -> tuple:
     return orderings[SourceSort(sort)]
 
 
+#
+# Construye la condición que restringe los datasets a las versiones indicadas.
+#
 def _version_filter(versions: dict[UUID, int] | None) -> list:
     if versions is None:
         return []
     return [tuple_(Dataset.id, Dataset.version).in_(list(versions.items()))]
 
 
+#
+# Construye un dataset verificado con su procedencia y advertencias a partir de una fila.
+#
 def _verified_dataset(
     dataset: Dataset,
     source_name: str,
@@ -584,6 +674,9 @@ def _verified_dataset(
     )
 
 
+#
+# Devuelve las columnas y tipos que debe tener la tabla física de un dataset.
+#
 def _expected_physical_columns(dataset: Dataset) -> dict[str, str]:
     expected = {column["sql_name"]: column["sql_type"] for column in dataset.columns_metadata}
     expected.update({"_aquai_row": "BIGINT", "_aquai_source_row": "BIGINT"})
@@ -592,8 +685,10 @@ def _expected_physical_columns(dataset: Dataset) -> dict[str, str]:
     return expected
 
 
+#
+# Comprueba que la tabla física exista, tenga los tipos esperados y conserve al menos un registro.
+#
 def _physical_table_matches(session: Session, table_name: str, expected: dict[str, str]) -> bool:
-    """La tabla existe, tiene los tipos declarados y conserva al menos un registro."""
     connection = session.connection()
     inspector = inspect(connection)
     if not inspector.has_table(table_name):

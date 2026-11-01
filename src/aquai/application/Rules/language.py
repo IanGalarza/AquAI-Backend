@@ -1,5 +1,3 @@
-"""Palabras que delatan el idioma de una pregunta cuando no hay una preferencia explícita."""
-
 import re
 
 WORD = re.compile(r"[a-záéíóúñ]+")

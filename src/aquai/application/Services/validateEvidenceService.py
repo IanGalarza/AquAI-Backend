@@ -28,14 +28,23 @@ INTERMEDIATE_EVIDENCE_OPERATIONS = {"aggregate", "calculate", "sort", "latest"}
 
 
 class ValidateEvidenceService:
+    #
+    # Valida la evidencia producida por la ejecución del plan sin bloquear el bucle de eventos.
+    #
     async def validate(self, state: QueryExecutionState) -> EvidenceValidationResult:
         return await asyncio.to_thread(self._evaluate, state)
 
+    #
+    # Evalúa la evidencia del estado de ejecución y devuelve el resultado de validación.
+    #
     def _evaluate(self, state):
         return _EvidenceEvaluation(state).run()
 
 
 class _EvidenceEvaluation:
+    #
+    # Guarda el estado de ejecución y prepara el resultado de validación inicial.
+    #
     def __init__(self, state: QueryExecutionState) -> None:
         self._started = perf_counter()
         self._state = state
@@ -62,11 +71,17 @@ class _EvidenceEvaluation:
         self._charts = {}
         self._complete = set()
 
+    #
+    # Ejecuta la validación y devuelve el resultado final.
+    #
     def run(self) -> EvidenceValidationResult:
         self._validate()
 
         return self._finish()
 
+    #
+    # Recorre las comprobaciones de plan, transferencias, dependencias y evidencia utilizable.
+    #
     def _validate(self) -> None:
         self._collect_retrieval_warnings()
 
@@ -102,21 +117,33 @@ class _EvidenceEvaluation:
         self._resolve_status()
         self._note_pending_operations()
 
+    #
+    # Registra un problema de evidencia, opcionalmente asociado a una operación.
+    #
     def _issue(self, code, message, operation_id=None) -> None:
         self._result.issues.append(
             EvidenceIssue(code=code, message=message, operation_id=operation_id)
         )
 
+    #
+    # Deduplica las advertencias, registra la duración y devuelve el resultado.
+    #
     def _finish(self) -> EvidenceValidationResult:
         self._result.warnings = list(dict.fromkeys(self._result.warnings))
         self._result.duration_ms = round((perf_counter() - self._started) * 1000, 3)
 
         return self._result
 
+    #
+    # Agrega al resultado las advertencias de la recuperación de datasets.
+    #
     def _collect_retrieval_warnings(self) -> None:
         if self._state.retrieval:
             self._result.warnings.extend(self._state.retrieval.warnings)
 
+    #
+    # Reúne advertencias y errores del plan y de las ejecuciones SQL y Python.
+    #
     def _collect_execution_diagnostics(self) -> None:
         self._result.warnings.extend(self._plan.warnings)
 
@@ -124,6 +151,9 @@ class _EvidenceEvaluation:
             if execution:
                 self._collect_diagnostics(execution)
 
+    #
+    # Copia al resultado advertencias y errores de una ejecución y de sus operaciones.
+    #
     def _collect_diagnostics(self, execution) -> None:
         self._result.warnings.extend(execution.warnings)
 
@@ -135,6 +165,9 @@ class _EvidenceEvaluation:
             if record.error and record.error not in self._result.errors:
                 self._result.errors.append(record.error)
 
+    #
+    # Indica si la evidencia pertenece a una pregunta distinta de la recibida.
+    #
     def _question_mismatch(self) -> bool:
         question = self._state.question
         retrieval = self._state.retrieval
@@ -144,6 +177,9 @@ class _EvidenceEvaluation:
 
         return retrieval is not None and retrieval.question != question
 
+    #
+    # Resuelve el estado cuando el plan no autoriza ejecución, rechazando ejecuciones inesperadas.
+    #
     def _resolve_without_execution(self) -> None:
         plan = self._plan
         execution_received = (
@@ -164,7 +200,6 @@ class _EvidenceEvaluation:
         self._result.clarification_question = plan.clarification_question
         self._result.missing_information = list(plan.missing_information)
         if plan.status in {"failed", "insufficient_coverage"}:
-            # Trazabilidad: el motivo del Planner y lo que bloqueó el plan quedan en la respuesta guardada.
             self._issue(f"planning_{plan.status}", plan.reason)
             for item in plan.validation_issues:
                 if item.severity == "clarification":
@@ -177,6 +212,9 @@ class _EvidenceEvaluation:
             self._result.status = "failed"
             self._issue("missing_clarification", "El estado requiere una pregunta de aclaración.")
 
+    #
+    # Indica si el plan supera las validaciones determinísticas del planificador.
+    #
     def _plan_passes_deterministic_checks(self) -> bool:
         try:
             validate_execution_plan(self._plan, self._plan.selected_datasets)
@@ -185,6 +223,9 @@ class _EvidenceEvaluation:
 
         return True
 
+    #
+    # Comprueba que la transferencia SQL sea coherente con el plan y marca su confianza.
+    #
     def _check_sql_transfer(self) -> None:
         try:
             validate_sql_transfer(self._plan, self._sql)
@@ -195,6 +236,9 @@ class _EvidenceEvaluation:
                 "El plan, esquema o procedencia de la transferencia SQL son incoherentes.",
             )
 
+    #
+    # Comprueba que la transferencia Python conserve el plan y las entradas SQL verificadas.
+    #
     def _check_python_transfer(self) -> None:
         if not self._python_executed():
             return
@@ -208,6 +252,9 @@ class _EvidenceEvaluation:
             "Python no conserva el plan, las entradas SQL o sus versiones verificadas.",
         )
 
+    #
+    # Indica si alguna operación Python llegó a ejecutarse.
+    #
     def _python_executed(self) -> bool:
         python = self._python
 
@@ -215,6 +262,9 @@ class _EvidenceEvaluation:
             record.status == "executed" for record in python.operations
         )
 
+    #
+    # Indica si la ejecución Python conserva plan, entradas SQL y datasets verificados.
+    #
     def _python_transfer_consistent(self) -> bool:
         python = self._python
         selected = {item.dataset_id: item for item in self._plan.selected_datasets}
@@ -234,6 +284,9 @@ class _EvidenceEvaluation:
             for dataset_id, dataset in actual.items()
         )
 
+    #
+    # Indexa las operaciones del plan junto con su linaje y sus datasets.
+    #
     def _index_plan_operations(self) -> None:
         operations = self._plan.operations
         self._steps = {step.id: step for step in operations}
@@ -242,6 +295,9 @@ class _EvidenceEvaluation:
             self._ancestors[step.id] = self._lineage_of(step)
             self._dataset_ids[step.id] = self._dataset_ids_of(step)
 
+    #
+    # Devuelve el conjunto de operaciones de las que depende un paso, incluido él mismo.
+    #
     def _lineage_of(self, step) -> set:
         lineage = {step.id}
 
@@ -250,6 +306,9 @@ class _EvidenceEvaluation:
 
         return lineage
 
+    #
+    # Devuelve los datasets que alimentan un paso y sus dependencias.
+    #
     def _dataset_ids_of(self, step) -> set:
         dataset_ids = {ref.dataset_id for ref in step.columns}
 
@@ -258,6 +317,9 @@ class _EvidenceEvaluation:
 
         return dataset_ids
 
+    #
+    # Revisa los registros de operaciones recibidos de las transferencias SQL y Python.
+    #
     def _check_operation_records(self) -> None:
         transfers = (
             (self._sql, "sql", self._sql_trusted),
@@ -268,6 +330,9 @@ class _EvidenceEvaluation:
             if batch is not None:
                 self._check_batch_records(batch, tool, trusted)
 
+    #
+    # Valida los registros de un lote contra los pasos del plan y su herramienta.
+    #
     def _check_batch_records(self, batch, tool, trusted) -> None:
         seen = set()
 
@@ -291,6 +356,9 @@ class _EvidenceEvaluation:
 
             self._check_operation_result(step, record)
 
+    #
+    # Registra una referencia a operaciones repetidas o ajenas al plan.
+    #
     def _reject_operation_reference(self, record) -> None:
         self._issue(
             "invalid_operation_reference",
@@ -301,6 +369,9 @@ class _EvidenceEvaluation:
         if record.operation_id in self._steps:
             self._valid[record.operation_id] = False
 
+    #
+    # Comprueba que el resultado de una operación esté terminado, coincida con el plan y esté completo.
+    #
     def _check_operation_result(self, step, record) -> None:
         if record.status not in EXECUTED_STATUSES or record.error:
             self._issue("operation_incomplete", "La operación no terminó correctamente.", step.id)
@@ -319,7 +390,7 @@ class _EvidenceEvaluation:
             return
 
         if _dependency_without_rows(record):
-            return  # Su completitud se contrasta con consultas finales realmente ejecutadas.
+            return
 
         self._issue(
             "incomplete_materialization",
@@ -327,6 +398,9 @@ class _EvidenceEvaluation:
             step.id,
         )
 
+    #
+    # Indica si el esquema o los datasets de un registro difieren de los del plan.
+    #
     def _schema_or_sources_differ(self, step, record) -> bool:
         expected_ids = self._dataset_ids[step.id]
 
@@ -336,6 +410,9 @@ class _EvidenceEvaluation:
             or len(record.dataset_ids) != len(expected_ids)
         )
 
+    #
+    # Decodifica las filas de una operación según los tipos verificados y las marca como válidas.
+    #
     def _normalize_rows(self, step, record) -> None:
         try:
             self._normalized[step.id] = decode_rows(record, step.output_fields)
@@ -347,6 +424,9 @@ class _EvidenceEvaluation:
                 step.id,
             )
 
+    #
+    # Reúne los gráficos de la ejecución Python y detecta visualizaciones repetidas.
+    #
     def _collect_visualizations(self) -> None:
         if not self._python:
             return
@@ -363,6 +443,9 @@ class _EvidenceEvaluation:
 
             self._charts[chart.operation_id] = chart
 
+    #
+    # Verifica las dependencias de cada operación válida según su herramienta.
+    #
     def _check_dependencies(self) -> None:
         for step in self._plan.operations:
             if not self._valid.get(step.id):
@@ -373,6 +456,9 @@ class _EvidenceEvaluation:
             elif step.tool == "python":
                 self._check_python_dependencies(step)
 
+    #
+    # Comprueba que la consulta SQL conserve la traza de todos sus ancestros.
+    #
     def _check_sql_lineage(self, step) -> None:
         lineage = self._ancestors[step.id]
         lineage_traced = all(self._ancestor_traced(key, step.id) for key in lineage)
@@ -388,6 +474,9 @@ class _EvidenceEvaluation:
 
         self._complete.update(lineage)
 
+    #
+    # Indica si un ancestro SQL quedó trazado en la consulta completa indicada.
+    #
     def _ancestor_traced(self, key, query_id) -> bool:
         ancestor = self._steps[key]
 
@@ -402,6 +491,9 @@ class _EvidenceEvaluation:
             and set(record.dataset_ids) == self._dataset_ids[key]
         )
 
+    #
+    # Verifica que un paso Python tenga dependencias utilizables y evidencia coherente.
+    #
     def _check_python_dependencies(self, step) -> None:
         record = self._records.get(step.id)
 
@@ -425,13 +517,18 @@ class _EvidenceEvaluation:
                 step.id,
             )
 
+    #
+    # Indica si las dependencias de un paso Python faltan o no se pueden usar.
+    #
     def _dependencies_unusable(self, step, record) -> bool:
-        # Todo paso Python opera sobre un resultado previo: sin entrada no hay evidencia válida.
         if not step.depends_on or record.input_operation_ids != step.depends_on:
             return True
 
         return any(self._dependency_unusable(parent) for parent in step.depends_on)
 
+    #
+    # Indica si una operación padre está incompleta, inválida o truncada.
+    #
     def _dependency_unusable(self, parent) -> bool:
         return (
             parent not in self._complete
@@ -440,6 +537,9 @@ class _EvidenceEvaluation:
             or self._records[parent].truncated
         )
 
+    #
+    # Valida contadores, exclusiones y, si corresponde, el gráfico de un paso Python.
+    #
     def _validate_python_evidence(self, step, record) -> None:
         parent = self._records[step.depends_on[0]]
 
@@ -449,6 +549,9 @@ class _EvidenceEvaluation:
         if step.operation == "visualize":
             self._validate_chart(step, parent)
 
+    #
+    # Valida el gráfico de una operación contra el plan, sus datos de entrada y sus fuentes.
+    #
     def _validate_chart(self, step, parent) -> None:
         chart = self._charts.get(step.id)
         if chart is None:
@@ -461,6 +564,9 @@ class _EvidenceEvaluation:
 
         self._result.warnings.extend(chart.warnings)
 
+    #
+    # Registra qué operaciones del plan están completas y cuáles quedan pendientes.
+    #
     def _record_operation_progress(self) -> None:
         operations = self._plan.operations
         complete = self._complete
@@ -470,6 +576,9 @@ class _EvidenceEvaluation:
             step.id for step in operations if step.id not in complete
         ]
 
+    #
+    # Reúne las referencias de evidencia utilizables para responder la pregunta.
+    #
     def _collect_usable_evidence(self) -> None:
         requested_ancestors = self._requested_ancestors()
 
@@ -477,6 +586,9 @@ class _EvidenceEvaluation:
             if self._usable_as_evidence(step, requested_ancestors):
                 self._result.usable_evidence.append(self._evidence_reference(step))
 
+    #
+    # Devuelve las operaciones de las que dependen las salidas solicitadas.
+    #
     def _requested_ancestors(self) -> set:
         requested = set()
 
@@ -485,6 +597,9 @@ class _EvidenceEvaluation:
 
         return requested
 
+    #
+    # Indica si el resultado de un paso sirve como evidencia de la respuesta.
+    #
     def _usable_as_evidence(self, step, requested_ancestors) -> bool:
         materialized = (
             step.id in self._complete
@@ -499,6 +614,9 @@ class _EvidenceEvaluation:
 
         return step.id in requested_ancestors and step.operation in INTERMEDIATE_EVIDENCE_OPERATIONS
 
+    #
+    # Construye la referencia de evidencia de una operación (tabla o visualización).
+    #
     def _evidence_reference(self, step) -> EvidenceReference:
         return EvidenceReference(
             evidence_id=f"e{len(self._result.usable_evidence) + 1}",
@@ -510,6 +628,9 @@ class _EvidenceEvaluation:
             is_requested_output=step.id in self._plan.output_steps,
         )
 
+    #
+    # Reúne las fuentes de los datasets usados por la evidencia utilizable.
+    #
     def _collect_sources(self) -> None:
         used = set()
         for evidence in self._result.usable_evidence:
@@ -521,12 +642,18 @@ class _EvidenceEvaluation:
             if dataset.dataset_id in used
         ]
 
+    #
+    # Determina si la evidencia queda validada, parcial o sin evidencia utilizable.
+    #
     def _resolve_status(self) -> None:
         if not self._result.usable_evidence:
             return
 
         self._result.status = "validated" if self._fully_validated() else "partial"
 
+    #
+    # Indica si la evidencia está completa, sin pendientes, errores ni problemas.
+    #
     def _fully_validated(self) -> bool:
         result = self._result
 
@@ -535,9 +662,15 @@ class _EvidenceEvaluation:
 
         return all(self._has_evidence_for(output) for output in self._plan.output_steps)
 
+    #
+    # Indica si existe evidencia utilizable para una operación.
+    #
     def _has_evidence_for(self, operation_id) -> bool:
         return any(item.operation_id == operation_id for item in self._result.usable_evidence)
 
+    #
+    # Agrega una limitación cuando quedan operaciones pendientes o no utilizables.
+    #
     def _note_pending_operations(self) -> None:
         if self._result.pending_operations:
             self._result.limitations.append(
@@ -545,6 +678,9 @@ class _EvidenceEvaluation:
             )
 
 
+#
+# Indica si un dataset de Python coincide con el verificado en el plan.
+#
 def _same_verified_dataset(dataset, expected) -> bool:
     if expected is None:
         return False
@@ -557,8 +693,10 @@ def _same_verified_dataset(dataset, expected) -> bool:
     )
 
 
+#
+# Indica si un registro SQL es solo un marcador de paso Python pendiente.
+#
 def _is_pending_python_marker(record, step, tool) -> bool:
-    # Marcador del SQL Agent, no resultado Python.
     return (
         tool == "sql"
         and step is not None
@@ -567,14 +705,23 @@ def _is_pending_python_marker(record, step, tool) -> bool:
     )
 
 
+#
+# Indica si el resultado está materializado, sin truncar y con todas sus filas.
+#
 def _fully_materialized(record) -> bool:
     return record.materialized and not record.truncated and record.rows_returned == len(record.rows)
 
 
+#
+# Indica si el registro es una dependencia ejecutada que no devuelve filas.
+#
 def _dependency_without_rows(record) -> bool:
     return record.status == "executed_as_dependency" and not record.rows and not record.materialized
 
 
+#
+# Construye la referencia de fuente de un dataset seleccionado.
+#
 def _source_reference(dataset) -> SourceReference:
     return SourceReference(
         source_id=dataset.source_id,
@@ -585,6 +732,9 @@ def _source_reference(dataset) -> SourceReference:
     )
 
 
+#
+# Valida que los contadores de entrada de Python coincidan con los del padre.
+#
 def _validate_input_counters(record, parent) -> None:
     counters_differ = (
         record.rows_processed != parent.rows_returned
@@ -594,6 +744,9 @@ def _validate_input_counters(record, parent) -> None:
         raise PlannerValidationError("Los contadores de entrada Python no son coherentes.")
 
 
+#
+# Valida que las exclusiones por nulos correspondan a los cálculos y a las filas filtradas.
+#
 def _validate_exclusions(step, record, rows) -> None:
     calculations = {item.output_name: item for item in step.calculations}
     totals = {key: 0 for key in calculations}
@@ -623,6 +776,9 @@ def _validate_exclusions(step, record, rows) -> None:
         )
 
 
+#
+# Agrupa las filas por los valores de las columnas de agrupación.
+#
 def _group_rows(rows, group_names) -> dict:
     grouped = {}
 
@@ -633,6 +789,9 @@ def _group_rows(rows, group_names) -> dict:
     return grouped
 
 
+#
+# Indica si una exclusión no corresponde al cálculo autorizado o tiene contadores incoherentes.
+#
 def _exclusion_unauthorized(exclusion, calculation, step) -> bool:
     return (
         calculation is None
@@ -643,6 +802,9 @@ def _exclusion_unauthorized(exclusion, calculation, step) -> bool:
     )
 
 
+#
+# Indica si las exclusiones del paso deben coincidir con un grupo del resultado.
+#
 def _requires_group_match(step, calculation) -> bool:
     if step.operation == "aggregate":
         return True
@@ -650,6 +812,9 @@ def _requires_group_match(step, calculation) -> bool:
     return step.operation == "calculate" and calculation.function == "correlation"
 
 
+#
+# Valida que una exclusión corresponda a un único grupo del resultado y respete su política de nulos.
+#
 def _validate_exclusion_group(exclusion, record, group_names, rows_by_group, seen) -> None:
     group_fields = [field for field in record.columns if field.name in exclusion.group]
     group = decode_rows(SimpleNamespace(rows=[exclusion.group]), group_fields)[0]
@@ -665,6 +830,9 @@ def _validate_exclusion_group(exclusion, record, group_names, rows_by_group, see
         raise PlannerValidationError("El resultado no conserva su grupo o su política de nulos.")
 
 
+#
+# Indica si un resultado debía conservar nulos pero devolvió un valor.
+#
 def _preserved_nulls_lost(exclusion, row) -> bool:
     return (
         exclusion.policy == "preserve"

@@ -12,10 +12,16 @@ from aquai.infrastructure.persistence.conversationSession import (
 
 
 class SqlAlchemyConversationQueries:
+    #
+    # Guarda el contexto de base de datos y la configuración de las consultas.
+    #
     def __init__(self, context, settings):
         self._context = context
         self._settings = settings
 
+    #
+    # Devuelve una página de conversaciones ordenadas por su actividad más reciente.
+    #
     def list(self, *, page, page_size):
         with conversation_session(self._context, self._settings, read_only=True) as session:
             total = session.scalar(select(func.count()).select_from(Conversation))
@@ -30,6 +36,9 @@ class SqlAlchemyConversationQueries:
 
             return {"items": items, "total": total, "page": page, "page_size": page_size}
 
+    #
+    # Devuelve una conversación o falla si no existe.
+    #
     def get(self, conversation_id):
         with conversation_session(self._context, self._settings, read_only=True) as session:
             item = session.get(Conversation, conversation_id)
@@ -37,6 +46,9 @@ class SqlAlchemyConversationQueries:
                 raise ConversationNotFoundError("La conversación no existe.")
             return conversation_view(item)
 
+    #
+    # Devuelve una página de mensajes de una conversación con sus fuentes.
+    #
     def messages(self, conversation_id, *, page, page_size):
         with conversation_session(self._context, self._settings, read_only=True) as session:
             if session.get(Conversation, conversation_id) is None:
@@ -66,6 +78,9 @@ class SqlAlchemyConversationQueries:
                 "page_size": page_size,
             }
 
+    #
+    # Devuelve el historial reciente de turnos completos de una conversación anterior a una secuencia.
+    #
     def context(self, conversation_id, *, before_sequence):
         if not self._settings.history_messages:
             return []
@@ -79,13 +94,14 @@ class SqlAlchemyConversationQueries:
             associations = _source_associations(session, rows)
             for index, row in enumerate(rows):
                 row["associations"] = associations.get(row["id"], [])
-                # La ventana reciente llega siempre; los anteriores sólo si la pregunta los recupera.
                 row["recent"] = index < self._settings.history_messages
             return list(reversed(rows))
 
 
+#
+# Construye la consulta de turnos completos recientes con su pregunta, fuentes y enrutamiento.
+#
 def _context_statement(conversation_id, before_sequence, completed, limit):
-    """Turnos completos recientes: cada pregunta sólo cuenta si ya tiene respuesta completa."""
     user = aliased(Message)
     reply = aliased(Message)
     data = Message.content_data
@@ -137,6 +153,9 @@ def _context_statement(conversation_id, before_sequence, completed, limit):
     )
 
 
+#
+# Obtiene las fuentes y datasets asociados a cada mensaje del historial.
+#
 def _source_associations(session, rows):
     message_ids = [row["id"] for row in rows if row["sources"]]
     associations = {}

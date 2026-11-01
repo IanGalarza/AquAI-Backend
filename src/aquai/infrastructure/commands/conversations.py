@@ -18,6 +18,9 @@ from aquai.infrastructure.persistence.conversationSession import (
 _DEFAULT_TITLE = "Nueva conversación"
 
 
+#
+# Devuelve la conversación bloqueada para escritura o falla si no existe.
+#
 def _locked_conversation(session, conversation_id):
     statement = select(Conversation).where(Conversation.id == conversation_id).with_for_update()
     conversation = session.scalar(statement)
@@ -26,6 +29,9 @@ def _locked_conversation(session, conversation_id):
     return conversation
 
 
+#
+# Devuelve las respuestas del asistente aún pendientes o en proceso.
+#
 def _generations(session, conversation_id, names):
     return session.scalars(
         select(Message).where(
@@ -36,12 +42,17 @@ def _generations(session, conversation_id, names):
     )
 
 
+#
+# Indica si una generación sigue en curso por no tener plazo o tenerlo vigente.
+#
 def _leased(message, now):
-    """Una generación sin plazo o con plazo vigente sigue en curso."""
     deadline = message.content_data.get("lease_expires_at")
     return deadline is None or datetime.fromisoformat(deadline) > now
 
 
+#
+# Marca como fallidas las generaciones vencidas y rechaza si hay una vigente.
+#
 def _fail_expired_generations(session, conversation_id, names, now):
     for message in _generations(session, conversation_id, names):
         if _leased(message, now):
@@ -56,6 +67,9 @@ def _fail_expired_generations(session, conversation_id, names, now):
         }
 
 
+#
+# Devuelve el último número de secuencia de los mensajes de la conversación.
+#
 def _last_sequence_number(session, conversation_id):
     last = session.scalar(
         select(func.max(Message.sequence_number)).where(Message.conversation_id == conversation_id)
@@ -63,6 +77,9 @@ def _last_sequence_number(session, conversation_id):
     return last or 0
 
 
+#
+# Crea el mensaje del usuario para un turno.
+#
 def _user_message(conversation_id, sequence_number, content, language, names, now):
     return Message(
         conversation_id=conversation_id,
@@ -79,6 +96,9 @@ def _user_message(conversation_id, sequence_number, content, language, names, no
     )
 
 
+#
+# Crea el mensaje provisional del asistente mientras se genera la respuesta.
+#
 def _assistant_placeholder(conversation_id, sequence_number, user, names, now, deadline):
     return Message(
         conversation_id=conversation_id,
@@ -96,11 +116,17 @@ def _assistant_placeholder(conversation_id, sequence_number, user, names, now, d
     )
 
 
+#
+# Deriva un título corto a partir del contenido del primer mensaje.
+#
 def _title_from(content):
     title = " ".join(content.split())
     return title if len(title) <= 80 else title[:77] + "…"
 
 
+#
+# Indica si un mensaje del asistente admite todavía el resultado del turno.
+#
 def _accepts_result(message, turn, names):
     if message is None:
         return False
@@ -112,6 +138,9 @@ def _accepts_result(message, turn, names):
     )
 
 
+#
+# Crea la referencia a una fuente citada por un mensaje.
+#
 def _message_source(message_id, item):
     return MessageSource(
         message_id=message_id,
@@ -123,10 +152,16 @@ def _message_source(message_id, item):
 
 
 class SqlAlchemyConversationCommands:
+    #
+    # Guarda el contexto de base de datos y la configuración de conversaciones.
+    #
     def __init__(self, context, settings):
         self._context = context
         self._settings = settings
 
+    #
+    # Crea una conversación con el título indicado o uno por defecto.
+    #
     def create(self, title):
         with conversation_session(self._context, self._settings) as session:
             item = Conversation(title=title or _DEFAULT_TITLE)
@@ -134,6 +169,9 @@ class SqlAlchemyConversationCommands:
             session.commit()
             return conversation_view(item)
 
+    #
+    # Cambia el título de una conversación y devuelve su vista.
+    #
     def rename(self, conversation_id, title):
         with conversation_session(self._context, self._settings) as session:
             conversation = _locked_conversation(session, conversation_id)
@@ -142,6 +180,9 @@ class SqlAlchemyConversationCommands:
             session.commit()
             return conversation_view(conversation)
 
+    #
+    # Elimina una conversación y sus mensajes, salvo que tenga una respuesta en generación.
+    #
     def delete(self, conversation_id):
         with conversation_session(self._context, self._settings) as session:
             conversation = _locked_conversation(session, conversation_id)
@@ -152,13 +193,15 @@ class SqlAlchemyConversationCommands:
                     "La conversación tiene una respuesta en generación; esperá a que finalice."
                 )
 
-            # Las claves foráneas restringen el borrado: primero las referencias y los mensajes.
             messages = select(Message.id).where(Message.conversation_id == conversation_id)
             session.execute(delete(MessageSource).where(MessageSource.message_id.in_(messages)))
             session.execute(delete(Message).where(Message.conversation_id == conversation_id))
             session.delete(conversation)
             session.commit()
 
+    #
+    # Reserva un turno guardando el mensaje del usuario y un mensaje provisional del asistente.
+    #
     def begin_turn(self, conversation_id, content, language):
         with conversation_session(self._context, self._settings) as session:
             conversation = _locked_conversation(session, conversation_id)
@@ -190,6 +233,9 @@ class SqlAlchemyConversationCommands:
                 user_sequence_number=user.sequence_number,
             )
 
+    #
+    # Cierra un turno guardando la respuesta del asistente y sus fuentes.
+    #
     def finish_turn(self, turn, record):
         with conversation_session(self._context, self._settings) as session:
             conversation = _locked_conversation(session, turn.conversation_id)

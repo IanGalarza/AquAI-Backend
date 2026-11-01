@@ -52,17 +52,24 @@ class _ExecutionLimit(ValueError):
 
 
 class SqlAlchemyPlanExecutor:
+    #
+    # Guarda el contexto de base de datos y la configuración de ejecución SQL.
+    #
     def __init__(self, context: DbContext, settings: SqlExecutionSettings) -> None:
         self._context = context
         self._settings = settings
 
+    #
+    # Ejecuta un plan en una transacción de solo lectura y devuelve su resultado.
+    #
     def execute(self, plan: PlanningResult) -> SqlExecutionResult:
         return _PlanExecution(self._context, self._settings, plan).run()
 
 
 class _PlanExecution:
-    """Una sola ejecución; la operación en curso al fallar determina el código de error."""
-
+    #
+    # Prepara el estado y el resultado inicial de una ejecución de un plan.
+    #
     def __init__(
         self, context: DbContext, settings: SqlExecutionSettings, plan: PlanningResult
     ) -> None:
@@ -82,6 +89,9 @@ class _PlanExecution:
         self._current: OperationExecution | None = None
         self._query_started = 0.0
 
+    #
+    # Ejecuta el plan, traduce los fallos a un error de ejecución y devuelve el resultado final.
+    #
     def run(self) -> SqlExecutionResult:
         result = self._result
         try:
@@ -108,6 +118,9 @@ class _PlanExecution:
 
         return result
 
+    #
+    # Revalida el plan y ejecuta sus consultas dentro de una transacción de solo lectura.
+    #
     def _execute_in_read_only_transaction(self) -> None:
         plan = self._plan
         validate_execution_plan(plan, plan.selected_datasets)
@@ -131,6 +144,9 @@ class _PlanExecution:
                     )
                 self._current = None
 
+    #
+    # Pone la transacción en solo lectura y verifica que quedó activa.
+    #
     def _start_read_only(self, connection) -> None:
         connection.exec_driver_sql("SET TRANSACTION READ ONLY")
         self._configure(connection)
@@ -138,6 +154,9 @@ class _PlanExecution:
             raise PlannerValidationError("No se pudo establecer una transacción de sólo lectura.")
         self._result.read_only = True
 
+    #
+    # Fija el schema de los datasets como único camino de búsqueda de la transacción.
+    #
     def _set_search_path(self, connection) -> None:
         preparer = connection.dialect.identifier_preparer
         schema = preparer.quote_identifier(self._settings.dataset_schema)
@@ -145,6 +164,9 @@ class _PlanExecution:
             select(func.pg_catalog.set_config("search_path", f"{schema}, pg_catalog", True))
         )
 
+    #
+    # Revalida el plan contra el catálogo vigente y devuelve los datasets y operaciones.
+    #
     def _revalidated_plan(self, connection):
         plan = self._plan
         with Session(bind=connection, join_transaction_mode="create_savepoint") as session:
@@ -152,9 +174,12 @@ class _PlanExecution:
             versions = {item.dataset_id: item.verified_version for item in plan.selected_datasets}
             catalog = queries.verified_datasets(list(versions), versions=versions)
             selected, operations = validate_execution_plan(plan, catalog)
-            session.commit()  # Libera el savepoint, no la transacción externa READ ONLY.
+            session.commit()
         return selected, operations
 
+    #
+    # Agrega una advertencia si la conexión usa un rol con privilegios elevados.
+    #
     def _warn_privileged_role(self, connection) -> None:
         privileges = connection.execute(
             text(
@@ -166,6 +191,9 @@ class _PlanExecution:
                 "La conexión usa un rol privilegiado; se aplica READ ONLY. Configurar SQL_EXECUTION_DATABASE_URL con un rol restringido para defensa adicional."
             )
 
+    #
+    # Carga las tablas físicas autorizadas de los datasets seleccionados.
+    #
     def _authorized_tables(self, connection, selected: list[VerifiedDataset]) -> dict:
         schema = self._settings.dataset_schema
         table_names = set(inspect(connection).get_table_names(schema=schema))
@@ -184,6 +212,9 @@ class _PlanExecution:
             )
         return tables
 
+    #
+    # Compila las operaciones del plan y crea el registro de ejecución de cada una.
+    #
     def _compile_operations(self, operations, tables: dict):
         records: dict[str, OperationExecution] = {}
         compiled: dict[str, CompiledStep] = {}
@@ -200,9 +231,15 @@ class _PlanExecution:
             _compile_operation(step, record, compiled, tables)
         return records, compiled
 
+    #
+    # Devuelve los mensajes de validación asociados a un paso del plan.
+    #
     def _validation_warnings(self, step_id: str) -> list[str]:
         return [issue.message for issue in self._plan.validation_issues if issue.step_id == step_id]
 
+    #
+    # Calcula los bytes que ocupan los metadatos y falla si superan el límite del resultado.
+    #
     def _metadata_bytes(self) -> int:
         result = self._result
         used_bytes = len(result.model_dump_json().encode("utf-8")) + 4096
@@ -216,6 +253,9 @@ class _PlanExecution:
             raise _ExecutionLimit("Los metadatos del resultado superan el límite configurado.")
         return used_bytes
 
+    #
+    # Ejecuta una consulta objetivo dentro del presupuesto restante y registra su resultado.
+    #
     def _run_target(self, connection, step, item: CompiledStep, records, used_bytes: int) -> int:
         settings = self._settings
         record = records[step.id]
@@ -243,6 +283,9 @@ class _PlanExecution:
         _link_ancestors(item, records, step.id)
         return used_bytes
 
+    #
+    # Lee las filas de una consulta por lotes respetando los límites de tiempo, filas y bytes.
+    #
     def _stream_rows(
         self, connection, query, guard_name: str, step, remaining: int, used_bytes: int
     ) -> int:
@@ -277,6 +320,9 @@ class _PlanExecution:
                 used_bytes += row_bytes
         return used_bytes
 
+    #
+    # Marca como fallida la operación que estaba en curso cuando ocurrió el error.
+    #
     def _mark_interrupted_operation(self) -> None:
         current = self._current
         error = self._result.error
@@ -287,6 +333,9 @@ class _PlanExecution:
         current.truncated = bool(current.rows)
         current.duration_ms = round((perf_counter() - self._query_started) * 1000, 3)
 
+    #
+    # Advierte de las operaciones Python cuyas entradas están pendientes o incompletas.
+    #
     def _warn_incomplete_python_inputs(self) -> None:
         records = {item.operation_id: item for item in self._result.operations}
         for step in self._plan.operations:
@@ -302,6 +351,9 @@ class _PlanExecution:
                     "Hay entradas pendientes o incompletas; no se autoriza calcular sobre un prefijo como si fuera el conjunto completo."
                 )
 
+    #
+    # Cierra el resultado con operaciones pendientes, estado final y duración.
+    #
     def _finish(self) -> None:
         result = self._result
         result.pending_operations = [
@@ -311,6 +363,9 @@ class _PlanExecution:
         result.finished_at = datetime.now(timezone.utc)
         result.duration_ms = round((perf_counter() - self._started) * 1000, 3)
 
+    #
+    # Aplica los tiempos límite de consulta y bloqueo según el tiempo total restante.
+    #
     def _configure(self, connection) -> None:
         settings = self._settings
         remaining = int(settings.max_duration_ms - (perf_counter() - self._started) * 1000)
@@ -327,12 +382,18 @@ class _PlanExecution:
             ).scalar_one()
 
 
+#
+# Traduce un error de base de datos en un error de ejecución con código y mensaje.
+#
 def _database_error(error: SQLAlchemyError) -> ExecutionError:
     sqlstate = getattr(getattr(error, "orig", None), "sqlstate", None)
     code, message = _DATABASE_ERRORS.get(sqlstate, _UNKNOWN_DATABASE_ERROR)
     return ExecutionError(code=code, message=message)
 
 
+#
+# Convierte un dataset verificado en el dataset descrito en el resultado de ejecución.
+#
 def _execution_dataset(item: VerifiedDataset) -> ExecutionDataset:
     return ExecutionDataset(
         dataset_id=item.dataset_id,
@@ -344,6 +405,9 @@ def _execution_dataset(item: VerifiedDataset) -> ExecutionDataset:
     )
 
 
+#
+# Devuelve los datasets de entrada de un paso, incluidos los de sus dependencias.
+#
 def _input_dataset_ids(step, records: dict[str, OperationExecution]) -> list:
     dataset_ids = {ref.dataset_id for ref in step.columns}
     for dependency in step.depends_on:
@@ -351,6 +415,9 @@ def _input_dataset_ids(step, records: dict[str, OperationExecution]) -> list:
     return sorted(dataset_ids, key=str)
 
 
+#
+# Compila un paso a SQL o lo marca como pendiente, bloqueado o no soportado.
+#
 def _compile_operation(step, record: OperationExecution, compiled: dict, tables: dict) -> None:
     if step.tool == "python":
         record.status = "pending_python"
@@ -377,6 +444,9 @@ def _compile_operation(step, record: OperationExecution, compiled: dict, tables:
     record.warnings.extend(compiled[step.id].warnings)
 
 
+#
+# Determina los pasos compilados cuya consulta debe ejecutarse.
+#
 def _query_targets(operations, compiled: dict, output_steps: list[str]) -> list:
     consumed = set()
     pending_inputs = set()
@@ -398,17 +468,21 @@ def _query_targets(operations, compiled: dict, output_steps: list[str]) -> list:
     return targets
 
 
+#
+# Devuelve la clave de orden de un paso, con los pasos de salida primero y en su orden.
+#
 def _output_order(step_id: str, output_steps: list[str]) -> tuple[bool, int]:
     if step_id in output_steps:
         return False, output_steps.index(step_id)
     return True, 0
 
 
+#
+# Construye la consulta de un paso acotada por filas restantes y tamaño máximo de fila.
+#
 def _bounded_query(step, item: CompiledStep, remaining: int, settings: SqlExecutionSettings):
     ties = step.limit is not None and bool(step.order_by)
     fetch_limit = min(step.limit, remaining + 1) if step.limit is not None else remaining + 1
-    # Con empates el paso ya acota sus filas (FETCH ... WITH TIES); el presupuesto
-    # total se aplica afuera para no recortar un empate.
     base = (item.statement if ties else item.statement.limit(fetch_limit)).subquery()
 
     columns = [base.c[column.name] for column in step.output_fields]
@@ -426,14 +500,19 @@ def _bounded_query(step, item: CompiledStep, remaining: int, settings: SqlExecut
     return query, guard_name
 
 
+#
+# Construye la condición que detecta filas demasiado grandes para no transferirlas.
+#
 def _row_size_guard(columns, settings: SqlExecutionSettings):
-    """PostgreSQL anula y marca las filas demasiado grandes, para no transferir sus valores."""
     size = sum(
         func.coalesce(func.pg_catalog.octet_length(cast(column, Text)), 0) for column in columns
     )
     return size <= min(settings.max_row_bytes, settings.max_result_bytes)
 
 
+#
+# Devuelve un nombre de columna de guarda que no choque con las columnas existentes.
+#
 def _unused_guard_name(base) -> str:
     guard_index = 0
     guard_name = "__aquai_size_guard_0"
@@ -443,6 +522,9 @@ def _unused_guard_name(base) -> str:
     return guard_name
 
 
+#
+# Construye el orden de una columna con los valores nulos al final.
+#
 def _nulls_last_ordering(base, ordering):
     field = ordering.field
     name = field.column if hasattr(field, "column") else field.field
@@ -451,11 +533,17 @@ def _nulls_last_ordering(base, ordering):
     return directed.nulls_last()
 
 
+#
+# Valida los valores de una fila y devuelve solo las columnas de salida.
+#
 def _validated_row(mapping, output_fields) -> dict:
     values = {column.name: mapping[column.name] for column in output_fields}
     return _row_adapter.validate_python(values)
 
 
+#
+# Registra la consulta ejecutada en los pasos antecesores y los marca como ejecutados.
+#
 def _link_ancestors(item: CompiledStep, records: dict, step_id: str) -> None:
     for ancestor in item.ancestors:
         record = records[ancestor]
@@ -464,6 +552,9 @@ def _link_ancestors(item: CompiledStep, records: dict, step_id: str) -> None:
             record.status = "executed_as_dependency"
 
 
+#
+# Calcula el estado final de la ejecución según errores, pendientes y truncamientos.
+#
 def _final_status(result: SqlExecutionResult) -> str:
     executed = any(item.status in _EXECUTED_STATUSES for item in result.operations)
     if result.error:

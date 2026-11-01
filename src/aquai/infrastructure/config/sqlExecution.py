@@ -15,11 +15,17 @@ class SqlExecutionSettings(BaseSettings):
     max_result_bytes: int = Field(default=1048576, ge=1024, le=10485760)
     max_row_bytes: int = Field(default=65536, ge=128, le=1048576)
 
+    #
+    # Convierte una URL vacía en None.
+    #
     @field_validator("database_url", mode="before")
     @classmethod
     def empty_url(cls, value):
         return None if value == "" else value
 
+    #
+    # Valida que el schema de datasets no sea uno interno del motor.
+    #
     @field_validator("dataset_schema")
     @classmethod
     def application_schema(cls, value):

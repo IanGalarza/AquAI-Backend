@@ -9,8 +9,6 @@ from aquai.domain.enums.sourceStatus import ProcessingStatus, SemanticIndexStatu
 
 
 class RetrievedColumn(ColumnDetail):
-    # Conserva también header_values, unit_evidence, source_column/source_row y
-    # futuros metadatos de ingesta, sin duplicar el contrato de columnas existente.
     model_config = ConfigDict(extra="allow")
 
 
@@ -61,7 +59,6 @@ class DatasetEvidence(BaseModel):
     value_matches: dict[str, list[ValueMatch]] = Field(default_factory=dict)
     variable_matches: dict[str, list[str]] = Field(default_factory=dict)
     dimension_matches: dict[str, list[str]] = Field(default_factory=dict)
-    # Otros valores de la columna donde está un valor mencionado, de más a menos registros con la variable.
     category_values: dict[str, list[str]] = Field(default_factory=dict)
 
 
@@ -86,7 +83,6 @@ class DatasetRetrievalResult(BaseModel):
     retrieval_method: Literal["semantic", "explicit"] = "semantic"
     verified_at: datetime
     status: Literal["candidates_available", "no_available_candidates"]
-    # La similitud coseno no confirma que las columnas permitan responder.
     relevance: Literal["unassessed"] = "unassessed"
     requires_planner_review: Literal[True] = True
     warnings: list[str] = Field(default_factory=list)

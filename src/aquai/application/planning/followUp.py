@@ -1,5 +1,3 @@
-"""Seguimientos: qué conserva, reemplaza o reutiliza un plan del análisis verificado que cita."""
-
 from uuid import UUID
 
 from pydantic import ValidationError
@@ -21,10 +19,8 @@ from aquai.application.Rules.vocabulary import (
 _VALUE_OPERATORS = {"eq", "ieq", "in"}
 _TEMPORAL_TYPES = {"DATE", "TIMESTAMP"}
 _NUMERIC_TYPES = {"NUMERIC", "BIGINT"}
-# Una fecha agrupada se rotula por su período, no como un día concreto.
 _GRAIN_LABELS = {"day": "Día", "month": "Mes", "year": "Año"}
 _GRAIN_FIELDS = {"day": "dia", "month": "mes", "year": "anio"}
-# Cálculos que un seguimiento sin otra estadística conserva y la validación exige.
 _CONSERVED_STATISTICS = {"mean", "median", "sum", "stddev", "count"}
 _STEP_FIELDS = (
     "id",
@@ -40,11 +36,16 @@ _STEP_FIELDS = (
 )
 
 
+#
+# Devuelve las operaciones del análisis citado.
+#
 def previous_operations(analysis) -> set[str]:
-    """Operaciones del resultado citado: un latest o un gráfico se conservan aunque su pedido ya no esté en el texto."""
     return {str(item.get("operation")) for item in analysis.operations} if analysis else set()
 
 
+#
+# Devuelve la agrupación temporal que pide la pregunta, si la hay.
+#
 def requested_time_grain(question: str) -> str | None:
     return next(
         (grain for grain, cues in TIME_GRAIN_CUES.items() if contains_any_phrase(question, cues)),
@@ -52,8 +53,10 @@ def requested_time_grain(question: str) -> str | None:
     )
 
 
+#
+# Devuelve la precisión del período que la pregunta pide conocer, si la hay.
+#
 def requested_period(question: str) -> str | None:
-    """Precisión del período que la pregunta pide conocer: «¿de qué año es?» → year, «¿cuándo?» → day."""
     return next(
         (
             precision
@@ -64,8 +67,10 @@ def requested_period(question: str) -> str | None:
     )
 
 
+#
+# Devuelve la agrupación temporal del análisis citado si fue una sola.
+#
 def conserved_time_grain(analysis) -> str | None:
-    """Agrupación temporal del resultado citado («por mes»), si fue una sola."""
     if analysis is None:
         return None
 
@@ -77,8 +82,10 @@ def conserved_time_grain(analysis) -> str | None:
     return grains.pop() if len(grains) == 1 else None
 
 
+#
+# Devuelve las estadísticas del análisis citado que un seguimiento conserva.
+#
 def conserved_statistics(analysis, question) -> list[str]:
-    """«¿Y la turbiedad?» después de un promedio pide el mismo cálculo; nombrar otra estadística lo reemplaza."""
     if analysis is None or contains_any_phrase(question, MEASURED_STATISTICS):
         return []
 
@@ -90,10 +97,10 @@ def conserved_statistics(analysis, question) -> list[str]:
     return [item for item in dict.fromkeys(functions) if item in _CONSERVED_STATISTICS]
 
 
+#
+# Devuelve los valores de filtro del análisis citado que la consulta vigente ya no nombra.
+#
 def stale_values(analysis, mentions) -> list[str]:
-    """Valores que filtraban el resultado citado y la consulta vigente ya no nombra: se reemplazaron o se quitaron.
-
-    «¿Y en Punta Piedras?» después de Punta Lara: PUNTA LARA deja de ser un filtro aunque el modelo lo copie."""
     if analysis is None:
         return []
 
@@ -110,12 +117,17 @@ def stale_values(analysis, mentions) -> list[str]:
     return [value for value in dict.fromkeys(values) if not _names_value(value, named)]
 
 
+#
+# Indica si algún texto mencionado nombra el valor.
+#
 def _names_value(value, mentions) -> bool:
     return any(contains_phrase(value, text) or contains_phrase(text, value) for text in mentions)
 
 
+#
+# Quita de las lecturas los filtros de igualdad cuyos valores pertenecen al alcance reemplazado.
+#
 def without_stale_filters(decision, stale):
-    """Quita de los read los filtros de igualdad cuyos valores son todos del alcance reemplazado."""
     if not stale or decision.status != "plannable":
         return decision
 
@@ -131,6 +143,9 @@ def without_stale_filters(decision, stale):
     return changed if modified else decision
 
 
+#
+# Indica si un filtro de igualdad solo contiene valores obsoletos.
+#
 def _stale(predicate, known) -> bool:
     texts = [value for value in predicate.values if isinstance(value, str)]
     return (
@@ -141,10 +156,10 @@ def _stale(predicate, known) -> bool:
     )
 
 
+#
+# Cambia la agrupación por fecha exacta a la agrupación temporal pedida.
+#
 def with_time_grain(decision, grain, column_types):
-    """«Promedio por mes»: el group_by de una fecha exacta pasa a agruparla por mes.
-
-    Sólo si ningún group_by usa ya esa agrupación; column_types son los tipos SQL por (dataset_id, sql_name)."""
     if grain is None or decision.status != "plannable":
         return decision
 
@@ -168,9 +183,10 @@ def with_time_grain(decision, grain, column_types):
     return changed if modified else decision
 
 
+#
+# Agrega la fecha agrupada por período a los aggregate que no agrupan ninguna fecha.
+#
 def _undated_aggregates(decision, grain, column_types) -> bool:
-    """Un aggregate que no agrupa ninguna fecha no responde «por mes»: se agrega la única fecha de su dataset
-    agrupada por ese período. Con varias fechas en el dataset no se elige y la validación pide corregirlo."""
     steps = {step.id: step for step in decision.steps}
     modified = False
     for step in decision.steps:
@@ -198,10 +214,10 @@ def _undated_aggregates(decision, grain, column_types) -> bool:
     return modified
 
 
+#
+# Agrega la agrupación temporal que otros pasos usan pero su aggregate no expone.
+#
 def _grouped_periods(decision, grain, column_types) -> bool:
-    """Un paso que usa un campo que su aggregate no expone («mes») delata el group_by temporal omitido.
-
-    Con la agrupación pedida o conservada, ese campo es la única fecha del dataset agrupada por ese período."""
     steps = {step.id: step for step in decision.steps}
     modified = False
     for ref in (ref for step in decision.steps for ref in _used_fields(step)):
@@ -225,6 +241,9 @@ def _grouped_periods(decision, grain, column_types) -> bool:
     return modified
 
 
+#
+# Devuelve las referencias a resultados que usan el orden, los filtros y el gráfico de un paso.
+#
 def _used_fields(step):
     refs = [item.field for item in [*step.order_by, *step.filters]]
     if step.visualization is not None:
@@ -232,8 +251,10 @@ def _used_fields(step):
     return [ref for ref in refs if isinstance(ref, ResultRef)]
 
 
+#
+# Devuelve la única columna de fecha del dataset de la lectura, agregándola si falta.
+#
 def _only_date(read, decision, column_types):
-    """La única columna DATE/TIMESTAMP del dataset del read; se agrega a la lectura si no la incluía."""
     if read is None or read.operation != "read" or not read.columns:
         return None
 
@@ -255,8 +276,10 @@ def _only_date(read, decision, column_types):
     return column
 
 
+#
+# Devuelve el tipo SQL de la columna leída que llega a un campo.
+#
 def _field_type(ref, steps, column_types):
-    """Tipo de la columna leída que llega a un campo a través de sort y latest."""
     if isinstance(ref, ColumnRef):
         return column_types.get((ref.dataset_id, ref.column))
 
@@ -270,11 +293,10 @@ def _field_type(ref, steps, column_types):
     return column_types.get((column.dataset_id, column.column)) if column else None
 
 
+#
+# Construye un plan que grafica el resultado verificado anterior reutilizando sus operaciones.
+#
 def reused_decision(analysis, catalog, question):
-    """«Ahora mostralo en un gráfico»: las mismas operaciones verificadas y un visualize sobre su resultado.
-
-    Sólo si el resultado citado es una única tabla de varias filas con una categoría o fecha y un valor numérico
-    y sus datasets conservan la versión verificada; si no, el Planner vuelve a planificar."""
     if analysis is None or not analysis.complete or analysis.status != "validated":
         return None
     if not _same_versions(analysis.sources, catalog):
@@ -298,7 +320,7 @@ def reused_decision(analysis, catalog, question):
 
     chain = [steps[key] for key in steps if key in _ancestry(target["id"], steps)]
     if any(item.get("limit") == 1 for item in chain):
-        return None  # Una única fila no se grafica.
+        return None
 
     data = {
         "status": "plannable",
@@ -317,9 +339,10 @@ def reused_decision(analysis, catalog, question):
         return None
 
 
+#
+# Construye un plan que repite las operaciones verificadas del resultado citado para leer sus fechas.
+#
 def repeated_decision(analysis, catalog):
-    """«¿Y de qué año es?»: las mismas operaciones verificadas del resultado citado, sin gráficos, para leer sus
-    fechas. Sólo si sus datasets conservan la versión verificada."""
     if analysis is None or not analysis.complete or analysis.status != "validated":
         return None
     if not _same_versions(analysis.sources, catalog):
@@ -333,7 +356,6 @@ def repeated_decision(analysis, catalog):
             if item.get("operation_id") in steps
         )
     )
-    # Los pasos intermedios también se citan como evidencia; se publican sólo los finales de cada rama.
     inputs = {key for output in referenced for key in _ancestry(output, steps) - {output}}
     outputs = [key for key in referenced if key not in inputs]
     if not outputs:
@@ -358,10 +380,10 @@ def repeated_decision(analysis, catalog):
         return None
 
 
+#
+# Construye un plan que calcula la primera y última fecha de los registros del resultado citado.
+#
 def period_span_decision(analysis, catalog):
-    """«¿Y de qué año es?» sobre un resultado sin fechas (un promedio): la primera y la última fecha de los registros
-    que leyó, con sus mismos filtros. Sólo para datasets con una única columna DATE/TIMESTAMP y sin cambios de
-    versión; los filtros posteriores a la lectura (umbrales sobre promedios) no acotan ese período."""
     if analysis is None or not analysis.complete or analysis.status != "validated":
         return None
     if not _same_versions(analysis.sources, catalog):
@@ -415,6 +437,9 @@ def period_span_decision(analysis, catalog):
         return None
 
 
+#
+# Construye el paso que calcula la primera y última fecha de una lectura.
+#
 def _date_span(step_id, read_id, column) -> dict:
     field = {"kind": "result", "step_id": read_id, "field": column}
     return {
@@ -430,9 +455,10 @@ def _date_span(step_id, read_id, column) -> dict:
     }
 
 
+#
+# Devuelve los campos de un resultado que ubican sus filas en el tiempo.
+#
 def period_fields(step, steps, periods) -> list[str]:
-    """Campos de un resultado que ubican sus filas en el tiempo: fechas, períodos TEXT verificados o la fecha
-    agrupada por día, mes o año. steps son los pasos validados por id; periods, las columnas TEXT de períodos."""
     texts = {(item.dataset_id, item.column) for item in periods}
     origin = step
     while origin is not None and origin.operation in {"sort", "latest"} and origin.depends_on:
@@ -454,6 +480,9 @@ def period_fields(step, steps, periods) -> list[str]:
     ]
 
 
+#
+# Indica si las fuentes del análisis conservan las versiones verificadas del catálogo.
+#
 def _same_versions(sources, catalog) -> bool:
     versions = {item.dataset_id: item.verified_version for item in catalog}
     return bool(sources) and all(
@@ -461,6 +490,9 @@ def _same_versions(sources, catalog) -> bool:
     )
 
 
+#
+# Devuelve el paso indicado y todos los pasos de los que depende.
+#
 def _ancestry(key, steps) -> set[str]:
     found, pending = set(), [key]
     while pending:
@@ -471,12 +503,18 @@ def _ancestry(key, steps) -> set[str]:
     return found
 
 
+#
+# Copia un paso verificado como propuesta de repetición con su propósito.
+#
 def _proposed(step) -> dict:
     proposed = {key: step[key] for key in _STEP_FIELDS if key in step}
     proposed["purpose"] = "Repite el paso verificado del resultado anterior."
     return proposed
 
 
+#
+# Construye la selección de datasets y columnas que usan las lecturas de la cadena.
+#
 def _selections(chain, sources) -> list[dict]:
     columns = {}
     reads = [step for step in chain if step["operation"] == "read"]
@@ -495,11 +533,14 @@ def _selections(chain, sources) -> list[dict]:
     ]
 
 
+#
+# Construye el paso de gráfico para el resultado, o None si no se puede graficar.
+#
 def _chart(target, steps, question, catalog):
     fields = target.get("output_fields") or []
     origin = _origin(target, steps)
     if origin is None or (origin["operation"] == "aggregate" and not origin.get("group_by")):
-        return None  # Un único valor no se grafica.
+        return None
 
     grouped = [item.get("output_name") for item in origin.get("group_by") or []]
     x = _category(fields, grouped)
@@ -534,14 +575,19 @@ def _chart(target, steps, question, catalog):
     }
 
 
+#
+# Devuelve el paso de origen de un resultado, saltando los sort y latest.
+#
 def _origin(step, steps):
     while step is not None and step["operation"] in {"sort", "latest"} and step.get("depends_on"):
         step = steps.get(step["depends_on"][0])
     return step
 
 
+#
+# Devuelve el campo que sirve de eje x: agrupación, fecha o primera categoría de texto.
+#
 def _category(fields, grouped):
-    """El eje x es la agrupación del resultado; sin agrupar, su fecha o su primera categoría de texto."""
     by_name = {item["name"]: item for item in fields}
     candidates = [
         *(by_name[name] for name in grouped if name in by_name),
@@ -551,8 +597,10 @@ def _category(fields, grouped):
     return candidates[0] if candidates else None
 
 
+#
+# Devuelve el tipo de gráfico pedido si los ejes lo admiten, o uno por defecto.
+#
 def _chart_type(question, x):
-    """El tipo pedido, si los ejes lo admiten; sin pedido, línea para fechas y barras para categorías."""
     temporal = x is not None and x["sql_type"] in _TEMPORAL_TYPES
     numeric = x is not None and x["sql_type"] in _NUMERIC_TYPES
     asked = next(
@@ -564,10 +612,13 @@ def _chart_type(question, x):
     if asked == "line" and not (temporal or numeric):
         return None
     if asked in {"scatter", "histogram"}:
-        return None  # Requieren otros ejes: los decide el Planner.
+        return None
     return asked
 
 
+#
+# Devuelve el nombre original de cada columna por dataset y columna.
+#
 def _labels(catalog) -> dict[tuple, str]:
     return {
         (str(dataset.dataset_id), column.sql_name): column.original_name
@@ -576,6 +627,9 @@ def _labels(catalog) -> dict[tuple, str]:
     }
 
 
+#
+# Devuelve el dataset y la columna de origen de un campo, si es único.
+#
 def _source(field) -> tuple | None:
     sources = field.get("sources") or []
     if len(sources) != 1:
@@ -583,6 +637,9 @@ def _source(field) -> tuple | None:
     return str(sources[0].get("dataset_id")), sources[0].get("column")
 
 
+#
+# Devuelve un identificador de paso que no esté en uso.
+#
 def _unused_id(base, steps) -> str:
     key, index = base, 1
     while key in steps:

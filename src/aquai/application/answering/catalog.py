@@ -21,6 +21,9 @@ _ENGLISH_STATES = (
 )
 
 
+#
+# Construye los segmentos de respuesta que describen las fuentes y tablas del catálogo.
+#
 def catalog_segments(catalog, focus_dataset_ids=(), language="es") -> list[AnswerSegment]:
     focus = set(focus_dataset_ids)
     datasets = [dataset for source in catalog for dataset in source["datasets"]]
@@ -34,6 +37,9 @@ def catalog_segments(catalog, focus_dataset_ids=(), language="es") -> list[Answe
     return _overview_segments(catalog, datasets, available, language)
 
 
+#
+# Devuelve el aviso de que todavía no hay fuentes cargadas.
+#
 def _no_sources(language):
     if language == "es":
         return (
@@ -47,6 +53,9 @@ def _no_sources(language):
     )
 
 
+#
+# Construye los segmentos de las tablas del catálogo que el usuario pidió ver.
+#
 def _focused_segments(catalog, focus, language):
     segments = []
     for source in catalog:
@@ -58,6 +67,9 @@ def _focused_segments(catalog, focus, language):
     return segments
 
 
+#
+# Construye el segmento que describe una tabla: cantidad de filas y lista de columnas.
+#
 def _table_segment(source, dataset, label, language):
     es = language == "es"
     rows = _rows_text(dataset["row_count"], language)
@@ -75,6 +87,9 @@ def _table_segment(source, dataset, label, language):
     return AnswerSegment(text=text, items=[_column(column) for column in dataset["columns"]])
 
 
+#
+# Construye el resumen general de las fuentes cargadas y su cierre.
+#
 def _overview_segments(catalog, datasets, available, language):
     header = _inventory(catalog, datasets, available, language)
     notes = _state_notes(catalog, language)
@@ -86,6 +101,9 @@ def _overview_segments(catalog, datasets, available, language):
     return [AnswerSegment(text=header, items=items), AnswerSegment(text=_closing(language))]
 
 
+#
+# Devuelve la frase con el total de fuentes y tablas disponibles para consultar.
+#
 def _inventory(catalog, datasets, available, language):
     partial = len(available) != len(datasets)
     if language == "es":
@@ -101,6 +119,9 @@ def _inventory(catalog, datasets, available, language):
     return f"You have {sources} with {tables}{prepared}."
 
 
+#
+# Devuelve las notas sobre fuentes desactivadas, en procesamiento o con error.
+#
 def _state_notes(catalog, language):
     inactive = sum(not source["is_active"] for source in catalog)
     pending = sum(source["processing_status"] in _PROCESSING_STATUSES for source in catalog)
@@ -114,6 +135,9 @@ def _state_notes(catalog, language):
     return notes
 
 
+#
+# Devuelve la línea de una fuente con su estado y el resumen de sus tablas.
+#
 def _source_item(source, language):
     labels = _tables(source["datasets"], language)
     summaries = [
@@ -127,6 +151,9 @@ def _source_item(source, language):
     return f"{source['name']}{_source_state(source, language)}: " + tables
 
 
+#
+# Devuelve el resumen de una tabla: su nombre, sus filas y si no está disponible.
+#
 def _table_summary(dataset, label, language):
     text = f"{label} ({_rows_text(dataset['row_count'], language)})"
     if dataset["available"]:
@@ -135,6 +162,9 @@ def _table_summary(dataset, label, language):
     return text + (", no disponible para consultas" if language == "es" else ", not queryable")
 
 
+#
+# Devuelve el estado de una fuente: desactivada, en procesamiento o con error.
+#
 def _source_state(source, language):
     es = language == "es"
     state = "" if source["is_active"] else (" (desactivada)" if es else " (inactive)")
@@ -146,6 +176,9 @@ def _source_state(source, language):
     return state
 
 
+#
+# Devuelve la invitación final a preguntar por las variables o pedir cálculos.
+#
 def _closing(language):
     if language == "es":
         return (
@@ -155,12 +188,18 @@ def _closing(language):
     return "You can ask about the variables in a source or request calculations on its data."
 
 
+#
+# Devuelve el texto con la cantidad de filas, en singular o plural.
+#
 def _rows_text(total, language):
     es = language == "es"
 
     return count_text(total, "fila" if es else "row", "filas" if es else "rows", language)
 
 
+#
+# Devuelve la etiqueta de una columna con su unidad formateada.
+#
 def _column(column):
     unit = column.get("unit")
     label = column_label(column["original_name"], unit)
@@ -170,6 +209,9 @@ def _column(column):
     return f"{label} ({format_unit(unit)})"
 
 
+#
+# Devuelve las etiquetas de las tablas, numerando las que se repiten.
+#
 def _tables(datasets, language):
     labels = [dataset_label(item["name"]) for item in datasets]
     word = "tabla" if language == "es" else "table"

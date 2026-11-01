@@ -18,7 +18,6 @@ from aquai.application.errors import LLMProviderError
 from aquai.application.interfaces.routing import GeneralResponseProvider
 from aquai.application.interfaces.sources import SourceQueries
 
-# Bloques o firmas de código: AquAI explica en palabras y no entrega programas.
 _CODE = re.compile(
     r"```|^\s*(?:def|class|import|from\s+\S+\s+import|SELECT|function|public\s+class)\b",
     re.IGNORECASE | re.MULTILINE,
@@ -27,10 +26,16 @@ _SEGMENTS = TypeAdapter(list[AnswerSegment])
 
 
 class GenerateDirectResponseService:
+    #
+    # Guarda el proveedor de respuestas generales y, opcionalmente, el acceso al catálogo.
+    #
     def __init__(self, provider: GeneralResponseProvider, catalog: SourceQueries | None = None):
         self._provider = provider
         self._catalog = catalog
 
+    #
+    # Genera la respuesta de una consulta no analítica según la ruta decidida por el Router.
+    #
     async def generate(self, state):
         routing = state.routing
         if routing is None or routing.route == "data":
@@ -71,6 +76,9 @@ class GenerateDirectResponseService:
 
         return await self._general_response(response, state, routing, selected)
 
+    #
+    # Arma la respuesta que pide una aclaración al usuario.
+    #
     def _clarification_response(self, response, routing):
         response.response_type = "clarification"
         response.status = "needs_clarification"
@@ -79,8 +87,10 @@ class GenerateDirectResponseService:
 
         return response
 
+    #
+    # Arma la respuesta de catálogo con el inventario de fuentes leído de PostgreSQL.
+    #
     async def _catalog_response(self, response, routing):
-        """El inventario proviene de PostgreSQL en este turno, nunca del conocimiento del LLM."""
         response.response_type = "catalog"
         if self._catalog is None:
             return self._failure(response, "catalog_unavailable", "El catálogo no está disponible.")
@@ -105,6 +115,9 @@ class GenerateDirectResponseService:
 
         return response
 
+    #
+    # Reproduce una respuesta anterior con sus fuentes y referencias, sin ejecutar una nueva consulta.
+    #
     def _historical_response(self, response, routing, message):
         analysis = message.analysis
         response.response_type = "historical"
@@ -136,6 +149,9 @@ class GenerateDirectResponseService:
 
         return response
 
+    #
+    # Obtiene una respuesta de conocimiento general del modelo con el contexto de los mensajes citados.
+    #
     async def _general_response(self, response, state, routing, selected):
         context = {
             "question": state.question,
@@ -157,6 +173,9 @@ class GenerateDirectResponseService:
 
         return response
 
+    #
+    # Publica la respuesta general validando su idioma y reemplazando cualquier código generado.
+    #
     def _publish_reply(self, response, reply, language):
         response.generation.input_tokens = reply.input_tokens
         response.generation.output_tokens = reply.output_tokens
@@ -173,11 +192,17 @@ class GenerateDirectResponseService:
         response.generation.model = reply.model
         response.generation.status = "generated"
 
+    #
+    # Guarda el texto como respuesta y lo divide en segmentos.
+    #
     @staticmethod
     def _publish(response, text):
         response.answer = text
         response.segments = segments_from_text(text)
 
+    #
+    # Devuelve los segmentos de un mensaje anterior, reconstruyéndolos desde su texto si no son válidos.
+    #
     @staticmethod
     def _historical_segments(message, response):
         if message.text_complete and message.segments:
@@ -190,6 +215,9 @@ class GenerateDirectResponseService:
 
         return segments_from_text(message.text, evidence_ids)
 
+    #
+    # Marca la respuesta como fallida, publica un aviso al usuario y registra el error.
+    #
     @classmethod
     def _failure(cls, response, code, message):
         response.status = "failed"
@@ -209,6 +237,9 @@ class GenerateDirectResponseService:
         return response
 
 
+#
+# Crea la respuesta inicial determinística de una consulta no analítica.
+#
 def _initial_response(state, routing) -> QueryResponse:
     return QueryResponse(
         response_type="general",
@@ -222,6 +253,9 @@ def _initial_response(state, routing) -> QueryResponse:
     )
 
 
+#
+# Devuelve los mensajes del historial citados por la ruta, o None si alguno no existe.
+#
 def _selected_history(state, routing):
     messages = {item.message_id: item for item in state.conversation_history}
 
@@ -231,9 +265,10 @@ def _selected_history(state, routing):
     return [messages[key] for key in routing.history_message_ids]
 
 
+#
+# Selecciona los párrafos con resultados de una respuesta anterior, sin adjuntos, o la respuesta entera.
+#
 def _result_paragraphs(segments):
-    """Una referencia al resultado anterior («¿Y de qué año es?») muestra sus párrafos con resultados, sin repetir
-    introducciones, tablas ni gráficos; una respuesta sin párrafos citados se muestra entera."""
     cited = [
         segment.model_copy(update={"attachment": None})
         for segment in segments
@@ -242,6 +277,9 @@ def _result_paragraphs(segments):
     return cited or segments
 
 
+#
+# Devuelve el aviso de que se reproduce un resultado ya calculado, según el idioma.
+#
 def _replay_notice(language, attached):
     if language == "es":
         suffix = " Sus tablas y gráficos siguen en ese mensaje." if attached else ""
@@ -252,6 +290,9 @@ def _replay_notice(language, attached):
     return "This is the result I already calculated; I did not query the data again." + suffix
 
 
+#
+# Devuelve el texto que explica que AquAI no genera código de programación.
+#
 def _code_refusal(language):
     if language == "es":
         return (
@@ -266,6 +307,9 @@ def _code_refusal(language):
     )
 
 
+#
+# Copia al registro de generación los tokens informados por un error del proveedor.
+#
 def _record_error_tokens(generation, error):
     for field in ("input_tokens", "output_tokens"):
         value = getattr(error, field, None)

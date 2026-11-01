@@ -50,6 +50,9 @@ SINGLE_FILE_FIELD_ERROR = (
 )
 
 
+#
+# Devuelve el runtime de fuentes de la aplicación o responde 503 si no está disponible.
+#
 def _get_source_runtime(request: Request) -> SourceRuntime:
     sources = getattr(request.app.state, "sources", None)
 
@@ -59,18 +62,30 @@ def _get_source_runtime(request: Request) -> SourceRuntime:
     return sources
 
 
+#
+# Devuelve el manejador que carga fuentes.
+#
 def get_upload_source_handler(request: Request) -> UploadSourceHandler:
     return _get_source_runtime(request).upload
 
 
+#
+# Devuelve el manejador que lista fuentes.
+#
 def get_list_sources_handler(request: Request) -> ListSourcesHandler:
     return _get_source_runtime(request).list
 
 
+#
+# Devuelve el manejador que consulta una fuente.
+#
 def get_source_handler(request: Request) -> GetSourceHandler:
     return _get_source_runtime(request).get
 
 
+#
+# Devuelve el manejador que activa o desactiva fuentes.
+#
 def get_activate_source_handler(request: Request) -> ActivateSourceHandler:
     return _get_source_runtime(request).activate
 
@@ -81,6 +96,9 @@ GetSourceDependency = Annotated[GetSourceHandler, Depends(get_source_handler)]
 ActivateSourceDependency = Annotated[ActivateSourceHandler, Depends(get_activate_source_handler)]
 
 
+#
+# Valida que la carga sea un único archivo dentro del tamaño máximo y lo entrega como solicitud.
+#
 async def read_source_file(
     request: Request,
     file: Annotated[UploadFile, File(description="Archivo original CSV o XLSX.")],
@@ -110,6 +128,9 @@ async def read_source_file(
 SourceFileDependency = Annotated[UploadSourceRequest, Depends(read_source_file)]
 
 
+#
+# Devuelve el runtime de conversaciones y lo crea si aún no existe.
+#
 def _get_conversation_runtime(request: Request) -> ConversationRuntime:
     runtime = getattr(request.app.state, "conversations", None)
 
@@ -120,30 +141,51 @@ def _get_conversation_runtime(request: Request) -> ConversationRuntime:
     return runtime
 
 
+#
+# Devuelve el manejador que crea conversaciones.
+#
 def get_create_conversation_handler(request: Request) -> CreateConversationHandler:
     return _get_conversation_runtime(request).create
 
 
+#
+# Devuelve el manejador que renombra conversaciones.
+#
 def get_rename_conversation_handler(request: Request) -> RenameConversationHandler:
     return _get_conversation_runtime(request).rename
 
 
+#
+# Devuelve el manejador que elimina conversaciones.
+#
 def get_delete_conversation_handler(request: Request) -> DeleteConversationHandler:
     return _get_conversation_runtime(request).delete
 
 
+#
+# Devuelve el manejador que envía mensajes y genera respuestas.
+#
 def get_send_message_handler(request: Request) -> SendMessageHandler:
     return _get_conversation_runtime(request).send
 
 
+#
+# Devuelve el manejador que lista conversaciones.
+#
 def get_list_conversations_handler(request: Request) -> ListConversationsHandler:
     return _get_conversation_runtime(request).list
 
 
+#
+# Devuelve el manejador que consulta una conversación.
+#
 def get_conversation_handler(request: Request) -> GetConversationHandler:
     return _get_conversation_runtime(request).get
 
 
+#
+# Devuelve el manejador que consulta el historial de mensajes.
+#
 def get_messages_handler(request: Request) -> GetMessagesHandler:
     return _get_conversation_runtime(request).messages
 

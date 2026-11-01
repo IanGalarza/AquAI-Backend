@@ -5,9 +5,15 @@ from aquai.application.interfaces.conversations import ConversationCommands
 
 
 class RenameConversationHandler:
+    #
+    # Guarda los comandos de conversaciones que usa el manejador.
+    #
     def __init__(self, commands: ConversationCommands):
         self._commands = commands
 
+    #
+    # Cambia el título de una conversación.
+    #
     async def handle(self, conversation_id, request):
         result = await asyncio.to_thread(self._commands.rename, conversation_id, request.title)
 

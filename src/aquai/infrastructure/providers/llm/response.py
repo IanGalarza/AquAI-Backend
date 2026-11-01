@@ -19,6 +19,9 @@ from aquai.infrastructure.providers.llm.ollama import (
 
 
 class ResponseGenerationError(LLMProviderError):
+    #
+    # Guarda el mensaje del error junto con el modelo y los tokens usados.
+    #
     def __init__(self, message, *, model=None, input_tokens=None, output_tokens=None):
         super().__init__(message)
         self.model = model
@@ -27,6 +30,9 @@ class ResponseGenerationError(LLMProviderError):
 
 
 class OllamaResponseProvider:
+    #
+    # Guarda la configuración y calcula el presupuesto de contexto de la redacción.
+    #
     def __init__(self, settings: TabularSettings, answering_settings: AnsweringSettings):
         self._settings = settings
         self._client = _OllamaClient(settings, None)
@@ -45,14 +51,23 @@ class OllamaResponseProvider:
             ),
         )
 
+    #
+    # Devuelve el presupuesto de contexto de la redacción en bytes.
+    #
     @property
     def context_budget_bytes(self) -> int:
         return self._budget
 
+    #
+    # Devuelve el nombre del modelo usado para redactar.
+    #
     @property
     def model(self) -> str:
         return self._settings.default_model
 
+    #
+    # Pide a Ollama que redacte la respuesta a partir de la evidencia y devuelve el borrador.
+    #
     async def generate(self, context: ResponseContextRecord) -> ResponseReply:
         content = json.dumps(context.evidence, ensure_ascii=False, separators=(",", ":"))
         if len(content.encode("utf-8")) > self._budget:
@@ -87,6 +102,9 @@ class OllamaResponseProvider:
 
         return ResponseReply(draft=draft, **metadata)
 
+    #
+    # Construye el esquema del borrador limitado a las oraciones y evidencias del catálogo.
+    #
     @staticmethod
     def _draft_schema(sentences: list) -> dict:
         schema = ResponseDraft.model_json_schema()
@@ -100,6 +118,9 @@ class OllamaResponseProvider:
         draft_sentence["evidence_ids"]["maxItems"] = 1
         return schema
 
+    #
+    # Extrae el contenido de la respuesta y falla si está incompleta o sin contexto suficiente.
+    #
     def _message_content(self, body: dict, metadata: dict) -> str:
         message = body.get("message")
         context_limit = self._settings.llm_num_ctx - self._output_tokens - 256
@@ -117,6 +138,9 @@ class OllamaResponseProvider:
 
         return message["content"]
 
+    #
+    # Valida el contenido devuelto contra el contrato del borrador de respuesta.
+    #
     @staticmethod
     def _parse_draft(content: str, metadata: dict) -> ResponseDraft:
         try:
@@ -127,6 +151,9 @@ class OllamaResponseProvider:
             ) from error
 
 
+#
+# Devuelve los identificadores de evidencia sin repetir de las oraciones del catálogo.
+#
 def _unique_evidence_ids(sentences: list) -> list:
     evidence_ids = []
     for item in sentences:

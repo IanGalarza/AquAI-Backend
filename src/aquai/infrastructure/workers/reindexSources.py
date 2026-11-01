@@ -11,6 +11,9 @@ from aquai.infrastructure.queries.sources import SqlAlchemySourceQueries
 READY_STATUSES = {"ready", "ready_with_warnings"}
 
 
+#
+# Solicita reconstruir el índice semántico de una fuente lista, que el worker procesará luego.
+#
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("source_id", type=UUID)

@@ -36,6 +36,9 @@ _OUTCOME_STATUS_CODES = {
 }
 
 
+#
+# Crea una conversación (POST /conversations).
+#
 @router.post(
     "",
     status_code=201,
@@ -50,6 +53,9 @@ async def create_conversation(
     return await handler.handle(request)
 
 
+#
+# Lista las conversaciones de forma paginada (GET /conversations).
+#
 @router.get("", response_model=ConversationPage, responses=_ERRORS, summary="Listar conversaciones")
 async def list_conversations(
     handler: ListConversationsDependency,
@@ -59,6 +65,9 @@ async def list_conversations(
     return await handler.handle(page=page, page_size=page_size)
 
 
+#
+# Obtiene una conversación (GET /conversations/{id}).
+#
 @router.get(
     "/{id}", response_model=ConversationView, responses=_ERRORS, summary="Obtener conversación"
 )
@@ -66,6 +75,9 @@ async def get_conversation(id: UUID, handler: GetConversationDependency):
     return await handler.handle(id)
 
 
+#
+# Renombra una conversación (PATCH /conversations/{id}).
+#
 @router.patch(
     "/{id}", response_model=ConversationView, responses=_ERRORS, summary="Renombrar conversación"
 )
@@ -77,6 +89,9 @@ async def rename_conversation(
     return await handler.handle(id, request)
 
 
+#
+# Elimina una conversación con sus mensajes (DELETE /conversations/{id}).
+#
 @router.delete(
     "/{id}",
     status_code=204,
@@ -88,6 +103,9 @@ async def delete_conversation(id: UUID, handler: DeleteConversationDependency):
     await handler.handle(id)
 
 
+#
+# Obtiene el historial paginado de mensajes de una conversación (GET /conversations/{id}/messages).
+#
 @router.get(
     "/{id}/messages", response_model=MessagePage, responses=_ERRORS, summary="Obtener historial"
 )
@@ -100,6 +118,9 @@ async def get_messages(
     return await handler.handle(id, page=page, page_size=page_size)
 
 
+#
+# Envía una pregunta y devuelve su respuesta (POST /conversations/{id}/messages).
+#
 @router.post(
     "/{id}/messages",
     status_code=201,

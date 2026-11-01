@@ -19,8 +19,10 @@ from aquai.infrastructure.providers.llm.ollama import (
 _FREE_TEXT_LIMITS = {"reason": 400, "purpose": 160}
 
 
+#
+# Reduce el largo máximo de los textos explicativos del esquema del plan.
+#
 def _cap_free_text(schema):
-    """Los textos explicativos no se ejecutan: acotarlos reduce la generación sin cambiar el plan."""
     stack = [schema]
     while stack:
         node = stack.pop()
@@ -31,6 +33,9 @@ def _cap_free_text(schema):
             stack.extend(node)
 
 
+#
+# Acota el largo máximo de las propiedades de texto libre de un nodo del esquema.
+#
 def _cap_properties(properties):
     for key, value in properties.items():
         if key not in _FREE_TEXT_LIMITS or not isinstance(value, dict) or "maxLength" not in value:
@@ -39,10 +44,10 @@ def _cap_properties(properties):
         value["maxLength"] = min(value["maxLength"], _FREE_TEXT_LIMITS[key])
 
 
+#
+# Restringe en el esquema los identificadores de dataset y columna a los presentes en el contexto.
+#
 def _restrict_identifiers(schema, evidence):
-    """Los UUID y sql_name sólo pueden copiarse del contexto: el modelo altera dígitos o usa alias como columnas.
-
-    La validación sigue comprobando que cada columna pertenezca a su propio dataset."""
     datasets = [item["dataset_id"] for item in evidence.get("datasets", [])]
     columns = _catalog_columns(evidence)
     if not datasets or not columns:
@@ -56,6 +61,9 @@ def _restrict_identifiers(schema, evidence):
     column_ref["column"]["enum"] = columns
 
 
+#
+# Devuelve las columnas ordenadas que aparecen en los catálogos de la evidencia.
+#
 def _catalog_columns(evidence):
     columns = set()
     for rows in evidence.get("column_catalogs", {}).values():
@@ -66,6 +74,9 @@ def _catalog_columns(evidence):
 
 
 class OllamaPlannerProvider:
+    #
+    # Guarda la configuración, prepara el esquema del plan y calcula el presupuesto de contexto.
+    #
     def __init__(self, settings: TabularSettings) -> None:
         self._settings = settings
         self._client = _OllamaClient(settings, None)
@@ -82,10 +93,16 @@ class OllamaPlannerProvider:
             0, min(96_000, 2 * (settings.llm_num_ctx - self._output_tokens) - overhead)
         )
 
+    #
+    # Devuelve el presupuesto de contexto del planificador en bytes.
+    #
     @property
     def context_budget_bytes(self) -> int:
         return self._budget
 
+    #
+    # Pide a Ollama un plan para la consulta a partir de la evidencia y devuelve su respuesta.
+    #
     async def propose(self, context: PlanningContextRecord) -> PlannerReply:
         content = json.dumps(context.evidence, ensure_ascii=False, separators=(",", ":"))
         if len(content.encode("utf-8")) > self._budget:
@@ -120,6 +137,9 @@ class OllamaPlannerProvider:
             output_tokens=body.get("eval_count"),
         )
 
+    #
+    # Construye el esquema del plan restringido a la evidencia y a las menciones de valores.
+    #
     def _constrained_schema(self, evidence: dict) -> dict:
         schema = self._output.json_schema()
         _cap_free_text(schema)
@@ -131,6 +151,9 @@ class OllamaPlannerProvider:
 
         return schema
 
+    #
+    # Extrae el contenido de la respuesta y falla si está incompleta o cerca del límite de contexto.
+    #
     def _message_content(self, body: dict) -> str:
         message = body.get("message")
         incomplete = (
@@ -150,6 +173,9 @@ class OllamaPlannerProvider:
 
         return message["content"]
 
+    #
+    # Valida el contenido devuelto contra el contrato del plan y reporta el primer error.
+    #
     def _parse_decision(self, content: str) -> PlannerOutput:
         try:
             return self._output.validate_json(content)

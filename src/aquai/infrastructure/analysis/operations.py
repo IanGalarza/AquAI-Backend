@@ -25,6 +25,9 @@ _COMPARISONS = {
 }
 
 
+#
+# Filtra las filas aplicando en secuencia los predicados del paso.
+#
 def filter_rows(rows, filters, fields, budget):
     types = {field.name: field.sql_type for field in fields}
     result = rows
@@ -37,6 +40,9 @@ def filter_rows(rows, filters, fields, budget):
     return result
 
 
+#
+# Convierte los valores de un filtro al tipo de la columna.
+#
 def _typed_filter_values(raw_values, kind):
     parser = _FILTER_PARSERS.get(kind)
 
@@ -54,6 +60,9 @@ def _typed_filter_values(raw_values, kind):
     return values
 
 
+#
+# Indica si una fila cumple un predicado, con semántica SQL para los nulos.
+#
 def _matches(row, name, operator, values, budget):
     budget.check()
     value = row[name]
@@ -64,13 +73,15 @@ def _matches(row, name, operator, values, budget):
     if operator == "is_not_null":
         return value is not None
 
-    # Semántica SQL de NULL en comparaciones.
     if value is None:
         return False
 
     return _COMPARISONS[operator](value, values)
 
 
+#
+# Calcula un cuantil con interpolación lineal entre valores.
+#
 def _quantile(values, probability):
     ordered = sorted(values)
     position = Decimal(len(ordered) - 1) * probability
@@ -80,6 +91,9 @@ def _quantile(values, probability):
     return ordered[lower] + (ordered[upper] - ordered[lower]) * (position - lower)
 
 
+#
+# Separa las filas con todas las entradas presentes y cuenta las que tienen nulos.
+#
 def _complete_inputs(rows, names, budget):
     pairs = []
     nulls = 0
@@ -96,6 +110,9 @@ def _complete_inputs(rows, names, budget):
     return pairs, nulls
 
 
+#
+# Calcula una estadística escalar sobre las filas y devuelve su valor y exclusiones.
+#
 def _statistic(rows, calculation, precision, budget):
     pairs, nulls = _complete_inputs(rows, [ref.field for ref in calculation.inputs], budget)
     exclusion = ValueExclusion(
@@ -144,27 +161,45 @@ def _statistic(rows, calculation, precision, budget):
         return value, exclusion, warnings
 
 
+#
+# Devuelve el primer valor de cada fila de entradas.
+#
 def _first_inputs(numeric):
     return [pair[0] for pair in numeric]
 
 
+#
+# Calcula la suma de la primera entrada.
+#
 def _sum(numeric, calculation):
     return sum(_first_inputs(numeric), Decimal(0)), None
 
 
+#
+# Calcula el promedio de la primera entrada.
+#
 def _mean(numeric, calculation):
     values = _first_inputs(numeric)
     return sum(values, Decimal(0)) / Decimal(len(values)), None
 
 
+#
+# Calcula la mediana de la primera entrada.
+#
 def _median(numeric, calculation):
     return _quantile(_first_inputs(numeric), Decimal("0.5")), None
 
 
+#
+# Calcula el cuantil indicado por el cálculo sobre la primera entrada.
+#
 def _quantile_statistic(numeric, calculation):
     return _quantile(_first_inputs(numeric), Decimal(str(calculation.quantile))), None
 
 
+#
+# Calcula el desvío estándar según ddof, o indica que es indefinido.
+#
 def _stddev(numeric, calculation):
     values = _first_inputs(numeric)
     size = Decimal(len(values))
@@ -178,6 +213,9 @@ def _stddev(numeric, calculation):
     return (squared_deviations / (size - calculation.ddof)).sqrt(), None
 
 
+#
+# Calcula el coeficiente de correlación entre dos entradas, o indica que es indefinido.
+#
 def _correlation(numeric, calculation):
     left = _first_inputs(numeric)
     size = Decimal(len(left))
@@ -213,6 +251,9 @@ _DECIMAL_STATISTICS = {
 }
 
 
+#
+# Aplica a las filas la operación tabular del paso: latest, ordenar, calcular o agregar.
+#
 def tabular_operation(step, rows, parent_fields, settings, budget, period_key=None):
     filtered = filter_rows(rows, step.filters, parent_fields, budget)
     frame = pd.DataFrame(filtered, columns=[field.name for field in parent_fields], dtype=object)
@@ -230,8 +271,10 @@ def tabular_operation(step, rows, parent_fields, settings, budget, period_key=No
     return _aggregate(step, rows, filtered, settings, budget)
 
 
+#
+# Verifica que la tabla y sus copias de trabajo no excedan el presupuesto de memoria.
+#
 def _check_memory(frame, settings):
-    # Incluye margen para claves, ordenamientos y copias temporales acotadas.
     memory = int(frame.memory_usage(index=True, deep=True).sum())
 
     if memory * 4 > settings.max_memory_bytes:
@@ -240,6 +283,9 @@ def _check_memory(frame, settings):
         )
 
 
+#
+# Devuelve las filas del período más reciente, advirtiendo las que no tienen fecha.
+#
 def _latest(step, rows, filtered, period_key):
     name = step.order_by[0].field.field
     warnings = []
@@ -248,7 +294,6 @@ def _latest(step, rows, filtered, period_key):
     if undated:
         warnings.append(f"Se excluyeron {undated} registros sin fecha.")
 
-    # Un período TEXT se ordena por su fin explícito; los textos no interpretables se excluyen.
     key = period_key or (lambda value: value)
     dated = [(row, key(row[name])) for row in filtered if row[name] is not None]
 
@@ -264,15 +309,16 @@ def _latest(step, rows, filtered, period_key):
     maximum = max((value for _, value in dated), default=None)
     output = [row for row, value in dated if value == maximum]
 
-    # Sólo los filtros explícitos filtran; las filas de otras fechas son el criterio de latest.
     return output, [], warnings, len(rows) - len(filtered)
 
 
+#
+# Ordena las filas según los criterios del paso y aplica el límite.
+#
 def _sort(step, rows, filtered, frame, budget):
     for ordering in reversed(step.order_by):
         budget.check()
         ascending = ordering.direction == "asc"
-        # Igual que SQL: los faltantes no son extremos.
         frame = frame.sort_values(
             ordering.field.field, ascending=ascending, kind="stable", na_position="last"
         )
@@ -285,8 +331,10 @@ def _sort(step, rows, filtered, frame, budget):
     return records, [], [], len(rows) - len(filtered)
 
 
+#
+# Aplica el límite conservando las filas empatadas con la última incluida.
+#
 def _limit_with_ties(records, step):
-    """Igual que en SQL: el límite conserva las filas empatadas con la última incluida."""
     keys = [ordering.field.field for ordering in step.order_by]
     last = [records[step.limit - 1][key] for key in keys]
     tied = [row for row in records[step.limit :] if [row[key] for key in keys] == last]
@@ -294,6 +342,9 @@ def _limit_with_ties(records, step):
     return records[: step.limit] + tied
 
 
+#
+# Calcula por fila las diferencias o razones del paso y contabiliza las exclusiones.
+#
 def _calculate(step, rows, filtered, parent_fields, settings, budget):
     cohorts = {
         (calculation.null_policy, frozenset(ref.field for ref in calculation.inputs))
@@ -331,6 +382,9 @@ def _calculate(step, rows, filtered, parent_fields, settings, budget):
     return output, exclusions, warnings, len(rows) - len(filtered)
 
 
+#
+# Crea el contador de exclusiones de un cálculo por fila, exigiendo unidades compatibles.
+#
 def _row_exclusion(calculation, parent_fields, input_rows):
     fields = [
         next(field for field in parent_fields if field.name == ref.field)
@@ -352,6 +406,9 @@ def _row_exclusion(calculation, parent_fields, input_rows):
     )
 
 
+#
+# Calcula los valores de una fila para cada cálculo e indica si debe omitirse.
+#
 def _row_calculations(row, calculations, exclusions):
     values, skip = {}, False
 
@@ -371,6 +428,9 @@ def _row_calculations(row, calculations, exclusions):
     return values, skip
 
 
+#
+# Calcula la diferencia o razón de un par, contando las divisiones por cero.
+#
 def _pair_result(function, left, right, exclusion):
     if function == "ratio" and right == 0:
         exclusion.zero_divisions += 1
@@ -379,6 +439,9 @@ def _pair_result(function, left, right, exclusion):
     return left - right if function == "difference" else left / right
 
 
+#
+# Agrupa las filas y calcula las estadísticas de cada grupo.
+#
 def _aggregate(step, rows, filtered, settings, budget):
     groups = _group_rows(step, filtered, budget)
     output, exclusions, warnings = [], [], []
@@ -401,6 +464,9 @@ def _aggregate(step, rows, filtered, settings, budget):
     return output, exclusions, list(dict.fromkeys(warnings)), len(rows) - len(filtered)
 
 
+#
+# Agrupa las filas según las columnas de agrupación del paso.
+#
 def _group_rows(step, filtered, budget):
     groups = {}
 
@@ -415,6 +481,9 @@ def _group_rows(step, filtered, budget):
     return groups
 
 
+#
+# Devuelve el valor de agrupación truncado al grano temporal indicado.
+#
 def _grouping_value(value, time_grain):
     if value is None or time_grain == "raw":
         return value
@@ -428,5 +497,8 @@ def _grouping_value(value, time_grain):
     return date(value.year, value.month, value.day)
 
 
+#
+# Devuelve las etiquetas de columnas de agrupación para una clave de grupo.
+#
 def _group_labels(step, key):
     return {group.output_name: value for group, value in zip(step.group_by, key, strict=True)}

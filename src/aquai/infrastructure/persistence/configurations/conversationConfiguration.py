@@ -9,6 +9,9 @@ from aquai.infrastructure.persistence.configurations.common import (
 )
 
 
+#
+# Define la tabla Conversation y la mapea al modelo de dominio con sus mensajes.
+#
 def configure(mapper_registry: registry) -> None:
     table = Table(
         "Conversation",

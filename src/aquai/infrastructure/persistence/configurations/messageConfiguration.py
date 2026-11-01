@@ -17,6 +17,9 @@ from aquai.infrastructure.persistence.configurations.common import (
 )
 
 
+#
+# Define la tabla Message con su orden por conversación y la mapea al modelo de dominio.
+#
 def configure(mapper_registry: registry) -> None:
     table = Table(
         "Message",

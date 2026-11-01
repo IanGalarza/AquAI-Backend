@@ -77,6 +77,9 @@ _FAILED_STATUSES = {"blocked", "error", "unsupported"}
 _CATEGORICAL_CHARTS = {"bar", "line"}
 
 
+#
+# Devuelve los avisos que explican por qué no se pudo completar cada operación fallida.
+#
 def blocked_explanations(state, language) -> list[str]:
     steps = {step.id: step for step in state.planning.operations} if state.planning else {}
     records = execution_records(state)
@@ -93,13 +96,15 @@ def blocked_explanations(state, language) -> list[str]:
         else:
             texts.append(text)
 
-    # Sin otra explicación, el aviso general de respuesta parcial ya cubre lo que falta.
     if unexplained and texts:
         texts.append(_REASONS[language]["other"])
 
     return list(dict.fromkeys(texts))
 
 
+#
+# Elige la explicación de una operación fallida según su código de error.
+#
 def _explanation(step, record, records, language):
     code = record.error.code if record.error else None
     if step.operation == "visualize" and code in _CHART_REASONS[language]:
@@ -110,6 +115,9 @@ def _explanation(step, record, records, language):
     return None
 
 
+#
+# Explica por qué no se pudo armar un gráfico, con ejemplos de categorías repetidas si aplica.
+#
 def _chart_explanation(step, code, records, language):
     examples = _repeated(step, records, language) if code == "ambiguous_chart_granularity" else ""
     lead = (
@@ -122,8 +130,10 @@ def _chart_explanation(step, code, records, language):
     return lead.format(chart=chart) + _CHART_REASONS[language][code].format(examples=examples)
 
 
+#
+# Indica ejemplos de categorías repetidas que impiden graficar un valor por categoría.
+#
 def _repeated(step, records, language):
-    """Categorías repetidas con el mismo criterio del gráfico: por serie y sólo entre filas graficables."""
     request = step.visualization
     parent = records.get(step.depends_on[0]) if step.depends_on else None
     if parent is None or not parent.rows or request.chart_type not in _CATEGORICAL_CHARTS:
@@ -143,6 +153,9 @@ def _repeated(step, records, language):
     return f" (for example, {names} appear{'' if plural else 's'} more than once)"
 
 
+#
+# Cuenta cuántas veces aparece cada categoría graficable, por serie.
+#
 def _category_counts(rows, request):
     series = request.series.field if request.series is not None else None
     counts = Counter()
@@ -153,6 +166,9 @@ def _category_counts(rows, request):
     return counts
 
 
+#
+# Indica si una fila tiene los valores necesarios para dibujarse en el gráfico.
+#
 def _plottable(row, request):
     if row.get(request.x.field) is None:
         return False
@@ -160,6 +176,9 @@ def _plottable(row, request):
     return row.get(request.y.field) is not None or request.null_policy == "preserve"
 
 
+#
+# Devuelve un valor como texto legible, con fecha o número formateados según el idioma.
+#
 def _shown(value, language):
     if isinstance(value, date):
         return date_text(value, language)

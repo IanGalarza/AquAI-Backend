@@ -15,8 +15,10 @@ from aquai.presentation.errors import register_exception_handlers
 from aquai.presentation.uploadLimit import SourceUploadSizeLimit
 
 
+#
+# Configura el registro de la aplicación para mostrar los mensajes y duraciones por etapa.
+#
 def _configure_logging() -> None:
-    """uvicorn sólo configura sus loggers: sin esto no se ven las duraciones por etapa."""
     logger = logging.getLogger("aquai")
     if logger.handlers:
         return
@@ -28,6 +30,9 @@ def _configure_logging() -> None:
     logger.propagate = False
 
 
+#
+# Crea la aplicación FastAPI con su ciclo de vida, middleware, manejadores de errores y rutas.
+#
 def create_app(
     *, sources: SourceRuntime | None = None, conversations: ConversationRuntime | None = None
 ) -> FastAPI:
@@ -37,7 +42,6 @@ def create_app(
         app.state.sources = runtime
         await runtime.worker.start()
 
-        # Sólo con la composición real: la carga del modelo no bloquea el arranque.
         warm_up = None if sources else asyncio.create_task(warm_up_models(get_tabular_settings()))
 
         try:

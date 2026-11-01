@@ -26,6 +26,9 @@ _mapping_lock = Lock()
 _configured = False
 
 
+#
+# Configura una sola vez el mapeo imperativo de todas las tablas con los modelos de dominio.
+#
 def configure_mappings() -> None:
     global _configured
     with _mapping_lock:

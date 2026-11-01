@@ -52,34 +52,41 @@ _NUMBER_WORDS = "|".join(word for words in NUMBER_WORDS.values() for word in wor
 _LATEST = re.compile(
     rf"\b(?:(?:[uú]ltim[oa]s?|m[aá]s\s+recientes?)\s+{OBSERVATION_NOUNS_ES}|"
     rf"(?:latest|most\s+recent|last)\s+{OBSERVATION_NOUNS_EN})\b|"
-    # «la turbiedad más reciente», «el pH actual», «el último pH», «the latest pH». «Actual» sólo en castellano,
-    # tras lo que califica: en inglés («the actual values») significa «real».
     rf"\b(?:m[aá]s\s+recientes?|most\s+recent|actualmente)\b|"
     r"(?<=\w\s)actual(?:es)?\b(?!\s+[^\W\d_])|(?<=\w\s)actual(?:es)?(?=\s+(?:en|de|del|para|seg[uú]n)\b)|"
-    # «Por último, …» ordena la pregunta; no pide la última medición.
     rf"(?<!\bpor\s)\b{RECENT_WORDS}\s+(?:(?:de|del|of|the)\s+)?"
     rf"(?!(?:{RECENT_INTERVAL_NOUNS}|{_NUMBER_WORDS})\b)(?!\d)\w",
     re.IGNORECASE,
 )
 
 
+#
+# Indica si la pregunta pide la medición más reciente.
+#
 def latest_requested(question: str) -> bool:
     return _LATEST.search(question) is not None
 
 
+#
+# Indica si la pregunta pide el valor extremo de una variable y no todos sus registros ordenados.
+#
 def extreme_requested(question: str) -> bool:
-    """La pregunta pide el extremo de una variable («el valor máximo»), no todos sus registros ordenados."""
     return contains_any_phrase(question, EXTREME_CUES) and not contains_any_phrase(
         question, FULL_ORDER_CUES
     )
 
 
+#
+# Indica si la pregunta pide un gráfico.
+#
 def chart_requested(question: str) -> bool:
     return bool(re.search(rf"\b{CHART_WORDS}\b", question, re.IGNORECASE))
 
 
+#
+# Devuelve las estadísticas que nombra la pregunta.
+#
 def requested_statistics(question: str) -> list[str]:
-    """Estadísticas que la pregunta nombra («pH promedio» → mean); un máximo puede ser un orden y no se exige."""
     return [
         function
         for function, words in REQUESTED_STATISTICS.items()
@@ -87,8 +94,10 @@ def requested_statistics(question: str) -> list[str]:
     ]
 
 
+#
+# Devuelve los umbrales numéricos pedidos en las menciones de tipo umbral.
+#
 def requested_thresholds(mentions) -> list[RequestedThreshold]:
-    """Umbrales de las menciones threshold; una comparación sin número legible no fija ninguno."""
     thresholds = {}
     for item in mentions:
         if item.kind != "threshold":
@@ -99,9 +108,10 @@ def requested_thresholds(mentions) -> list[RequestedThreshold]:
     return list(thresholds.values())
 
 
+#
+# Devuelve los períodos pedidos en las menciones de tipo fecha.
+#
 def requested_periods(mentions) -> list[RequestedPeriod]:
-    """Períodos de las menciones date con una fecha legible; «la última fecha» no fija ninguno. Una mención con fechas
-    sueltas («2019 y 2021») pide cada período por separado."""
     periods = {}
     for item in mentions:
         ranges = period_ranges(item.text) if item.kind == "date" else []
@@ -112,14 +122,19 @@ def requested_periods(mentions) -> list[RequestedPeriod]:
     return list(periods.values())
 
 
+#
+# Devuelve el texto que describe el período pedido, cerrado o abierto, en el idioma indicado.
+#
 def period_phrase(period: dict, language: str = "es") -> str:
-    """Período pedido tras «acotarlos»: «a 2021» o, si es abierto, «al período desde 2020»."""
     closed = period.get("start") is not None and period.get("end") is not None
     if language == "es":
         return ("a " if closed else "al período ") + period["text"]
     return ("to " if closed else "to the period ") + period["text"]
 
 
+#
+# Construye el contexto de planificación con el catálogo de columnas y los requisitos de la pregunta.
+#
 def build_planning_context(
     question: str,
     datasets: list[VerifiedDataset],
@@ -153,32 +168,26 @@ def build_planning_context(
     if require_latest:
         evidence["temporal_requirements"] = _temporal_requirements(temporal_candidates_excluded)
     if temporal_text_columns:
-        # Columnas TEXT cuyos valores distintos nombran períodos explícitos (12/2008, 2013-02-08).
         evidence["text_period_columns"] = [
             _text_period_column(item) for item in temporal_text_columns
         ]
     if query_mentions:
         evidence["query_mentions"] = [item.model_dump(mode="json") for item in query_mentions]
     if thresholds:
-        # Operador y valor exactos de cada comparación pedida; se revalidan antes de ejecutar.
         evidence["requested_thresholds"] = [item.model_dump(mode="json") for item in thresholds]
     if periods:
-        # Intervalo exacto de cada período pedido; toda salida debe acotar su fecha a él.
         evidence["requested_periods"] = [item.model_dump(mode="json") for item in periods]
     if statistics:
         evidence["requested_statistics"] = list(statistics)
     if chart:
         evidence["requested_chart"] = True
     if time_grain:
-        # «Promedio por mes» agrupa la fecha por mes; un group_by de la fecha exacta no lo responde.
         evidence["requested_time_grain"] = time_grain
     if observed:
-        # Hechos observados en PostgreSQL: valores TEXT almacenados que contienen cada mención.
         evidence["observed_evidence"] = observed
     if unmatched_values:
         evidence["values_not_found_in_candidates"] = list(unmatched_values)
     if source_mentions:
-        # Nombres con los que el usuario eligió la fuente: ya definen los candidatos.
         evidence["user_named_sources"] = list(source_mentions)
 
     compacted = []
@@ -197,6 +206,9 @@ def build_planning_context(
     )
 
 
+#
+# Resume los valores y columnas observados en un dataset para la planificación.
+#
 def _observed_dataset(item) -> dict:
     observed = {
         "dataset_id": str(item.dataset_id),
@@ -213,6 +225,9 @@ def _observed_dataset(item) -> dict:
     return observed
 
 
+#
+# Resume una coincidencia de valores almacenados, limitando los valores mostrados.
+#
 def _stored_match(match) -> dict:
     return {
         "column": match.column,
@@ -221,6 +236,9 @@ def _stored_match(match) -> dict:
     }
 
 
+#
+# Proyecta los datasets del contexto y agrupa los catálogos de columnas repetidos.
+#
 def _project_datasets(datasets, warnings) -> tuple[dict[str, list], list[dict]]:
     column_catalogs = {}
     projected = []
@@ -233,6 +251,9 @@ def _project_datasets(datasets, warnings) -> tuple[dict[str, list], list[dict]]:
     return column_catalogs, projected
 
 
+#
+# Convierte una columna en una fila compacta con sus campos y anotaciones.
+#
 def _column_row(column) -> list:
     row = [getattr(column, field) for field in _COLUMN_FIELDS[:-1]]
     annotations = {}
@@ -248,6 +269,9 @@ def _column_row(column) -> list:
     return row
 
 
+#
+# Registra un catálogo de columnas y devuelve el identificador de uno idéntico si ya existe.
+#
 def _register_catalog(rows, column_catalogs) -> str:
     for catalog_id, catalog in column_catalogs.items():
         if catalog == rows:
@@ -259,6 +283,9 @@ def _register_catalog(rows, column_catalogs) -> str:
     return catalog_id
 
 
+#
+# Proyecta un dataset con sus metadatos y el catálogo de columnas que usa.
+#
 def _dataset_projection(dataset, warnings, catalog_id) -> dict:
     return {
         "dataset_id": str(dataset.dataset_id),
@@ -273,6 +300,9 @@ def _dataset_projection(dataset, warnings, catalog_id) -> dict:
     }
 
 
+#
+# Devuelve los requisitos temporales para seleccionar la medición más reciente.
+#
 def _temporal_requirements(temporal_candidates_excluded) -> dict:
     return {
         "operation": "latest",
@@ -283,6 +313,9 @@ def _temporal_requirements(temporal_candidates_excluded) -> dict:
     }
 
 
+#
+# Resume una columna TEXT cuyos valores nombran períodos.
+#
 def _text_period_column(item) -> dict:
     return {
         "dataset_id": str(item.dataset_id),
@@ -291,10 +324,16 @@ def _text_period_column(item) -> dict:
     }
 
 
+#
+# Serializa la evidencia como JSON compacto en bytes.
+#
 def _serialized(evidence) -> bytes:
     return json.dumps(evidence, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
 
+#
+# Recorta las descripciones largas de los datasets y devuelve los campos compactados.
+#
 def _truncate_descriptions(projected) -> list[str]:
     compacted = []
 
@@ -307,6 +346,9 @@ def _truncate_descriptions(projected) -> list[str]:
     return compacted
 
 
+#
+# Recorta los significados largos de las columnas y devuelve los campos compactados.
+#
 def _truncate_meanings(column_catalogs) -> list[str]:
     compacted = []
 

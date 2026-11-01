@@ -23,6 +23,9 @@ from aquai.infrastructure.providers.tabular import get_tabular_settings
 from aquai.infrastructure.queries.sources import SqlAlchemySourceQueries
 
 
+#
+# Construye el grafo de planificación de consultas con sus servicios y proveedores.
+#
 def create_query_planning_graph() -> CompiledStateGraph:
     settings = get_tabular_settings()
     sources = SqlAlchemySourceQueries(get_db_context())

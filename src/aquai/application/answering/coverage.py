@@ -1,6 +1,3 @@
-"""Cobertura de un resultado: datasets que registran lo pedido y no participan de la respuesta, y unidades que
-impiden comparar los resultados de distintos archivos."""
-
 from datetime import date
 
 from aquai.application.answering.presentation import format_unit
@@ -14,9 +11,10 @@ from aquai.application.planning.validation import period_columns
 from aquai.application.units import comparable_unit
 
 
+#
+# Devuelve el aviso de archivos del resultado citado cuyo período no se pudo leer.
+#
 def period_notes(state, language) -> list[str]:
-    """«¿Y de qué año es?»: los archivos del resultado citado cuyo período no se pudo leer (fechas guardadas como
-    texto, varias columnas de fecha) se nombran, para no presentar como completa una respuesta parcial."""
     routing, plan = state.routing, state.planning
     if routing is None or plan is None or not routing.requested_period:
         return []
@@ -47,15 +45,15 @@ def period_notes(state, language) -> list[str]:
     ]
 
 
+#
+# Devuelve avisos de variables registradas en unidades o bases distintas entre archivos.
+#
 def unit_notes(state, language) -> list[str]:
-    """Una misma variable registrada en unidades o bases químicas distintas según el archivo (mg N/L frente a mg/l sin
-    base declarada) no se convierte ni se compara: los resultados de cada archivo quedan en su unidad y se advierte que
-    no son directamente comparables."""
     retrieval, plan, validation = state.retrieval, state.planning, state.validation
     if retrieval is None or plan is None or validation is None:
         return []
     if state.routing is not None and state.routing.requested_period:
-        return []  # La respuesta sólo informa períodos, no compara valores.
+        return []
 
     mentions = {
         (item.dataset_id, column): mention
@@ -86,18 +84,27 @@ def unit_notes(state, language) -> list[str]:
     ]
 
 
+#
+# Devuelve el nombre original de una columna a partir de su referencia.
+#
 def _original_name(datasets, ref) -> str:
     dataset = datasets.get(ref.dataset_id)
     columns = dataset.columns_metadata if dataset else []
     return next((item.original_name for item in columns if item.sql_name == ref.column), ref.column)
 
 
+#
+# Devuelve el texto de la base química de una unidad, o que no está declarada.
+#
 def _basis_text(basis, language) -> str:
     if basis is None:
         return "sin base declarada" if language == "es" else "basis not declared"
     return ("como " if language == "es" else "as ") + basis
 
 
+#
+# Redacta el aviso de que los archivos registran una variable en unidades distintas.
+#
 def _different_units(mention, by_unit, datasets, language) -> str:
     bases = {basis for _, basis in by_unit}
     places = []
@@ -128,10 +135,10 @@ def _different_units(mention, by_unit, datasets, language) -> str:
     )
 
 
+#
+# Devuelve avisos de datasets con lo pedido que el resultado no incluye y por qué.
+#
 def coverage_notes(state, language) -> list[str]:
-    """Una cobertura parcial no se presenta como completa: se nombran los datasets con las variables y los valores
-    pedidos que el resultado no incluye y, si se conoce, por qué. Una fuente elegida por el usuario o heredada de
-    un resultado anterior no se compara con el resto del catálogo."""
     retrieval, plan, routing = state.retrieval, state.planning, state.routing
     if retrieval is None or plan is None or routing is None:
         return []
@@ -152,7 +159,6 @@ def coverage_notes(state, language) -> list[str]:
     if not variables and not values:
         return []
 
-    # Un dataset elegido cuya rama no se publicó tampoco forma parte de lo que la respuesta muestra.
     sources = state.validation.sources if state.validation is not None else plan.selected_datasets
     used = {item.dataset_id for item in sources}
     evidence = {item.dataset_id: item for item in retrieval.evidence}
@@ -208,8 +214,10 @@ def coverage_notes(state, language) -> list[str]:
     return notes
 
 
+#
+# Devuelve para qué hacía falta una fecha: acotar un período o agrupar por tiempo.
+#
 def _dated_purpose(evidence, language) -> str | None:
-    """Para qué hacía falta una fecha: acotar un período pedido o agrupar por día, mes o año."""
     periods = evidence.get("requested_periods", [])
     if periods:
         phrases = [period_phrase(item, language) for item in periods]
@@ -224,17 +232,20 @@ def _dated_purpose(evidence, language) -> str | None:
     return "group it by " + grain
 
 
+#
+# Indica si un dataset tiene la fecha o el año que exige la consulta.
+#
 def _dated(dataset, evidence) -> bool:
-    """Un período se acota con una fecha o un año; una agrupación por mes o día exige una fecha."""
     kinds = set(period_columns([dataset]).values())
     if evidence.get("requested_periods"):
         return bool(kinds)
     return "date" in kinds
 
 
+#
+# Devuelve las columnas pedidas guardadas como texto sin versión numérica.
+#
 def _text_measurements(dataset, evidence, variables) -> list[str]:
-    """Columnas de las variables pedidas que el dataset guarda como texto sin representación numérica: no se pueden
-    calcular («N-NO3» con valores como «<0,001»). Vacío si alguna variable tiene una columna numérica."""
     if evidence is None or not variables:
         return []
 
@@ -254,6 +265,9 @@ def _text_measurements(dataset, evidence, variables) -> list[str]:
     return [column.original_name for column in textual] if matched and len(textual) == len(matched) else []
 
 
+#
+# Redacta el aviso de datos guardados como texto sin versión numérica.
+#
 def _stored_as_text(what, files, columns, language) -> str:
     names = list(dict.fromkeys(columns))
     listed, single = join_words(names, language), len(names) == 1
@@ -272,9 +286,10 @@ def _stored_as_text(what, files, columns, language) -> str:
     )
 
 
+#
+# Indica por qué un dataset con fechas en texto no se acotó al período pedido.
+#
 def _period_gap(dataset, text_periods, requested) -> str | None:
-    """Por qué un dataset con fechas guardadas como texto no se acotó al período pedido: no tiene registros en él
-    («outside») o tiene más fechas distintas en él de las que admite un filtro («crowded»)."""
     columns = [
         item
         for item in text_periods
@@ -293,10 +308,16 @@ def _period_gap(dataset, text_periods, requested) -> str | None:
     return "crowded" if max(counts) > MAX_FILTER_VALUES else None
 
 
+#
+# Devuelve las fechas de inicio y fin de un período pedido.
+#
 def _bounds(period) -> tuple[date | None, date | None]:
     return tuple(date.fromisoformat(period[side]) if period.get(side) else None for side in ("start", "end"))
 
 
+#
+# Redacta el aviso de datos que no se incluyeron por el período pedido.
+#
 def _outside_period(what, files, gap, requested, language) -> str:
     periods = join_words(list(dict.fromkeys(item["text"] for item in requested)), language)
     if language == "es":
@@ -315,6 +336,9 @@ def _outside_period(what, files, gap, requested, language) -> str:
     return f"There is also {what} data in {files}, but I did not include it because {reason}."
 
 
+#
+# Indica si la evidencia de un dataset cubre las variables y valores pedidos.
+#
 def _covers(evidence, variables, values) -> bool:
     return (
         evidence is not None
@@ -323,6 +347,9 @@ def _covers(evidence, variables, values) -> bool:
     )
 
 
+#
+# Devuelve el texto de lo pedido: variables y valores.
+#
 def _requested(variables, values, language) -> str:
     if variables and values:
         connector = " de " if language == "es" else " in "
@@ -331,14 +358,19 @@ def _requested(variables, values, language) -> str:
     return join_words(variables or values, language)
 
 
+#
+# Devuelve los archivos con su hoja como texto.
+#
 def _files(pairs, language) -> str:
-    """Archivo y hoja: un mismo archivo puede tener varias tablas con la misma variable."""
     sheet = "hoja" if language == "es" else "sheet"
     names = [f"{file_stem(source)} ({sheet} {dataset_label(name)})" for name, source in pairs]
 
     return join_words(list(dict.fromkeys(names)), language)
 
 
+#
+# Redacta el aviso de datos sin la dimensión pedida.
+#
 def _without_dimension(what, files, dimensions, language) -> str:
     if language == "es":
         return (
@@ -352,6 +384,9 @@ def _without_dimension(what, files, dimensions, language) -> str:
     )
 
 
+#
+# Redacta el aviso de datos sin fecha para el período o agrupación pedidos.
+#
 def _without_dates(what, files, purpose, language) -> str:
     if language == "es":
         return (
@@ -365,6 +400,9 @@ def _without_dates(what, files, purpose, language) -> str:
     )
 
 
+#
+# Redacta el aviso de datos que el resultado no incluye.
+#
 def _not_included(what, files, language) -> str:
     if language == "es":
         return (

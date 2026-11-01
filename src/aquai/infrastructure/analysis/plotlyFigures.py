@@ -25,6 +25,9 @@ _LINE_DASHES = ("solid", "dash", "dot", "dashdot")
 _X_AXIS_TYPES = {"DATE": "date", "TIMESTAMP": "date", "TEXT": "category", "BOOLEAN": "category"}
 
 
+#
+# Devuelve el título del eje con su unidad o la advertencia de unidad no documentada.
+#
 def _axis_title(axis: ChartAxis) -> str:
     label = escape(axis.label)
     field = axis.field
@@ -39,11 +42,16 @@ def _axis_title(axis: ChartAxis) -> str:
     return label
 
 
+#
+# Devuelve los valores de X de una serie, con los booleanos como texto.
+#
 def _x_values(series):
-    # Plotly representa categorías booleanas con etiquetas explícitas.
     return [str(point.x).lower() if type(point.x) is bool else point.x for point in series.points]
 
 
+#
+# Construye la figura Plotly de un gráfico validado, lista para serializar.
+#
 def build_plotly_figure(chart: VisualizationResult) -> PlotlyFigure:
     figure = go.Figure()
     figure.update_layout(template="none")
@@ -76,7 +84,6 @@ def build_plotly_figure(chart: VisualizationResult) -> PlotlyFigure:
         meta=_figure_meta(chart),
     )
 
-    # La librería valida la figura. Sólo JSON estándar cruza a Application/LangGraph.
     payload = json.loads(
         to_json(figure, validate=True, pretty=False, remove_uids=True, engine="json")
     )
@@ -95,6 +102,9 @@ def build_plotly_figure(chart: VisualizationResult) -> PlotlyFigure:
     )
 
 
+#
+# Crea la traza Plotly de una serie según el tipo de gráfico.
+#
 def _trace(chart, series, index):
     color = _COLORS[index % len(_COLORS)]
     name = escape(series.name) if series.name is not None else escape(chart.y_axis.label)
@@ -115,13 +125,15 @@ def _trace(chart, series, index):
     return trace
 
 
+#
+# Crea la traza de un histograma con los intervalos ya calculados.
+#
 def _histogram_trace(series):
     nonconstant = [item for item in series.bins if item.lower != item.upper]
 
     if nonconstant:
         trace = _interval_bars(series)
     else:
-        # No se inventa anchura numérica para una distribución constante.
         trace = go.Bar(
             x=[format(item.lower, ".17g") for item in series.bins],
             y=[item.count for item in series.bins],
@@ -136,8 +148,10 @@ def _histogram_trace(series):
     return trace
 
 
+#
+# Crea barras con centro y anchura de cada intervalo ya calculado del histograma.
+#
 def _interval_bars(series):
-    """go.Histogram calcula frecuencias en JavaScript; se dibujan los bins ya calculados con Decimal."""
     centers, widths = [], []
 
     for item in series.bins:
@@ -159,6 +173,9 @@ def _interval_bars(series):
     return go.Bar(x=centers, y=[item.count for item in series.bins], width=widths)
 
 
+#
+# Crea la traza de líneas o puntos de una serie.
+#
 def _scatter_trace(chart, series, index):
     trace = go.Scatter(
         x=_x_values(series),
@@ -174,12 +191,18 @@ def _scatter_trace(chart, series, index):
     return trace
 
 
+#
+# Indica si el histograma es de una variable constante.
+#
 def _is_constant_histogram(chart):
     return chart.chart_type == "histogram" and all(
         item.lower == item.upper for series in chart.series for item in series.bins
     )
 
 
+#
+# Devuelve el tipo de eje X según el tipo SQL del campo.
+#
 def _x_axis_type(chart, constant_histogram):
     if constant_histogram:
         return "category"
@@ -187,6 +210,9 @@ def _x_axis_type(chart, constant_histogram):
     return _X_AXIS_TYPES.get(chart.x_axis.field.sql_type, "linear")
 
 
+#
+# Construye la configuración del eje X, con categorías explícitas si corresponde.
+#
 def _x_axis(chart, figure, x_type):
     axis = {
         "title": {"text": _axis_title(chart.x_axis)},
@@ -214,6 +240,9 @@ def _x_axis(chart, figure, x_type):
     return axis
 
 
+#
+# Construye la configuración del eje Y según el tipo de gráfico.
+#
 def _y_axis(chart):
     axis = {
         "title": {"text": _axis_title(chart.y_axis)},
@@ -242,6 +271,9 @@ def _y_axis(chart):
     return axis
 
 
+#
+# Aplica a los ejes los formatos de marcas de presentación del gráfico.
+#
 def _apply_tick_formats(chart, x_type, x_axis, y_axis):
     formats = chart_axis_formats(chart)
 
@@ -252,6 +284,9 @@ def _apply_tick_formats(chart, x_type, x_axis, y_axis):
         y_axis["tickformat"] = formats["yaxis"]
 
 
+#
+# Crea la nota al pie con las filas de entrada y excluidas y las unidades no documentadas.
+#
 def _note_annotation(chart):
     note = f"{chart.input_rows} filas de entrada; {chart.excluded_rows} excluidas."
     undocumented = any(
@@ -275,6 +310,9 @@ def _note_annotation(chart):
     }
 
 
+#
+# Devuelve los metadatos de procedencia que se incluyen en la figura.
+#
 def _figure_meta(chart):
     return {
         "operation_id": chart.operation_id,

@@ -45,6 +45,9 @@ class _RowScan:
     formula_only_rows: int = 0
 
 
+#
+# Agrupa índices ordenados en bloques de posiciones consecutivas.
+#
 def _consecutive_groups(indices: list[int]) -> list[list[int]]:
     groups = []
 
@@ -56,51 +59,84 @@ def _consecutive_groups(indices: list[int]) -> list[list[int]]:
     return groups
 
 
+#
+# Devuelve el rango en notación de hoja de cálculo para unos límites de región.
+#
 def _range_reference(bounds: _Bounds) -> str:
     left, top, right, bottom = bounds
     return f"{get_column_letter(left)}{top}:{get_column_letter(right)}{bottom}"
 
 
+#
+# Construye el nombre de una tabla a partir del archivo, la hoja y el rango.
+#
 def _table_name(filename: str, sheet_name: str, range_reference: str) -> str:
     return f"{PurePath(filename).stem} / {sheet_name} / {range_reference}"
 
 
+#
+# Devuelve el nombre provisional de una columna sin encabezado.
+#
 def _placeholder_name(column: int) -> str:
     return f"Columna {get_column_letter(column + 1)}"
 
 
+#
+# Calcula los límites de una región, base 1, a partir de sus columnas y filas.
+#
 def _region_bounds(columns: list[int], rows: list[int]) -> _Bounds:
     return (columns[0] + 1, rows[0] + 1, columns[-1] + 1, rows[-1] + 1)
 
 
+#
+# Devuelve los valores de una fila de la hoja para las columnas indicadas.
+#
 def _row_values(sheet: SheetData, row: int, columns: list[int]) -> list[object]:
     return [sheet.frame.iat[row, column] for column in columns]
 
 
+#
+# Indica si alguno de los valores no está vacío.
+#
 def _has_value(values) -> bool:
     return any(not is_empty(value) for value in values)
 
 
+#
+# Indica si el valor es una fórmula de hoja de cálculo.
+#
 def _is_formula(value: object) -> bool:
     return isinstance(value, str) and value.startswith("=")
 
 
+#
+# Indica si el valor es un número o una fecha, excluyendo booleanos.
+#
 def _is_scalar(value: object) -> bool:
     return isinstance(value, (int, float, Decimal, date)) and not isinstance(value, bool)
 
 
+#
+# Indica si una celda combinada queda totalmente dentro de los límites.
+#
 def _merge_inside(merge: _Bounds, bounds: _Bounds) -> bool:
     min_col, min_row, max_col, max_row = merge
     left, top, right, bottom = bounds
     return left <= min_col <= max_col <= right and top <= min_row <= max_row <= bottom
 
 
+#
+# Indica si una celda combinada se superpone con los límites.
+#
 def _merge_overlaps(merge: _Bounds, bounds: _Bounds) -> bool:
     min_col, min_row, max_col, max_row = merge
     left, top, right, bottom = bounds
     return min_col <= right and max_col >= left and min_row <= bottom and max_row >= top
 
 
+#
+# Indica si el valor es un texto utilizable como etiqueta de encabezado.
+#
 def _is_header_text(value: object) -> bool:
     if not isinstance(value, str) or not value.strip() or value.startswith("="):
         return False
@@ -108,15 +144,24 @@ def _is_header_text(value: object) -> bool:
     return not _looks_like_number_or_date(value)
 
 
+#
+# Indica si un texto tiene la forma de un número o una fecha.
+#
 def _looks_like_number_or_date(value: str) -> bool:
     return bool(re.search(r"\d", value)) and re.fullmatch(r"[+-]?[\d.,/ :T-]+", value) is not None
 
 
+#
+# Indica si la fila parece un título, con a lo sumo una etiqueta de texto.
+#
 def _is_title_row(values) -> bool:
     present = [value for value in values if not is_empty(value)]
     return len(present) <= 1 and all(_is_header_text(value) for value in present)
 
 
+#
+# Detecta las regiones tabulares de una hoja, declaradas o inferidas por bloques ocupados.
+#
 def _regions(sheet: SheetData, file_type: str) -> list[_Bounds]:
     if sheet.has_declared_tables:
         return sheet.table_ranges
@@ -139,6 +184,9 @@ def _regions(sheet: SheetData, file_type: str) -> list[_Bounds]:
     return regions
 
 
+#
+# Separa las columnas ocupadas en bloques, uniéndolos si comparten un mismo encabezado.
+#
 def _column_blocks(sheet: SheetData, values: list[list], rows: list[int]) -> list[list[int]]:
     columns = [
         column
@@ -147,13 +195,15 @@ def _column_blocks(sheet: SheetData, values: list[list], rows: list[int]) -> lis
     ]
     blocks = _consecutive_groups(columns)
 
-    # Una columna separadora no convierte un atributo sin nombre en otra tabla.
     if len(blocks) > 1 and _blocks_share_header(sheet, values, rows, columns, blocks):
         return [columns]
 
     return blocks
 
 
+#
+# Indica si varios bloques de columnas separados comparten en realidad un único encabezado.
+#
 def _blocks_share_header(
     sheet: SheetData,
     values: list[list],
@@ -176,6 +226,9 @@ def _blocks_share_header(
     return not independent and not formula_block and shared_header
 
 
+#
+# Indica si las celdas indicadas están vacías o contienen solo fórmulas.
+#
 def _only_formulas(values: list[list], rows: list[int], columns: list[int]) -> bool:
     return all(
         is_empty(values[row][column]) or _is_formula(values[row][column])
@@ -184,6 +237,9 @@ def _only_formulas(values: list[list], rows: list[int], columns: list[int]) -> b
     )
 
 
+#
+# Agrega una región a la lista o la fusiona con la anterior si no tiene encabezado propio.
+#
 def _add_region(
     sheet: SheetData,
     regions: list[_Bounds],
@@ -191,7 +247,6 @@ def _add_region(
     rows: list[int],
     columns: list[int],
 ) -> None:
-    """Un bloque sin encabezado propio bajo las mismas columnas continúa la tabla anterior."""
     bounds = _region_bounds(columns, rows)
     previous = _previous_region_with_header(sheet, regions, bounds)
     first_row = values[rows[0]][columns[0] : columns[-1] + 1]
@@ -210,6 +265,9 @@ def _add_region(
     regions[previous] = (prior[0], prior[1], prior[2], bounds[3])
 
 
+#
+# Busca la región previa con las mismas columnas y un encabezado válido.
+#
 def _previous_region_with_header(
     sheet: SheetData, regions: list[_Bounds], bounds: _Bounds
 ) -> int | None:
@@ -223,6 +281,9 @@ def _previous_region_with_header(
     return None
 
 
+#
+# Detecta el encabezado de una región y devuelve sus nombres y su cantidad de filas.
+#
 def _header(
     sheet: SheetData,
     bounds: _Bounds,
@@ -257,6 +318,9 @@ def _header(
     return _single_row_header(sheet, bounds, columns, first_row)
 
 
+#
+# Devuelve las celdas combinadas que forman parte del encabezado de una región.
+#
 def _header_merges(sheet: SheetData, bounds: _Bounds) -> list[_Bounds]:
     left, top, right, bottom = bounds
     return [
@@ -269,10 +333,16 @@ def _header_merges(sheet: SheetData, bounds: _Bounds) -> list[_Bounds]:
     ]
 
 
+#
+# Calcula cuántas filas de encabezado implican las celdas combinadas.
+#
 def _merged_depth(merges: list[_Bounds], top: int) -> int:
     return max((merged[3] - top + 1 + (merged[2] > merged[0]) for merged in merges), default=1)
 
 
+#
+# Construye el encabezado de varias filas apiladas y devuelve sus nombres si es consistente.
+#
 def _stacked_header(
     sheet: SheetData, top: int, columns: list[int], merges: list[_Bounds], depth: int
 ) -> tuple[list[str], int] | None:
@@ -290,6 +360,9 @@ def _stacked_header(
     return _stacked_names(grid, columns), depth
 
 
+#
+# Arma la cuadrícula de valores del encabezado, propagando el contenido de las celdas combinadas.
+#
 def _header_grid(
     sheet: SheetData, top: int, columns: list[int], merges: list[_Bounds], depth: int
 ) -> list[list[object]]:
@@ -307,8 +380,10 @@ def _header_grid(
     return grid
 
 
+#
+# Indica si las filas superiores son etiquetas de grupo combinadas sobre una fila de etiquetas.
+#
 def _labelled_groups(grid: list[list[object]], merges: list[_Bounds]) -> bool:
-    """Grupos combinados (por ejemplo años) sobre una última fila de etiquetas."""
     last_row = grid[-1]
 
     return (
@@ -319,6 +394,9 @@ def _labelled_groups(grid: list[list[object]], merges: list[_Bounds]) -> bool:
     )
 
 
+#
+# Indica si el valor sirve como etiqueta de grupo en un encabezado apilado.
+#
 def _is_group_label(value: object) -> bool:
     return (
         _is_header_text(value)
@@ -327,6 +405,9 @@ def _is_group_label(value: object) -> bool:
     )
 
 
+#
+# Une las etiquetas apiladas de cada columna en un único nombre.
+#
 def _stacked_names(grid: list[list[object]], columns: list[int]) -> list[str]:
     names = []
 
@@ -337,6 +418,9 @@ def _stacked_names(grid: list[list[object]], columns: list[int]) -> list[str]:
     return names
 
 
+#
+# Detecta un encabezado de dos filas donde la segunda documenta las unidades.
+#
 def _unit_row_header(
     sheet: SheetData,
     top: int,
@@ -365,14 +449,23 @@ def _unit_row_header(
     return names, 2
 
 
+#
+# Devuelve la unidad que documenta una etiqueta, si la tiene.
+#
 def _label_unit(value: object) -> str | None:
     return header_unit(f"unit [{value}]")
 
 
+#
+# Indica si la celda contiene un número o un texto numérico simple.
+#
 def _is_numeric_cell(value: object) -> bool:
     return _is_scalar(value) or (isinstance(value, str) and bool(_PLAIN_NUMBER.fullmatch(value)))
 
 
+#
+# Compone el nombre de una columna a partir de su etiqueta superior y su etiqueta de unidad.
+#
 def _unit_row_name(parent: object, child: object) -> str:
     if is_empty(parent):
         return str(child)
@@ -386,6 +479,9 @@ def _unit_row_name(parent: object, child: object) -> str:
     return f"{parent}{STACKED_HEADER_SEPARATOR}{child}"
 
 
+#
+# Detecta un encabezado de una sola fila y devuelve sus nombres si es confiable.
+#
 def _single_row_header(
     sheet: SheetData, bounds: _Bounds, columns: list[int], first_row: list[object]
 ) -> tuple[list[str], int] | None:
@@ -395,7 +491,6 @@ def _single_row_header(
     next_row = _row_values(sheet, top, columns)
     labelled_next_row = sum(_is_header_text(value) for value in next_row) * 2 > len(columns)
 
-    # Códigos sobre columnas y otra fila de etiquetas sugieren una matriz con contexto.
     if _mostly_codes(labels) and labelled_next_row:
         return None
 
@@ -416,11 +511,17 @@ def _single_row_header(
     return names, 1
 
 
+#
+# Indica si la mayoría de las etiquetas empieza con un dígito, como códigos.
+#
 def _mostly_codes(labels: list[object]) -> bool:
     codes = sum(isinstance(value, str) and re.match(r"^\d", value) is not None for value in labels)
     return codes * 2 > len(labels)
 
 
+#
+# Indica si las primeras filas bajo el encabezado contienen valores propios de datos.
+#
 def _has_data_evidence(sheet: SheetData, top: int, bottom: int, columns: list[int]) -> bool:
     return any(
         _is_data_like(value)
@@ -429,12 +530,18 @@ def _has_data_evidence(sheet: SheetData, top: int, bottom: int, columns: list[in
     )
 
 
+#
+# Indica si el valor parece un dato: número, fecha, fórmula o texto que empieza con número.
+#
 def _is_data_like(value: object) -> bool:
     return _is_scalar(value) or (
         isinstance(value, str) and (value.startswith("=") or bool(re.match(r"^[+-]?\d", value)))
     )
 
 
+#
+# Devuelve las columnas de la región que tienen al menos una celda con valor.
+#
 def _occupied_columns(sheet: SheetData, bounds: _Bounds) -> list[int]:
     left, top, right, bottom = bounds
     return [
@@ -444,6 +551,9 @@ def _occupied_columns(sheet: SheetData, bounds: _Bounds) -> list[int]:
     ]
 
 
+#
+# Localiza el encabezado de una región, saltando títulos previos, y cuenta las filas omitidas.
+#
 def _locate_header(
     sheet: SheetData,
     bounds: _Bounds,
@@ -457,7 +567,6 @@ def _locate_header(
     if header is not None or declared or header_depth is not None:
         return header, skipped
 
-    # Un título o una leyenda breve puede preceder a un encabezado completo.
     left, top, right, bottom = bounds
 
     while top + skipped < min(bottom, top + 5):
@@ -473,6 +582,9 @@ def _locate_header(
     return header, skipped
 
 
+#
+# Indica si hay celdas combinadas dentro de la zona de datos de la región.
+#
 def _merges_in_data(sheet: SheetData, bounds: _Bounds, data_start: int) -> bool:
     left, top, right, bottom = bounds
     return any(
@@ -481,6 +593,9 @@ def _merges_in_data(sheet: SheetData, bounds: _Bounds, data_start: int) -> bool:
     )
 
 
+#
+# Recorre las filas de datos separando registros de totales, leyendas y filas solo de fórmulas.
+#
 def _scan_rows(
     sheet: SheetData, selected: list[int], data_start: int, bottom: int, wide_region: bool
 ) -> _RowScan:
@@ -502,7 +617,6 @@ def _scan_rows(
             scan.omitted_totals += 1
             continue
 
-        # Sólo etiquetas explícitas identifican una leyenda; el texto largo puede ser un dato.
         if wide_region and _is_note_row(occupied):
             scan.omitted_notes += 1
             continue
@@ -513,6 +627,9 @@ def _scan_rows(
     return scan
 
 
+#
+# Indica si la fila es un total, con etiqueta de total e importes en el resto.
+#
 def _is_total_row(occupied: list[object]) -> bool:
     if len(occupied) <= 1:
         return False
@@ -525,6 +642,9 @@ def _is_total_row(occupied: list[object]) -> bool:
     return all(_is_total_amount(value) for value in occupied[1:])
 
 
+#
+# Indica si el valor puede ser un importe de total: número, fórmula o texto numérico.
+#
 def _is_total_amount(value: object) -> bool:
     if isinstance(value, (int, float, Decimal)):
         return True
@@ -534,6 +654,9 @@ def _is_total_amount(value: object) -> bool:
     )
 
 
+#
+# Indica si la fila es una leyenda de una sola celda con etiqueta de nota explícita.
+#
 def _is_note_row(occupied: list[object]) -> bool:
     if len(occupied) != 1:
         return False
@@ -543,6 +666,9 @@ def _is_note_row(occupied: list[object]) -> bool:
     return isinstance(note, str) and NOTE_ROW.match(note.strip()) is not None
 
 
+#
+# Genera las advertencias sobre filas de título, leyendas, totales y fórmulas que quedan sin interpretar.
+#
 def _omission_warnings(skipped: int, scan: _RowScan) -> list[str]:
     warnings = []
 
@@ -567,6 +693,9 @@ def _omission_warnings(skipped: int, scan: _RowScan) -> list[str]:
     return warnings
 
 
+#
+# Construye los metadatos de una columna: nombre, tipo, origen, unidad y encabezados originales.
+#
 def _column_metadata(
     sheet: SheetData,
     original: str,
@@ -597,6 +726,9 @@ def _column_metadata(
     return metadata
 
 
+#
+# Genera un nombre SQL libre para la columna de proyección numérica de una columna de texto.
+#
 def _projection_name(sql_name: str, columns: list[dict]) -> str:
     base = sql_name[:53] + "_numeric"
     taken = {column["sql_name"] for column in columns}
@@ -609,6 +741,9 @@ def _projection_name(sql_name: str, columns: list[dict]) -> str:
     return name
 
 
+#
+# Construye los metadatos de la columna de proyección numérica derivada de una de texto.
+#
 def _projection_column(metadata: dict, name: str, values: list, excluded: int) -> dict:
     return {
         **metadata,
@@ -623,6 +758,9 @@ def _projection_column(metadata: dict, name: str, values: list, excluded: int) -
     }
 
 
+#
+# Arma los registros de la tabla combinando valores convertidos, número de fila y fila de origen.
+#
 def _records(columns: list[dict], converted: list[list], source_rows: list[int]) -> list[dict]:
     sql_names = [column["sql_name"] for column in columns]
     records = []
@@ -633,6 +771,9 @@ def _records(columns: list[dict], converted: list[list], source_rows: list[int])
     return records
 
 
+#
+# Calcula una huella por fila a partir de las primeras columnas comparadas.
+#
 def _row_fingerprints(table: PreparedTable, compared_columns: int) -> list[str]:
     names = [column["sql_name"] for column in table.columns[:compared_columns]]
     fingerprints = []
@@ -644,6 +785,9 @@ def _row_fingerprints(table: PreparedTable, compared_columns: int) -> list[str]:
     return fingerprints
 
 
+#
+# Cuenta las filas coincidentes entre dos tablas con el mismo esquema inicial.
+#
 def _row_overlap(
     table: PreparedTable, schema: tuple, other: PreparedTable, other_schema: tuple
 ) -> dict | None:
@@ -661,6 +805,9 @@ def _row_overlap(
     return {"with": other.name, "matching_rows": count, "compared_columns": common}
 
 
+#
+# Cuenta las celdas con valor que quedan fuera de las tablas declaradas de la hoja.
+#
 def _cells_outside_tables(sheet: SheetData) -> int:
     outside = 0
 
@@ -677,11 +824,17 @@ def _cells_outside_tables(sheet: SheetData) -> int:
     return outside
 
 
+#
+# Construye el identificador de una región a partir de su hoja y sus límites.
+#
 def _region_id(sheet_index: int, bounds: _Bounds) -> str:
     left, top, right, bottom = bounds
     return f"{sheet_index}:{left}:{top}:{right}:{bottom}"
 
 
+#
+# Indica si una sugerencia de estructura tiene orientación y posiciones coherentes.
+#
 def _is_valid_hint(hint: StructureSuggestion) -> bool:
     positions = (hint.header_start, hint.header_depth, hint.data_start)
     integers = all(type(value) is int for value in positions)
@@ -696,6 +849,9 @@ def _is_valid_hint(hint: StructureSuggestion) -> bool:
     )
 
 
+#
+# Devuelve una hoja con el fragmento de la región transpuesto, para leer matrices por columnas.
+#
 def _transposed_sheet(sheet: SheetData, bounds: _Bounds) -> SheetData:
     left, top, right, bottom = bounds
     fragment = sheet.frame.iloc[top - 1 : bottom, left - 1 : right].T
@@ -714,6 +870,9 @@ def _transposed_sheet(sheet: SheetData, bounds: _Bounds) -> SheetData:
     )
 
 
+#
+# Devuelve las celdas combinadas dentro de la región con posiciones relativas a ella.
+#
 def _relative_merges(sheet: SheetData, bounds: _Bounds) -> list[list[int]]:
     left, top, right, bottom = bounds
     return [
@@ -723,6 +882,9 @@ def _relative_merges(sheet: SheetData, bounds: _Bounds) -> list[list[int]]:
     ]
 
 
+#
+# Toma una fila de muestra de la región con celdas de texto acotado.
+#
 def _sample_row(sheet: SheetData, row: int, columns: list[int], bounds: _Bounds) -> dict:
     left, top, right, bottom = bounds
     cells = {}
@@ -735,13 +897,22 @@ def _sample_row(sheet: SheetData, row: int, columns: list[int], bounds: _Bounds)
 
 
 class SimpleTabularProcessor:
+    #
+    # Guarda la configuración y crea el lector de tablas que usa el procesador.
+    #
     def __init__(self, settings: TabularSettings) -> None:
         self.settings = settings
         self.reader = TableReader(settings)
 
+    #
+    # Valida el archivo subido y devuelve su nombre seguro.
+    #
     def validate_upload(self, filename: str, content: bytes) -> str:
         return self.reader.validate(filename, content)
 
+    #
+    # Lee el archivo y lo convierte en tablas preparadas, usando sugerencias de estructura si existen.
+    #
     def prepare(
         self, filename: str, content: bytes, suggestions: list[StructureSuggestion] | None = None
     ) -> PreparationResult:
@@ -761,6 +932,9 @@ class SimpleTabularProcessor:
 
         return result
 
+    #
+    # Indexa las sugerencias por región y las descarta si hay regiones repetidas.
+    #
     @staticmethod
     def _unique_hints(
         suggestions: list[StructureSuggestion], warnings: list[str]
@@ -774,6 +948,9 @@ class SimpleTabularProcessor:
 
         return {}
 
+    #
+    # Prepara las tablas de una hoja y advierte sobre celdas fuera de las tablas declaradas.
+    #
     def _prepare_sheet(
         self,
         filename: str,
@@ -804,6 +981,9 @@ class SimpleTabularProcessor:
                 f"{sheet.name}: {outside} celdas fuera de las tablas declaradas permanecen en el original."
             )
 
+    #
+    # Prepara una región detectada, recurriendo a una sugerencia verificada o recogiendo un candidato.
+    #
     def _prepare_detected_region(
         self,
         filename: str,
@@ -836,6 +1016,9 @@ class SimpleTabularProcessor:
         if len(result.tables) > self.settings.max_datasets:
             raise FileTooLargeError("El archivo supera el límite de datasets permitido.")
 
+    #
+    # Aplica una sugerencia de estructura y descarta las advertencias del intento automático si se verifica.
+    #
     def _verified_hint(
         self,
         filename: str,
@@ -854,11 +1037,13 @@ class SimpleTabularProcessor:
             )
             return None
 
-        # La tabla verificada reemplaza las advertencias del intento automático.
         del warnings[warning_start:]
 
         return table
 
+    #
+    # Registra una región no resuelta como candidata para recibir asistencia de estructura.
+    #
     def _collect_candidate(
         self, sheet: SheetData, bounds: _Bounds, region_id: str, result: PreparationResult
     ) -> None:
@@ -872,6 +1057,9 @@ class SimpleTabularProcessor:
         if bottom - top >= 2 and right > left and evidence:
             result.structure_candidates.append(self._structure_sample(sheet, bounds, region_id))
 
+    #
+    # Arma una muestra acotada de la región para pedir asistencia de estructura.
+    #
     @staticmethod
     def _structure_sample(sheet: SheetData, bounds: _Bounds, region_id: str) -> dict:
         left, top, right, bottom = bounds
@@ -890,6 +1078,9 @@ class SimpleTabularProcessor:
             "merged_ranges": _relative_merges(sheet, bounds)[:20],
         }
 
+    #
+    # Prepara una región según una sugerencia de estructura, verificándola contra el archivo.
+    #
     def _assisted_region(
         self,
         filename: str,
@@ -966,6 +1157,9 @@ class SimpleTabularProcessor:
 
         return table
 
+    #
+    # Restaura la referencia a filas y columnas de origen en tablas leídas por columnas.
+    #
     @staticmethod
     def _restore_column_orientation(
         table: PreparedTable,
@@ -994,6 +1188,9 @@ class SimpleTabularProcessor:
         table.name = _table_name(filename, sheet.name, table.source_locator["range"])
         table.description = f"Matriz de {sheet.name}, rango {table.source_locator['range']}, con {len(table.rows)} columnas de origen almacenadas como registros."
 
+    #
+    # Marca las tablas que comparten filas con otras tablas del mismo archivo.
+    #
     @staticmethod
     def _mark_overlap(tables: list[PreparedTable]) -> None:
         previous: list[tuple[PreparedTable, tuple]] = []
@@ -1016,6 +1213,9 @@ class SimpleTabularProcessor:
 
             previous.append((table, schema))
 
+    #
+    # Prepara una región como tabla tipada o devuelve None con advertencias si no es confiable.
+    #
     def _prepare_region(
         self,
         filename: str,
@@ -1080,6 +1280,9 @@ class SimpleTabularProcessor:
             table_warnings,
         )
 
+    #
+    # Infiere el tipo y los metadatos de cada columna y registra advertencias de encabezado o tipo.
+    #
     @staticmethod
     def _typed_columns(
         sheet: SheetData,
@@ -1109,6 +1312,9 @@ class SimpleTabularProcessor:
 
         return columns, converted
 
+    #
+    # Agrega columnas de proyección numérica para columnas de texto con mediciones.
+    #
     def _add_numeric_projections(
         self,
         columns: list[dict],
@@ -1139,6 +1345,9 @@ class SimpleTabularProcessor:
                 f"{metadata['original_name']}: representación numérica auxiliar; {excluded} valores no convertibles conservados en el texto original y excluidos de cálculos."
             )
 
+    #
+    # Construye la tabla preparada con su localizador de origen, descripción y advertencias.
+    #
     @staticmethod
     def _prepared_table(
         filename: str,

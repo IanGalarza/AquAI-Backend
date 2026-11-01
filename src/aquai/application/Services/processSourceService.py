@@ -12,6 +12,9 @@ from aquai.application.utils.background import complete_write
 
 
 class ProcessSourceService:
+    #
+    # Guarda los puertos de comandos, consultas, procesamiento, semántica e índice que usa el servicio.
+    #
     def __init__(
         self,
         commands: SourceCommands,
@@ -26,6 +29,9 @@ class ProcessSourceService:
         self._semantics = semantics
         self._index = index
 
+    #
+    # Procesa una fuente cargada: prepara sus tablas, las describe y las indexa.
+    #
     async def process(self, source_id: UUID, *, reprocess: bool = False) -> None:
         source = await asyncio.to_thread(self._queries.get, source_id, include_content=True)
         if source["datasets"] and not reprocess:
@@ -51,6 +57,9 @@ class ProcessSourceService:
         await self._describe_datasets(source_id, prepared.tables)
         await self.reindex(source_id)
 
+    #
+    # Reconstruye el índice semántico de una fuente y registra su estado.
+    #
     async def reindex(self, source_id: UUID) -> None:
         await complete_write(self._commands.set_index_status, source_id, "processing")
 
@@ -81,6 +90,9 @@ class ProcessSourceService:
                 expected_active=source["is_active"],
             )
 
+    #
+    # Intenta mejorar la detección de estructura con sugerencias semánticas y registra el resultado.
+    #
     async def _assist_structure(self, source, prepared, structure_report):
         structure_report["attempted"] = True
 
@@ -110,6 +122,9 @@ class ProcessSourceService:
 
         return prepared
 
+    #
+    # Guarda las tablas preparadas de la fuente, reemplazando las anteriores si se reprocesa.
+    #
     async def _save_prepared(self, source_id, tables, report, *, reprocess) -> None:
         if reprocess:
             await complete_write(
@@ -123,8 +138,10 @@ class ProcessSourceService:
 
         await complete_write(self._commands.save_prepared, source_id, tables, report)
 
+    #
+    # Genera y guarda la descripción semántica de cada dataset de la fuente.
+    #
     async def _describe_datasets(self, source_id, tables) -> None:
-        # El catálogo usa el mismo orden y locator que las tablas preparadas.
         persisted = await asyncio.to_thread(self._queries.get, source_id)
 
         for table in tables:
@@ -138,6 +155,9 @@ class ProcessSourceService:
                 warnings=semantic_warnings,
             )
 
+    #
+    # Obtiene la descripción semántica de una tabla o conserva la estructural si falla.
+    #
     async def _describe(self, table, dataset):
         try:
             result = await self._semantics.describe(table)
@@ -150,6 +170,9 @@ class ProcessSourceService:
             return dataset["description"], table.columns, [fallback_warning]
 
 
+#
+# Construye el informe de preparación con avisos, recuentos y asistencia estructural.
+#
 def _preparation_report(prepared, structure_report) -> dict:
     warnings = _unique_warnings(prepared)
 
@@ -165,6 +188,9 @@ def _preparation_report(prepared, structure_report) -> dict:
     }
 
 
+#
+# Reúne los avisos de la preparación y de sus tablas sin duplicados.
+#
 def _unique_warnings(prepared) -> list:
     warnings = list(prepared.warnings)
     for table in prepared.tables:
@@ -173,6 +199,9 @@ def _unique_warnings(prepared) -> list:
     return list(dict.fromkeys(warnings))
 
 
+#
+# Devuelve el dataset guardado que corresponde a una tabla preparada.
+#
 def _persisted_dataset(persisted, table) -> dict:
     return next(
         item for item in persisted["datasets"] if item["source_locator"] == table.source_locator

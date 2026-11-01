@@ -9,6 +9,9 @@ from aquai.infrastructure.persistence.configurations.common import (
 )
 
 
+#
+# Define la tabla MessageSource que une mensajes con fuentes y datasets y la mapea.
+#
 def configure(mapper_registry: registry) -> None:
     table = Table(
         "MessageSource",
@@ -34,8 +37,6 @@ def configure(mapper_registry: registry) -> None:
         Column("ReferenceOrder", Integer, key="reference_order", nullable=False),
         Column("details", JSONB(none_as_null=True), nullable=False),
         *timestamp_columns(),
-        # MATCH SIMPLE permite una referencia documental con datasetId = NULL.
-        # Si se indica un conjunto de datos, debe pertenecer a la misma fuente.
         ForeignKeyConstraint(
             ["dataset_id", "source_id"],
             ["Dataset.id", "Dataset.source_id"],
@@ -53,8 +54,6 @@ def configure(mapper_registry: registry) -> None:
                 back_populates="message_sources",
                 foreign_keys=[table.c.source_id],
             ),
-            # Esta relación sincroniza solo dataset_id. La relación con la fuente
-            # administra source_id; SQL rechaza las combinaciones incompatibles.
             "dataset": relationship(
                 "Dataset",
                 back_populates="message_sources",

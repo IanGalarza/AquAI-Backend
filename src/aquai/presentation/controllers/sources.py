@@ -22,6 +22,9 @@ from aquai.presentation.errors import ERROR_RESPONSES
 router = APIRouter(prefix="/sources", tags=["Fuentes"])
 
 
+#
+# Carga un archivo CSV o XLSX como fuente (POST /sources).
+#
 @router.post(
     "",
     status_code=202,
@@ -37,6 +40,9 @@ async def upload_source(
     return await handler.handle(file)
 
 
+#
+# Lista las fuentes cargadas de forma paginada y filtrable (GET /sources).
+#
 @router.get(
     "", response_model=SourceListResponse, summary="Listar fuentes", responses=ERROR_RESPONSES
 )
@@ -61,6 +67,9 @@ async def list_sources(
     )
 
 
+#
+# Consulta una fuente y sus datasets (GET /sources/{id}).
+#
 @router.get(
     "/{id}",
     response_model=SourceDetailResponse,
@@ -71,6 +80,9 @@ async def get_source(id: UUID, handler: GetSourceDependency) -> SourceDetailResp
     return await handler.handle(id)
 
 
+#
+# Activa o desactiva una fuente (PATCH /sources/{id}).
+#
 @router.patch(
     "/{id}",
     response_model=SourceActivationResponse,

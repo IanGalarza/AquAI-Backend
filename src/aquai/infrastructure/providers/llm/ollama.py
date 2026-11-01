@@ -36,8 +36,10 @@ _DESCRIBED_COLUMN_KEYS = (
 )
 
 
+#
+# Devuelve el bloqueo que serializa las inferencias de Ollama en el loop actual.
+#
 def _inference_lock() -> asyncio.Lock:
-    """Las instancias comparten una cola por loop para no saturar Ollama."""
     loop = asyncio.get_running_loop()
     if loop not in _inference_locks:
         _inference_locks[loop] = asyncio.Lock()
@@ -45,6 +47,9 @@ def _inference_lock() -> asyncio.Lock:
     return _inference_locks[loop]
 
 
+#
+# Normaliza el nombre de un modelo agregando la etiqueta «latest» si no tiene.
+#
 def model_identity(model: str) -> str:
     image_name = model.rsplit("/", 1)[-1]
     if ":" in image_name:
@@ -53,8 +58,10 @@ def model_identity(model: str) -> str:
     return f"{model}:latest"
 
 
+#
+# Devuelve los tokens de entrada que Ollama informa, o None si no los incluyó.
+#
 def prompt_tokens(body: dict) -> int | None:
-    # Ollama puede omitir el recuento o enviarlo nulo: entonces el desborde no puede medirse.
     count = body.get("prompt_eval_count")
 
     if count is None:
@@ -66,12 +73,18 @@ def prompt_tokens(body: dict) -> int | None:
     return count
 
 
+#
+# Indica si los tokens de entrada alcanzan o superan el límite de contexto.
+#
 def exceeds_context(body: dict, limit: int) -> bool:
     tokens = prompt_tokens(body)
 
     return tokens is not None and tokens >= limit
 
 
+#
+# Indica si el valor es un número entero o decimal finito, excluyendo booleanos.
+#
 def _is_finite_number(value: Any) -> bool:
     return not isinstance(value, bool) and isinstance(value, (int, float)) and math.isfinite(value)
 
@@ -103,12 +116,18 @@ class _StructureResponse(BaseModel):
 
 
 class _OllamaClient:
+    #
+    # Guarda la configuración y el transporte HTTP del cliente de Ollama.
+    #
     def __init__(
         self, settings: TabularSettings, transport: httpx.AsyncBaseTransport | None
     ) -> None:
         self._settings = settings
         self._transport = transport
 
+    #
+    # Envía una petición a Ollama y devuelve su respuesta tras verificar el modelo que contestó.
+    #
     async def post(self, path: str, payload: dict, timeout: float) -> dict:
         payload = self._with_keep_alive(payload)
         response = await self._send(path, payload, timeout)
@@ -119,12 +138,18 @@ class _OllamaClient:
 
         return body
 
+    #
+    # Agrega al payload el tiempo de permanencia del modelo si está configurado.
+    #
     def _with_keep_alive(self, payload: dict) -> dict:
         if self._settings.llm_keep_alive is None:
             return payload
 
         return {**payload, "keep_alive": self._settings.llm_keep_alive}
 
+    #
+    # Envía la petición HTTP a Ollama con cola de inferencia y traduce los errores a errores del proveedor.
+    #
     async def _send(self, path: str, payload: dict, timeout: float) -> httpx.Response:
         try:
             async with _inference_lock():
@@ -144,6 +169,9 @@ class _OllamaClient:
 
         return response
 
+    #
+    # Extrae el cuerpo JSON de la respuesta y rechaza respuestas no JSON o con error.
+    #
     @staticmethod
     def _protocol_body(response: httpx.Response) -> dict:
         try:
@@ -156,6 +184,9 @@ class _OllamaClient:
 
         return body
 
+    #
+    # Indica si la respuesta proviene del modelo solicitado.
+    #
     @staticmethod
     def _answered_by_requested_model(body: dict, payload: dict) -> bool:
         returned_model = body.get("model")
@@ -166,12 +197,18 @@ class _OllamaClient:
 
 
 class OllamaSemanticProvider:
+    #
+    # Guarda la configuración y crea el cliente de Ollama del proveedor semántico.
+    #
     def __init__(
         self, settings: TabularSettings, *, transport: httpx.AsyncBaseTransport | None = None
     ) -> None:
         self._settings = settings
         self._client = _OllamaClient(settings, transport)
 
+    #
+    # Pide a Ollama sugerencias de estructura para regiones candidatas y valida que no las alteren.
+    #
     async def suggest_structure(self, candidates: list[dict]) -> list[StructureSuggestion]:
         if not candidates or not self._settings.structure_assistance:
             return []
@@ -192,6 +229,9 @@ class OllamaSemanticProvider:
 
         return [StructureSuggestion(**hint.model_dump()) for hint in result.suggestions]
 
+    #
+    # Genera la descripción semántica de una tabla y el significado de cada columna con Ollama.
+    #
     async def describe(self, table: PreparedTable) -> SemanticDescription:
         names = [column["original_name"] for column in table.columns]
         if not names or len(names) > self._settings.max_columns:
@@ -214,12 +254,18 @@ class OllamaSemanticProvider:
 
         return SemanticDescription(description=result.description.strip(), columns=columns)
 
+    #
+    # Construye el esquema JSON de la asistencia estructural limitando las regiones permitidas.
+    #
     @staticmethod
     def _structure_schema(region_ids: list) -> dict:
         schema = _StructureResponse.model_json_schema()
         schema["$defs"]["_StructureHint"]["properties"]["region_id"]["enum"] = region_ids
         return schema
 
+    #
+    # Valida la respuesta de asistencia estructural contra su contrato JSON.
+    #
     @staticmethod
     def _parse_structure(content: str) -> _StructureResponse:
         try:
@@ -227,6 +273,9 @@ class OllamaSemanticProvider:
         except ValidationError as exc:
             raise LLMProviderError("La asistencia estructural no cumple el contrato JSON.") from exc
 
+    #
+    # Construye el esquema JSON de la descripción limitando los nombres de columna permitidos.
+    #
     @staticmethod
     def _description_schema(names: list) -> dict:
         schema = _Description.model_json_schema()
@@ -234,6 +283,9 @@ class OllamaSemanticProvider:
         original_name["enum"] = list(dict.fromkeys(names))
         return schema
 
+    #
+    # Arma la evidencia de la tabla (metadatos, advertencias y muestra) que se envía para describirla.
+    #
     def _description_evidence(self, table: PreparedTable) -> dict:
         sample = self._sample(table)
 
@@ -249,10 +301,16 @@ class OllamaSemanticProvider:
             "sample_is_partial": len(table.rows) > len(sample),
         }
 
+    #
+    # Selecciona de una columna solo las claves que se envían como evidencia.
+    #
     @staticmethod
     def _column_evidence(column: dict) -> dict:
         return {key: column[key] for key in _DESCRIBED_COLUMN_KEYS if key in column}
 
+    #
+    # Valida la descripción devuelta por Ollama contra su contrato JSON.
+    #
     @staticmethod
     def _parse_description(content: str) -> _Description:
         try:
@@ -262,6 +320,9 @@ class OllamaSemanticProvider:
                 "Ollama devolvió una descripción que no cumple el contrato JSON."
             ) from exc
 
+    #
+    # Envía a Ollama el prompt y la evidencia con un esquema JSON y devuelve el contenido de la respuesta.
+    #
     async def _chat(self, prompt: str, schema: dict, evidence: dict) -> str:
         content = json.dumps(evidence, ensure_ascii=False, separators=(",", ":"))
         if len(content) > 96_000:
@@ -294,6 +355,9 @@ class OllamaSemanticProvider:
 
         return message["content"]
 
+    #
+    # Devuelve el localizador de origen, truncado si supera el tamaño permitido.
+    #
     @staticmethod
     def _bounded_locator(locator: dict[str, Any]) -> dict[str, Any]:
         content = json.dumps(locator, ensure_ascii=False, separators=(",", ":"), default=str)
@@ -302,6 +366,9 @@ class OllamaSemanticProvider:
 
         return json.loads(content)
 
+    #
+    # Toma una muestra de filas de la tabla acotada por tamaño.
+    #
     def _sample(self, table: PreparedTable) -> list[list[Any]]:
         rows: list[list[Any]] = []
         remaining = 16_000
@@ -319,10 +386,16 @@ class OllamaSemanticProvider:
 
         return rows
 
+    #
+    # Calcula índices de filas distribuidos de forma pareja para la muestra.
+    #
     def _evenly_spaced_indices(self, row_count: int) -> list[int]:
         count = min(row_count, self._settings.sample_rows)
         return [round(index * (row_count - 1) / max(1, count - 1)) for index in range(count)]
 
+    #
+    # Convierte un valor de celda a una forma serializable, truncando los textos largos.
+    #
     @staticmethod
     def _cell_preview(value: Any) -> Any:
         if value is None or isinstance(value, (bool, int)):
@@ -341,12 +414,18 @@ class OllamaSemanticProvider:
 
 
 class OllamaEmbeddingProvider:
+    #
+    # Guarda la configuración y crea el cliente de Ollama del proveedor de embeddings.
+    #
     def __init__(
         self, settings: TabularSettings, *, transport: httpx.AsyncBaseTransport | None = None
     ) -> None:
         self._settings = settings
         self._client = _OllamaClient(settings, transport)
 
+    #
+    # Calcula los embeddings de una lista de textos con Ollama y valida los vectores devueltos.
+    #
     async def embed(self, texts: list[str]) -> list[list[float]]:
         if not texts:
             return []
@@ -370,6 +449,9 @@ class OllamaEmbeddingProvider:
         self._validate_vectors(vectors)
         return [[float(value) for value in vector] for vector in vectors]
 
+    #
+    # Valida que los vectores no estén vacíos, sean finitos, no nulos y de igual dimensión.
+    #
     @staticmethod
     def _validate_vectors(vectors: list) -> None:
         dimension = None
@@ -387,11 +469,12 @@ class OllamaEmbeddingProvider:
             dimension = len(vector)
 
 
+#
+# Precarga los modelos de Ollama al iniciar para que la primera consulta no pague la carga.
+#
 async def warm_up_models(settings: TabularSettings) -> None:
-    """Carga los modelos al iniciar para que la primera consulta no pague la carga."""
     client = _OllamaClient(settings, None)
     try:
-        # Mismo num_ctx que las consultas: otro tamaño obligaría a Ollama a recargar el modelo.
         await client.post(
             "/api/chat",
             {

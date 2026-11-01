@@ -42,11 +42,17 @@ class ConversationRuntime:
     messages: GetMessagesHandler
 
 
+#
+# Devuelve la configuración de conversaciones, cacheada.
+#
 @lru_cache
 def get_conversation_settings():
     return ConversationSettings()
 
 
+#
+# Construye los manejadores de conversaciones con sus comandos, consultas y el ejecutor del grafo.
+#
 @lru_cache
 def create_conversation_runtime() -> ConversationRuntime:
     initialize_application()

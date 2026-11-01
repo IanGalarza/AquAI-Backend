@@ -1,5 +1,3 @@
-"""Persistencia completa, recuperación y atomicidad sin servicios externos."""
-
 import re
 from importlib import import_module
 from io import StringIO
@@ -27,6 +25,9 @@ from aquai.infrastructure.queries.sources import SqlAlchemySourceQueries
 from tests.sourceDatabase import SourceTestDbContext
 
 
+#
+# Construye una fuente de prueba con un CSV pequeño.
+#
 def _upload(content: bytes = b"codigo,valor\n001,nd\n") -> Source:
     return Source(
         name="Observaciones",
@@ -38,6 +39,9 @@ def _upload(content: bytes = b"codigo,valor\n001,nd\n") -> Source:
     )
 
 
+#
+# Construye una tabla preparada de prueba con la cantidad de filas indicada.
+#
 def _prepared(count: int = 2) -> PreparedTable:
     return PreparedTable(
         name="Observaciones",
@@ -72,22 +76,34 @@ def _prepared(count: int = 2) -> PreparedTable:
     )
 
 
+#
+# Normaliza las líneas de un DDL para compararlas sin importar su orden.
+#
 def _ddl_lines(body: str) -> list[str]:
     return sorted(" ".join(line.strip().rstrip(",").split()) for line in body.strip().splitlines())
 
 
 class SimplePersistenceTests(TestCase):
+    #
+    # Prepara una base aislada con comandos y consultas de fuentes.
+    #
     def setUp(self):
         self.context = SourceTestDbContext()
         self.commands = SqlAlchemySourceCommands(self.context)
         self.queries = SqlAlchemySourceQueries(self.context)
         self.addCleanup(self.context.dispose)
 
+    #
+    # Devuelve los registros de la tabla física de un dataset ordenados por fila.
+    #
     def _rows(self, dataset):
         with self.context.engine.connect() as connection:
             table = Table(dataset["physical_table_name"], MetaData(), autoload_with=connection)
             return connection.execute(select(table).order_by(table.c._aquai_row)).mappings().all()
 
+    #
+    # Verifica que todas las filas se guardan una vez y que el hash deduplica los originales.
+    #
     def test_all_rows_persist_once_and_sha_deduplicates_originals(self):
         source = _upload()
         self.assertEqual(self.commands.create_upload(source), (source.id, True))
@@ -115,6 +131,9 @@ class SimplePersistenceTests(TestCase):
         self.assertEqual(rows[1]["valor"], "NA")
         self.assertEqual(self.queries.list(search="Observ", processing_status="ready")["total"], 1)
 
+    #
+    # Verifica que interrupciones y fallos conservan filas y que la activación condiciona las consultas.
+    #
     def test_interruption_and_provider_failure_preserve_rows_and_activation_gates_queries(self):
         source = _upload()
         self.commands.create_upload(source)
@@ -162,6 +181,9 @@ class SimplePersistenceTests(TestCase):
         self.assertEqual(self.queries.get(empty.id)["processing_status"], "failed")
         self.assertEqual(self.queries.get(empty.id)["datasets"], [])
 
+    #
+    # Verifica que reprocesar rechaza perder regiones o fuentes referenciadas por mensajes.
+    #
     def test_reprocess_rejects_lost_regions_and_sources_used_by_messages(self):
         metadata.create_all(self.context.engine)
         source = _upload()
@@ -203,6 +225,9 @@ class SimplePersistenceTests(TestCase):
         )
         self.assertEqual(len(self._rows(dataset)), 2)
 
+    #
+    # Verifica que un lote fallido revierte catálogo y tablas y que el esquema coincide con la migración.
+    #
     def test_failed_batch_rolls_back_catalog_and_physical_tables_and_schema_rejects_bad_state(self):
         source = _upload()
         self.commands.create_upload(source)

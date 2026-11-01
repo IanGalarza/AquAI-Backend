@@ -12,6 +12,9 @@ logger = logging.getLogger(__name__)
 
 
 class SourceWorker:
+    #
+    # Guarda los comandos de fuentes, el procesador y el intervalo de sondeo del worker.
+    #
     def __init__(
         self,
         commands: SourceCommands,
@@ -26,11 +29,17 @@ class SourceWorker:
         self._task: asyncio.Task | None = None
         self._stopping = False
 
+    #
+    # Inicia la tarea en segundo plano que procesa la cola de fuentes si no estaba activa.
+    #
     async def start(self) -> None:
         if self._task is None:
             self._stopping = False
             self._task = asyncio.create_task(self.run(), name="aquai-source-worker")
 
+    #
+    # Detiene la tarea en segundo plano del worker y espera a que termine.
+    #
     async def stop(self) -> None:
         if self._task is None:
             return
@@ -46,9 +55,15 @@ class SourceWorker:
 
         self._task = None
 
+    #
+    # Despierta al worker para que revise la cola de inmediato.
+    #
     def wake(self) -> None:
         self._wake.set()
 
+    #
+    # Reprocesa una fuente bajo el bloqueo del worker o falla si otro worker está procesando.
+    #
     async def reprocess(self, source_id: UUID) -> None:
         async with self._worker_lock() as acquired:
             if not acquired:
@@ -58,6 +73,9 @@ class SourceWorker:
 
             await self._processor.process(source_id, reprocess=True)
 
+    #
+    # Procesa la cola de fuentes de forma continua hasta que se detenga el worker.
+    #
     async def run(self) -> None:
         while not self._stopping:
             try:
@@ -70,8 +88,10 @@ class SourceWorker:
 
             await self._wait_for_wake()
 
+    #
+    # Procesa una fuente o un índice pendiente y devuelve si hubo trabajo.
+    #
     async def run_once(self) -> bool:
-        # Conexión autocommit reservada para un advisory lock, sin sesión ORM abierta.
         async with self._worker_lock() as acquired:
             if not acquired:
                 return False
@@ -90,6 +110,9 @@ class SourceWorker:
             await self._processor.reindex(index_id)
             return True
 
+    #
+    # Espera hasta que despierten al worker o venza el intervalo de sondeo.
+    #
     async def _wait_for_wake(self) -> None:
         try:
             async with asyncio.timeout(self._poll_seconds):
@@ -99,6 +122,9 @@ class SourceWorker:
 
         self._wake.clear()
 
+    #
+    # Adquiere de forma exclusiva el bloqueo del worker y lo libera al salir.
+    #
     @asynccontextmanager
     async def _worker_lock(self):
         manager = self._commands.worker_lock()
@@ -116,6 +142,9 @@ class SourceWorker:
         finally:
             await complete_write(manager.__exit__, None, None, None)
 
+    #
+    # Reclama la siguiente fuente pendiente de procesar o de indexar, o None si no hay.
+    #
     async def _claim(self, *, semantic: bool = False) -> UUID | None:
         operation = self._commands.claim_index_next if semantic else self._commands.claim_next
         task = asyncio.create_task(asyncio.to_thread(operation))
@@ -128,6 +157,9 @@ class SourceWorker:
                 await self._release_claim(source_id, semantic=semantic)
             raise
 
+    #
+    # Devuelve una fuente reclamada a su estado pendiente tras una interrupción.
+    #
     async def _release_claim(self, source_id: UUID, *, semantic: bool) -> None:
         if semantic:
             await complete_write(self._commands.set_index_status, source_id, "pending")
@@ -140,6 +172,9 @@ class SourceWorker:
             "Procesamiento interrumpido al reclamar la fuente.",
         )
 
+    #
+    # Procesa una fuente y registra el fallo si se interrumpe o no se puede preparar.
+    #
     async def _process(self, source_id: UUID) -> None:
         try:
             await self._processor.process(source_id)

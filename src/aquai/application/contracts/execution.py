@@ -138,7 +138,6 @@ class VisualizationResult(BaseModel):
     excluded_rows: int
     numeric_encoding: Literal["float64_for_display"] = "float64_for_display"
     warnings: list[str] = Field(default_factory=list)
-    # None permite leer resultados anteriores; las nuevas visualizaciones incluyen figura.
     figure: PlotlyFigure | None = None
 
 

@@ -1,5 +1,3 @@
-"""Flujo HTTP y fallos externos sin servicios ni archivos privados."""
-
 import asyncio
 import unittest
 from datetime import date
@@ -24,9 +22,15 @@ from tests.sourceDatabase import SourceTestDbContext
 
 
 class DescriptionDouble:
+    #
+    # Guarda si el doble debe simular un fallo del proveedor semántico.
+    #
     def __init__(self, fail=False):
         self.fail = fail
 
+    #
+    # Devuelve una descripción básica de la tabla o falla si se simula el proveedor caído.
+    #
     async def describe(self, table):
         if self.fail:
             raise RuntimeError("offline")
@@ -35,6 +39,9 @@ class DescriptionDouble:
             columns=table.columns,
         )
 
+    #
+    # Devuelve sin sugerencias de estructura o falla si se simula el proveedor caído.
+    #
     async def suggest_structure(self, candidates):
         if self.fail:
             raise RuntimeError("offline")
@@ -42,20 +49,32 @@ class DescriptionDouble:
 
 
 class IndexDouble:
+    #
+    # Guarda si el doble debe simular un fallo del índice y las fuentes indexadas.
+    #
     def __init__(self, fail=False):
         self.fail = fail
         self.sources = []
 
+    #
+    # Registra la fuente indexada o falla si se simula el índice caído.
+    #
     async def index_source(self, source):
         if self.fail:
             raise RuntimeError("offline")
         self.sources.append(source)
 
+    #
+    # Simula el cambio de actividad de una fuente en el índice sin hacer nada.
+    #
     async def set_source_active(self, source_id, active):
         pass
 
 
 class SourceLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    #
+    # Prepara una base aislada, los comandos, las consultas y el runtime de fuentes.
+    #
     def setUp(self):
         self.context = SourceTestDbContext()
         self.addCleanup(self.context.dispose)
@@ -66,6 +85,9 @@ class SourceLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.index = IndexDouble()
         self.runtime = self.build()
 
+    #
+    # Construye el runtime de fuentes con los dobles de semántica e índice.
+    #
     def build(self, semantics=None):
         return build_source_runtime(
             self.commands,
@@ -76,6 +98,9 @@ class SourceLifecycleTests(unittest.IsolatedAsyncioTestCase):
             max_upload_bytes=self.settings.max_upload_bytes,
         )
 
+    #
+    # Carga un CSV pequeño de prueba y devuelve la respuesta de aceptación.
+    #
     async def upload(self):
         return await self.runtime.upload.handle(
             UploadSourceRequest(
@@ -84,6 +109,9 @@ class SourceLifecycleTests(unittest.IsolatedAsyncioTestCase):
             )
         )
 
+    #
+    # Devuelve los registros de la tabla física de un dataset ordenados por fila.
+    #
     def physical_rows(self, dataset):
         table = Table(
             dataset["physical_table_name"],
@@ -97,6 +125,9 @@ class SourceLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 ).mappings()
             )
 
+    #
+    # Verifica que se guardan todas las filas, que una carga duplicada se detecta y que reindexar es idempotente.
+    #
     async def test_full_rows_duplicate_upload_and_idempotent_reindex(self):
         accepted = await self.upload()
         duplicate = await self.upload()
@@ -116,6 +147,9 @@ class SourceLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.queries.get(accepted.id)["datasets"][0]["id"], dataset_id)
         self.assertEqual(len(self.physical_rows(state["datasets"][0])), 3)
 
+    #
+    # Verifica que si falla el proveedor semántico se conserva el SQL y se indexa una descripción básica.
+    #
     async def test_qwen_failure_keeps_confirmed_sql_and_indexes_basic_description(self):
         self.runtime = self.build(DescriptionDouble(fail=True))
         accepted = await self.upload()
@@ -126,6 +160,9 @@ class SourceLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.physical_rows(state["datasets"][0])), 3)
         self.assertTrue(state["processing_report"]["warnings"])
 
+    #
+    # Verifica que un fallo del índice se ve, conserva el SQL y se reintenta sin releer el archivo.
+    #
     async def test_index_failure_visible_and_sql_preserved_then_retry_without_reading(self):
         self.index.fail = True
         accepted = await self.upload()
@@ -140,6 +177,9 @@ class SourceLifecycleTests(unittest.IsolatedAsyncioTestCase):
         await self.runtime.worker.run_once()
         self.assertEqual(self.queries.get(accepted.id)["semantic_index_status"], "ready")
 
+    #
+    # Verifica que la ayuda estructural es acotada y que el fallback conserva el SQL normal.
+    #
     async def test_structural_assistance_is_bounded_and_fallback_keeps_normal_sql(self):
         def content(value):
             workbook = Workbook()
@@ -198,6 +238,9 @@ class SourceLifecycleTests(unittest.IsolatedAsyncioTestCase):
             )
         )
 
+    #
+    # Verifica que reprocesar conserva los identificadores y revierte las tablas si falla.
+    #
     async def test_reprocessing_keeps_ids_and_rolls_back_tables_on_failure(self):
         metadata.create_all(self.context.engine)
         accepted = await self.upload()
@@ -239,6 +282,9 @@ class SourceLifecycleTests(unittest.IsolatedAsyncioTestCase):
             1,
         )
 
+    #
+    # Verifica que activar nunca habilita datasets sin preparar o inactivos.
+    #
     async def test_activation_never_enables_unprepared_or_inactive_datasets(self):
         accepted = await self.upload()
         detail = await self.runtime.activate.handle(accepted.id, True)
@@ -252,6 +298,9 @@ class SourceLifecycleTests(unittest.IsolatedAsyncioTestCase):
         public_detail = await self.runtime.get.handle(accepted.id)
         self.assertFalse(public_detail.datasets[0].queryable)
 
+    #
+    # Verifica que cancelar la semántica conserva el SQL, recupera el índice y el cierre termina.
+    #
     async def test_cancelled_semantics_keeps_sql_and_recovers_pending_index(self):
         entered = asyncio.Event()
 
@@ -274,7 +323,6 @@ class SourceLifecycleTests(unittest.IsolatedAsyncioTestCase):
         await self.runtime.worker.run_once()
         self.assertEqual(self.queries.get(accepted.id)["semantic_index_status"], "ready")
 
-        # El cierre debe terminar incluso si una operación consume su cancelación.
         worker = self.runtime.worker
         entered.clear()
 
@@ -290,6 +338,9 @@ class SourceLifecycleTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.wait_for(entered.wait(), timeout=2)
         await asyncio.wait_for(worker.stop(), timeout=2)
 
+    #
+    # Verifica el contrato de las cuatro rutas HTTP de fuentes y el rechazo de cargas inválidas.
+    #
     def test_four_http_routes_contract_and_invalid_uploads(self):
         from fastapi.testclient import TestClient
 

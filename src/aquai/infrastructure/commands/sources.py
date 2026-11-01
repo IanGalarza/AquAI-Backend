@@ -49,6 +49,9 @@ _PROVENANCE_COLUMNS = {"_aquai_row", "_aquai_source_row"}
 _INSERT_BATCH_SIZE = 1000
 
 
+#
+# Devuelve los dos locks de SQLite asociados al motor, creándolos si faltan.
+#
 def _sqlite_locks(engine: Engine) -> tuple[Lock, Lock]:
     with _engine_locks_guard:
         if engine not in _engine_locks:
@@ -56,21 +59,33 @@ def _sqlite_locks(engine: Engine) -> tuple[Lock, Lock]:
         return _engine_locks[engine]
 
 
+#
+# Devuelve la fecha y hora actuales en UTC.
+#
 def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+#
+# Deduplica y acota las advertencias en cantidad y longitud.
+#
 def _warnings(*groups: list[str]) -> list[str]:
     unique = dict.fromkeys(str(item)[:1000] for group in groups for item in group)
     return list(unique)[:50]
 
 
+#
+# Devuelve una copia del informe con las advertencias agregadas.
+#
 def _report_with_warnings(report: dict[str, Any], warnings: list[str]) -> dict[str, Any]:
     updated = deepcopy(report)
     updated["warnings"] = _warnings(updated.get("warnings", []), warnings)
     return updated
 
 
+#
+# Valida la procedencia, las columnas y los registros de una tabla preparada.
+#
 def _validate_table(table: PreparedTable) -> None:
     if not isinstance(table.source_locator, dict):
         raise ValueError("La procedencia de la tabla debe ser un objeto JSON.")
@@ -97,6 +112,9 @@ def _validate_table(table: PreparedTable) -> None:
         _validate_row(row, position, expected, transposed)
 
 
+#
+# Valida los metadatos de una columna preparada.
+#
 def _validate_column(column: dict[str, Any]) -> None:
     name = column["sql_name"]
     if not isinstance(name, str) or not re.fullmatch(r"[a-z_][a-z0-9_]{0,62}", name):
@@ -113,6 +131,9 @@ def _validate_column(column: dict[str, Any]) -> None:
         raise ValueError("Una columna no numérica no puede habilitar cálculos numéricos.")
 
 
+#
+# Valida que un registro tenga las columnas y la procedencia esperadas.
+#
 def _validate_row(row: dict[str, Any], position: int, expected: set[str], transposed: bool) -> None:
     if set(row) != expected:
         raise ValueError("Los registros no corresponden a las columnas declaradas.")
@@ -126,6 +147,9 @@ def _validate_row(row: dict[str, Any], position: int, expected: set[str], transp
         raise ValueError("La columna original debe tener procedencia válida.")
 
 
+#
+# Valida las tablas preparadas y el informe antes de guardarlos.
+#
 def _validate_prepared(tables: list[PreparedTable], report: dict[str, Any]) -> None:
     locators: set[str] = set()
     for table in tables:
@@ -142,6 +166,9 @@ def _validate_prepared(tables: list[PreparedTable], report: dict[str, Any]) -> N
     json.dumps(report, allow_nan=False)
 
 
+#
+# Construye la definición de la tabla física de un dataset.
+#
 def _physical_table(name: str, columns: list[dict[str, Any]], *, transposed: bool = False) -> Table:
     return Table(
         name,
@@ -157,6 +184,9 @@ def _physical_table(name: str, columns: list[dict[str, Any]], *, transposed: boo
     )
 
 
+#
+# Devuelve una clave estable de la región de origen de un dataset.
+#
 def _region_key(locator: dict) -> str:
     stable = (
         {key: locator.get(key) for key in ("file_type", "sheet", "range")}
@@ -166,6 +196,9 @@ def _region_key(locator: dict) -> str:
     return json.dumps(stable, sort_keys=True)
 
 
+#
+# Indica si el reprocesamiento reduciría las filas de un dataset existente.
+#
 def _reduces_rows(prior: Dataset | None, prepared: PreparedTable) -> bool:
     if prior is None or len(prepared.rows) >= prior.row_count:
         return False
@@ -173,6 +206,9 @@ def _reduces_rows(prior: Dataset | None, prepared: PreparedTable) -> bool:
     return prior_orientation == prepared.source_locator.get("orientation", "rows")
 
 
+#
+# Construye el informe final de procesamiento con advertencias y cantidades.
+#
 def _final_report(
     report: dict[str, Any], tables: list[PreparedTable], replace_existing: bool
 ) -> dict[str, Any]:
@@ -188,6 +224,9 @@ def _final_report(
     return final_report
 
 
+#
+# Devuelve el estado de procesamiento que corresponde a las tablas preparadas.
+#
 def _prepared_status(tables: list[PreparedTable], warnings: list[str]) -> ProcessingStatus:
     if not tables:
         return ProcessingStatus.FAILED
@@ -196,6 +235,9 @@ def _prepared_status(tables: list[PreparedTable], warnings: list[str]) -> Proces
     return ProcessingStatus.READY
 
 
+#
+# Devuelve el estado de procesamiento que corresponde tras un fallo.
+#
 def _failure_status(has_datasets: bool, code: str) -> ProcessingStatus:
     if has_datasets:
         return ProcessingStatus.READY_WITH_WARNINGS
@@ -204,6 +246,9 @@ def _failure_status(has_datasets: bool, code: str) -> ProcessingStatus:
     return ProcessingStatus.FAILED
 
 
+#
+# Indica si la fuente tiene algún dataset consultable.
+#
 def _has_queryable_dataset(session: Session, source_id: UUID) -> bool:
     dataset_id = session.scalar(
         select(Dataset.id)
@@ -213,6 +258,9 @@ def _has_queryable_dataset(session: Session, source_id: UUID) -> bool:
     return dataset_id is not None
 
 
+#
+# Inserta las filas por lotes y verifica la cantidad total.
+#
 def _insert_rows(session: Session, table: Table, rows: list[dict[str, Any]]) -> int:
     for offset in range(0, len(rows), _INSERT_BATCH_SIZE):
         session.execute(table.insert(), rows[offset : offset + _INSERT_BATCH_SIZE])
@@ -222,6 +270,9 @@ def _insert_rows(session: Session, table: Table, rows: list[dict[str, Any]]) -> 
     return count
 
 
+#
+# Elimina la tabla física anterior de un dataset administrado.
+#
 def _drop_previous_table(session: Session, dataset: Dataset) -> None:
     if not re.fullmatch(r"dataset_[0-9a-f]{32}", dataset.physical_table_name):
         raise ValueError("La tabla anterior no corresponde a un dataset administrado.")
@@ -233,6 +284,9 @@ def _drop_previous_table(session: Session, dataset: Dataset) -> None:
     old_table.drop(session.connection())
 
 
+#
+# Actualiza un dataset con los datos de la tabla preparada.
+#
 def _apply_prepared(
     dataset: Dataset, prepared: PreparedTable, physical_name: str, row_count: int
 ) -> None:
@@ -247,6 +301,9 @@ def _apply_prepared(
     dataset.semantic_description = None
 
 
+#
+# Aplica los significados de columna validando que no se alteren los metadatos verificados.
+#
 def _apply_column_meanings(metadata: list[dict[str, Any]], columns: list[dict[str, Any]]) -> None:
     existing = {column["sql_name"]: column for column in metadata}
     if columns and [column.get("sql_name") for column in columns] != list(existing):
@@ -265,6 +322,9 @@ def _apply_column_meanings(metadata: list[dict[str, Any]], columns: list[dict[st
         stored["meaning"] = meaning
 
 
+#
+# Obtiene el lock de worker de SQLite sin bloquear e indica si lo consiguió.
+#
 @contextmanager
 def _sqlite_worker_lock(engine: Engine) -> Iterator[bool]:
     lock = _sqlite_locks(engine)[0]
@@ -276,6 +336,9 @@ def _sqlite_worker_lock(engine: Engine) -> Iterator[bool]:
             lock.release()
 
 
+#
+# Obtiene el lock consultivo de worker en PostgreSQL e indica si lo consiguió.
+#
 @contextmanager
 def _advisory_worker_lock(engine: Engine) -> Iterator[bool]:
     with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as connection:
@@ -290,9 +353,15 @@ def _advisory_worker_lock(engine: Engine) -> Iterator[bool]:
 
 
 class SqlAlchemySourceCommands:
+    #
+    # Guarda el contexto de base de datos que usa el repositorio.
+    #
     def __init__(self, context: DbContext) -> None:
         self._context = context
 
+    #
+    # Abre una sesión de escritura con commit, serializada en SQLite.
+    #
     @contextmanager
     def _write_session(self) -> Iterator[Session]:
         engine = self._context.engine
@@ -307,9 +376,11 @@ class SqlAlchemySourceCommands:
             if lock is not None:
                 lock.release()
 
+    #
+    # Obtiene un lock global de worker para evitar procesamientos simultáneos.
+    #
     @contextmanager
     def worker_lock(self) -> Iterator[bool]:
-        """Un lock global evita inferencias simultáneas y habilita recuperar interrupciones."""
         engine = self._context.engine
         if engine.dialect.name == "sqlite":
             with _sqlite_worker_lock(engine) as acquired:
@@ -321,6 +392,9 @@ class SqlAlchemySourceCommands:
         with _advisory_worker_lock(engine) as acquired:
             yield acquired
 
+    #
+    # Devuelve la fuente bloqueada para escritura o falla si no existe.
+    #
     @staticmethod
     def _source(session: Session, source_id: UUID) -> Source:
         source = session.scalar(select(Source).where(Source.id == source_id).with_for_update())
@@ -328,6 +402,9 @@ class SqlAlchemySourceCommands:
             raise SourceNotFoundError("La fuente no existe.")
         return source
 
+    #
+    # Registra una fuente cargada y devuelve su id, detectando duplicados por huella.
+    #
     def create_upload(self, source: Source) -> tuple[UUID, bool]:
         digest = sha256(source.file_content).hexdigest()
         if source.content_hash and source.content_hash != digest:
@@ -347,13 +424,15 @@ class SqlAlchemySourceCommands:
                 session.flush()
                 return source.id, True
         except IntegrityError:
-            # La constraint SHA también coordina cargas simultáneas entre procesos.
             with self._context.session() as session:
                 existing = session.scalar(select(Source.id).where(Source.content_hash == digest))
                 if existing is None:
                     raise
                 return existing, False
 
+    #
+    # Toma la siguiente fuente cargada pendiente y la marca como en procesamiento.
+    #
     def claim_next(self) -> UUID | None:
         with self._write_session() as session:
             source = session.scalar(
@@ -370,8 +449,10 @@ class SqlAlchemySourceCommands:
             source.updated_at = _now()
             return source.id
 
+    #
+    # Recupera las fuentes cuyo procesamiento o indexado quedó interrumpido.
+    #
     def recover_interrupted(self) -> int:
-        """Sólo se llama tras obtener worker_lock, cuando ningún otro worker trabaja."""
         with self._write_session() as session:
             sources = session.scalars(
                 select(Source)
@@ -389,6 +470,9 @@ class SqlAlchemySourceCommands:
                 source.updated_at = _now()
             return len(sources)
 
+    #
+    # Restablece el estado de una fuente cuyo procesamiento fue interrumpido.
+    #
     @staticmethod
     def _recover_processing(session: Session, source: Source) -> None:
         has_datasets = _has_queryable_dataset(session, source.id)
@@ -399,6 +483,9 @@ class SqlAlchemySourceCommands:
             source.processing_report, ["Se recuperó un procesamiento interrumpido."]
         )
 
+    #
+    # Guarda los datasets preparados de una fuente y actualiza su estado e informe.
+    #
     def save_prepared(
         self,
         source_id: UUID,
@@ -412,7 +499,6 @@ class SqlAlchemySourceCommands:
         try:
             with self._write_session() as session:
                 if replace_existing and self._context.engine.dialect.name == "sqlite":
-                    # SQLite difiere BEGIN: iniciarlo explícitamente incluye también el DDL.
                     session.connection().exec_driver_sql("BEGIN IMMEDIATE")
                 source = self._source(session, source_id)
                 existing = session.scalars(
@@ -447,13 +533,15 @@ class SqlAlchemySourceCommands:
                 source.semantic_index_status = SemanticIndexStatus.PENDING
                 source.updated_at = _now()
         except BaseException:
-            # PostgreSQL revierte DDL e INSERT juntos. SQLite necesita limpiar DDL explícitamente.
             if self._context.engine.dialect.name == "sqlite" and created_tables:
                 with self._context.engine.begin() as connection:
                     for table in reversed(created_tables):
                         table.drop(connection, checkfirst=True)
             raise
 
+    #
+    # Verifica que la fuente pueda reprocesarse sin perder ni reducir datasets existentes.
+    #
     @staticmethod
     def _ensure_replaceable(
         session: Session,
@@ -482,6 +570,9 @@ class SqlAlchemySourceCommands:
                     "El reprocesamiento reduciría registros existentes; se conserva la versión actual."
                 )
 
+    #
+    # Crea la tabla física de un dataset, inserta sus filas y actualiza su metadato.
+    #
     @staticmethod
     def _store_prepared(
         session: Session,
@@ -522,6 +613,9 @@ class SqlAlchemySourceCommands:
             dataset.updated_at = _now()
         _apply_prepared(dataset, prepared, physical_name, count)
 
+    #
+    # Guarda la descripción y los significados de columnas de un dataset.
+    #
     def save_dataset_semantics(
         self,
         dataset_id: UUID,
@@ -550,6 +644,9 @@ class SqlAlchemySourceCommands:
                     source.processing_status = ProcessingStatus.READY_WITH_WARNINGS
                 source.updated_at = _now()
 
+    #
+    # Actualiza el estado del índice semántico de una fuente y su error.
+    #
     def set_index_status(
         self,
         source_id: UUID,
@@ -577,6 +674,9 @@ class SqlAlchemySourceCommands:
             source.processing_report = report
             source.updated_at = _now()
 
+    #
+    # Toma la siguiente fuente pendiente de indexar y la marca en procesamiento.
+    #
     def claim_index_next(self) -> UUID | None:
         with self._write_session() as session:
             source = session.scalar(
@@ -598,6 +698,9 @@ class SqlAlchemySourceCommands:
             source.updated_at = _now()
             return source.id
 
+    #
+    # Activa o desactiva una fuente y pide reindexarla si está lista.
+    #
     def set_active(self, source_id: UUID, is_active: bool) -> None:
         if type(is_active) is not bool:
             raise ValueError("is_active debe ser booleano.")
@@ -612,6 +715,9 @@ class SqlAlchemySourceCommands:
                 source.semantic_index_status = SemanticIndexStatus.PENDING
             source.updated_at = _now()
 
+    #
+    # Registra un fallo en el informe de la fuente y actualiza su estado.
+    #
     def record_failure(self, source_id: UUID, code: str, message: str) -> None:
         with self._write_session() as session:
             source = self._source(session, source_id)
@@ -629,5 +735,8 @@ class SqlAlchemySourceCommands:
                 source.semantic_index_status = SemanticIndexStatus.PENDING
             source.updated_at = _now()
 
+    #
+    # Marca una fuente para que se reindexe.
+    #
     def request_reindex(self, source_id: UUID) -> None:
         self.set_index_status(source_id, SemanticIndexStatus.PENDING)

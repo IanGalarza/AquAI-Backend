@@ -2,22 +2,30 @@ import re
 
 from aquai.application.contracts.answering import AnswerSegment
 
-# Respuestas anteriores al formato estructurado citaban su evidencia con marcadores [eN].
 _LEGACY_REFERENCE = re.compile(r"\s*\[(e\d+)\]")
 
 
+#
+# Devuelve el texto completo de la respuesta a partir de sus segmentos.
+#
 def answer_text(segments: list[AnswerSegment]) -> str:
     paragraphs = [_paragraph(segment) for segment in segments]
 
     return "\n\n".join(paragraphs)
 
 
+#
+# Devuelve un segmento como un párrafo con sus elementos como viñetas.
+#
 def _paragraph(segment):
     bullets = [f"• {item}" for item in segment.items]
 
     return "\n".join([segment.text, *bullets])
 
 
+#
+# Convierte un texto con marcadores heredados de evidencia en segmentos de respuesta.
+#
 def segments_from_text(text: str, evidence_ids=(), hidden=()) -> list[AnswerSegment]:
     known = set(evidence_ids)
     omitted = set(hidden)
@@ -31,6 +39,9 @@ def segments_from_text(text: str, evidence_ids=(), hidden=()) -> list[AnswerSegm
     return segments
 
 
+#
+# Quita de un párrafo los marcadores de evidencia conocidos.
+#
 def _without_known_references(paragraph, known):
     def removed_if_known(match):
         return "" if match.group(1) in known else match.group(0)

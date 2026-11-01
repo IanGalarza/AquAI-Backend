@@ -23,17 +23,25 @@ from aquai.application.Services.validateEvidenceService import ValidateEvidenceS
 _logger = logging.getLogger(__name__)
 
 
+#
+# Devuelve el estado con la pregunta contextualizada para el análisis.
+#
 def analytical_state(state: QueryResponseState) -> QueryResponseState:
-    """La pregunta original permanece intacta en el estado y en Message.content."""
     question = state.routing.contextualized_question if state.routing else state.question
 
     return state.model_copy(update={"question": question})
 
 
+#
+# Elige el siguiente nodo tras el enrutado: recuperación de datos o respuesta directa.
+#
 def next_after_routing(state: QueryResponseState):
     return "retriever" if state.routing.route == "data" else "direct_response"
 
 
+#
+# Elige el siguiente nodo tras planificar: SQL, Python o validación.
+#
 def next_after_planning(state: QueryResponseState):
     plan = state.planning
     if plan is None or plan.status != "plannable":
@@ -48,6 +56,9 @@ def next_after_planning(state: QueryResponseState):
     return "validator"
 
 
+#
+# Elige el siguiente nodo tras SQL: Python si hay pasos pendientes, si no la validación.
+#
 def next_after_sql(state: QueryResponseState):
     plan = state.planning
     python_pending = (
@@ -62,6 +73,9 @@ def next_after_sql(state: QueryResponseState):
     return "validator"
 
 
+#
+# Construye el grafo de consulta con enrutado, recuperación, planificación, ejecución y respuesta.
+#
 def build_query_planning_graph(
     retriever_factory: Callable[[], RetrieveDatasetsService],
     planner: PlanQueryService,
@@ -202,6 +216,9 @@ def build_query_planning_graph(
     return builder.compile()
 
 
+#
+# Agrega al grafo las conexiones entre nodos.
+#
 def _add_edges(builder: StateGraph) -> None:
     builder.add_edge(START, "router")
     builder.add_conditional_edges(
@@ -226,14 +243,23 @@ def _add_edges(builder: StateGraph) -> None:
     builder.add_edge("response_generator", END)
 
 
+#
+# Indica si el SQL Agent rechazó el plan por inválido.
+#
 def _sql_rejected_plan(execution) -> bool:
     return execution and execution.error and execution.error.code == "invalid_plan"
 
 
+#
+# Devuelve las menciones de datos estructuradas, sin las de texto simple.
+#
 def _structured_mentions(routing):
     return [item for item in routing.data_mentions if not isinstance(item, str)]
 
 
+#
+# Devuelve el estado de análisis vacío para reiniciar planificación, ejecución y respuesta.
+#
 def _cleared_analysis() -> dict:
     return {
         "planning": None,
@@ -249,6 +275,9 @@ def _cleared_analysis() -> dict:
     }
 
 
+#
+# Devuelve las duraciones por etapa añadiendo la de la etapa indicada.
+#
 def _stage_durations(state: QueryResponseState, stage: str, started: float) -> dict:
     return {
         **state.stage_durations_ms,

@@ -16,7 +16,6 @@ class TabularSettings(BaseSettings):
     llm_timeout_seconds: float = Field(default=600, gt=0, allow_inf_nan=False)
     llm_num_ctx: int = Field(default=32768, ge=1024)
     llm_think: bool = False
-    # Tiempo que Ollama conserva los modelos cargados; sin valor rige su predeterminado (5m).
     llm_keep_alive: str | None = Field(default=None, pattern=r"^-?\d+(?:\.\d+)?(?:ms|s|m|h)?$")
     max_upload_bytes: int = Field(default=10 * 1024 * 1024, gt=0)
     max_cells: int = Field(default=2_000_000, gt=0)
@@ -32,6 +31,9 @@ class TabularSettings(BaseSettings):
     qdrant_collection: str = Field(default="aquai_datasets", min_length=1, max_length=200)
     index_timeout_seconds: float = Field(default=60, gt=0, allow_inf_nan=False)
 
+    #
+    # Valida que la URL sea HTTP sin parámetros ni fragmentos y quita la barra final.
+    #
     @field_validator("ollama_base_url", "qdrant_url")
     @classmethod
     def validate_ollama_base_url(cls, value: str) -> str:
@@ -40,6 +42,9 @@ class TabularSettings(BaseSettings):
             raise ValueError("La URL no debe incluir parámetros ni fragmentos.")
         return str(url).rstrip("/")
 
+    #
+    # Valida que el nombre de modelo o colección no esté vacío.
+    #
     @field_validator("default_model", "embedding_model", "qdrant_collection")
     @classmethod
     def validate_default_model(cls, value: str) -> str:
@@ -48,6 +53,9 @@ class TabularSettings(BaseSettings):
             raise ValueError("El modelo o colección no puede estar vacío.")
         return model
 
+    #
+    # Valida que los modelos de descripción y de embeddings sean distintos.
+    #
     @model_validator(mode="after")
     def validate_separate_embedding_model(self) -> "TabularSettings":
         if self.default_model.removesuffix(":latest") == self.embedding_model.removesuffix(

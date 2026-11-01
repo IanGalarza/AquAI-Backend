@@ -16,10 +16,16 @@ from aquai.application.planning.validation import validate_execution_plan
 
 
 class ExecutePythonPlanService:
+    #
+    # Guarda el ejecutor de Python y las consultas de fuentes que usa el servicio.
+    #
     def __init__(self, executor: PythonPlanExecutor, queries: SourceQueries) -> None:
         self._executor = executor
         self._queries = queries
 
+    #
+    # Ejecuta las operaciones Python autorizadas del plan, o informa que no son ejecutables.
+    #
     async def execute(
         self,
         plan: PlanningResult,
@@ -40,6 +46,9 @@ class ExecutePythonPlanService:
 
         return await asyncio.to_thread(self._execute, plan, sql_result, previous)
 
+    #
+    # Revalida el plan y ejecuta el análisis Python registrando su inicio y su duración.
+    #
     def _execute(self, plan, sql_result, previous):
         now = datetime.now(timezone.utc)
         started = perf_counter()
@@ -69,6 +78,9 @@ class ExecutePythonPlanService:
 
         return result
 
+    #
+    # Revalida el plan, la transferencia SQL y las versiones de los datasets contra el catálogo vigente.
+    #
     def _revalidate(self, plan, sql_result) -> None:
         validate_execution_plan(plan, plan.selected_datasets)
         validate_sql_transfer(plan, sql_result)
@@ -78,6 +90,9 @@ class ExecutePythonPlanService:
         validate_execution_plan(plan, current)
 
 
+#
+# Construye el resultado Python no ejecutado con las operaciones pendientes y el error indicado.
+#
 def _not_executed(plan, now, started, *, code, message) -> PythonExecutionResult:
     return PythonExecutionResult(
         status="not_executed",

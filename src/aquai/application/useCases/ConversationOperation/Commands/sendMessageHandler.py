@@ -28,6 +28,9 @@ _logger = logging.getLogger(__name__)
 
 
 class SendMessageHandler:
+    #
+    # Guarda los comandos, consultas, ejecutor y plazo que usa el manejador.
+    #
     def __init__(
         self,
         commands: ConversationCommands,
@@ -43,6 +46,9 @@ class SendMessageHandler:
         self._snapshots = snapshots
         self._timeout_seconds = timeout_seconds
 
+    #
+    # Procesa un mensaje del usuario y devuelve la respuesta, o un fallo registrado.
+    #
     async def handle(self, conversation_id, request):
         turn = await self._reserve_turn(conversation_id, request)
 
@@ -96,9 +102,10 @@ class SendMessageHandler:
 
         return SendMessageOutcome(message, outcome)
 
+    #
+    # Reserva el turno del mensaje y lo cierra como cancelado si la petición se cancela.
+    #
     async def _reserve_turn(self, conversation_id, request):
-        # La reserva se protege con shield: si la petición se cancela, el turno ya reservado
-        # se cierra como cancelado en lugar de quedar abierto.
         reservation = asyncio.create_task(
             asyncio.to_thread(
                 self._commands.begin_turn,
@@ -115,6 +122,9 @@ class SendMessageHandler:
             await self._cancel(turn)
             raise
 
+    #
+    # Carga el historial previo de la conversación para contextualizar la pregunta.
+    #
     async def _load_history(self, turn):
         rows = await asyncio.to_thread(
             self._queries.context,
@@ -124,6 +134,9 @@ class SendMessageHandler:
 
         return build_history(rows, turn.question)
 
+    #
+    # Cierra el turno como cancelado ignorando conflictos si ya se había cerrado.
+    #
     async def _cancel(self, turn):
         try:
             record = failure_record(
@@ -131,11 +144,13 @@ class SendMessageHandler:
             )
             await asyncio.shield(asyncio.to_thread(self._commands.finish_turn, turn, record))
         except (ConversationConflictError, ConversationNotFoundError):
-            pass  # Una recuperación de la reserva ya cerró el turno, o la conversación se eliminó.
+            pass
 
 
+#
+# Agrega al turno el historial estructurado y la ventana visible para el redactor.
+#
 def _with_history(turn, history):
-    # El redactor recibe sólo la ventana reciente; un análisis recuperado llega por su referencia estructurada.
     visible_history = [item for item in history if item.text.strip() and not item.recalled]
 
     return replace(
@@ -146,6 +161,9 @@ def _with_history(turn, history):
     )
 
 
+#
+# Registra en el log un fallo inesperado de la consulta sin exponer su detalle.
+#
 def _log_unexpected_failure(turn, error):
     frames = traceback.extract_tb(error.__traceback__)
     frame = frames[-1] if frames else None

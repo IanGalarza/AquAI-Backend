@@ -8,6 +8,9 @@ from aquai.application.Services.sourceDetailService import SourceDetailService
 
 
 class ActivateSourceHandler:
+    #
+    # Guarda los comandos, el servicio de detalle y la notificación que usa el manejador.
+    #
     def __init__(
         self,
         commands: SourceCommands,
@@ -19,6 +22,9 @@ class ActivateSourceHandler:
         self._details = details
         self._notify = notify
 
+    #
+    # Activa o desactiva una fuente y devuelve su detalle actualizado.
+    #
     async def handle(self, source_id: UUID, active: bool) -> SourceActivationResponse:
         await asyncio.to_thread(self._commands.set_active, source_id, active)
 

@@ -24,11 +24,17 @@ from aquai.infrastructure.providers.semanticIndex import (
 
 
 class _Queries:
+    #
+    # Guarda los datasets utilizables y las versiones que simula el doble de consultas.
+    #
     def __init__(self, usable, versions=None):
         self.usable = set(usable)
         self.versions = versions or {}
         self.requested = []
 
+    #
+    # Devuelve los datasets utilizables solicitados cuya versión coincide con la esperada.
+    #
     def usable_dataset_ids(self, dataset_ids, *, versions=None):
         self.requested = dataset_ids
         return {
@@ -39,6 +45,9 @@ class _Queries:
 
 
 class SemanticProviderTests(unittest.IsolatedAsyncioTestCase):
+    #
+    # Verifica que el contrato semántico conserva tipos, unidades y nombres y acota la muestra enviada.
+    #
     async def test_semantic_contract_preserves_types_units_names_and_bounded_sample(self):
         settings = TabularSettings(_env_file=None, sample_rows=2)
         table = PreparedTable(
@@ -149,6 +158,9 @@ class SemanticProviderTests(unittest.IsolatedAsyncioTestCase):
                 await provider.describe(table)
         self.assertEqual(table, before)
 
+    #
+    # Verifica que el endpoint de embeddings devuelve vectores reales y rechaza respuestas inválidas.
+    #
     async def test_embedding_endpoint_returns_actual_vectors_and_rejects_bad_protocol(self):
         settings = TabularSettings(_env_file=None)
         requests = []
@@ -186,6 +198,9 @@ class SemanticProviderTests(unittest.IsolatedAsyncioTestCase):
 
 
 class SemanticIndexTests(unittest.IsolatedAsyncioTestCase):
+    #
+    # Prepara la configuración, un Qdrant en memoria y un proveedor de embeddings simulado.
+    #
     def setUp(self):
         self.settings = TabularSettings(_env_file=None)
         self.client = QdrantClient(":memory:")
@@ -206,9 +221,15 @@ class SemanticIndexTests(unittest.IsolatedAsyncioTestCase):
             self.settings, transport=httpx.MockTransport(handle)
         )
 
+    #
+    # Cierra el cliente de Qdrant en memoria.
+    #
     def tearDown(self):
         self.client.close()
 
+    #
+    # Verifica el ciclo de vida idempotente de los puntos de dataset y su validación contra PostgreSQL.
+    #
     async def test_idempotent_dataset_points_lifecycle_and_postgres_validation(self):
         first, second, source_id = uuid4(), uuid4(), uuid4()
         source = {
@@ -261,7 +282,6 @@ class SemanticIndexTests(unittest.IsolatedAsyncioTestCase):
             self.settings.qdrant_collection, payload={"version": 2}, points=[str(first)]
         )
         await index.set_source_active(source_id, False)
-        # La actividad real proviene de SQL, incluso con payload obsoleto.
         queries.usable.clear()
         self.assertEqual(await index.search("muestras"), [])
         await index.set_source_active(source_id, True)
@@ -270,6 +290,9 @@ class SemanticIndexTests(unittest.IsolatedAsyncioTestCase):
         queries.usable.clear()
         self.assertEqual(await index.search("muestras"), [])
 
+    #
+    # Verifica que la colección rechaza una dimensión o un modelo distinto sin insertar puntos.
+    #
     async def test_collection_rejects_dimension_or_model_mismatch_without_upsert(self):
         source = {
             "id": uuid4(),

@@ -5,20 +5,27 @@ from html import escape
 from aquai.application.units import repaired_symbols
 
 _SUPERSCRIPTS = str.maketrans("0123456789", "⁰¹²³⁴⁵⁶⁷⁸⁹")
-# Sólo exponentes negativos tras un símbolo (mL-1): PO4 o N-NO3 son fórmulas, no potencias.
 _NEGATIVE_EXPONENT = re.compile(r"(?<=[A-Za-zµμ])-(\d{1,2})(?![\d.,])")
 
 
+#
+# Devuelve una unidad con sus exponentes negativos en superíndice.
+#
 def format_unit(unit: str) -> str:
     return _NEGATIVE_EXPONENT.sub(_superscript_exponent, repaired_symbols(unit))
 
 
+#
+# Convierte un exponente negativo encontrado en su forma de superíndice.
+#
 def _superscript_exponent(match):
     return "⁻" + match.group(1).translate(_SUPERSCRIPTS)
 
 
+#
+# Formatea un número para mostrarlo con las convenciones del idioma.
+#
 def format_number(value: Decimal | int | float, language="es") -> str:
-    # No interpreta separadores regionales ni elimina puntos como si fueran miles.
     number = value if isinstance(value, Decimal) else Decimal(str(value))
     if not number.is_finite():
         raise ValueError("La presentación requiere un número finito.")
@@ -28,7 +35,6 @@ def format_number(value: Decimal | int | float, language="es") -> str:
     mantissa, exponent = _rounded(number)
     integer, _, fraction = mantissa.partition(".")
     decimal, thousands = (",", ".") if language == "es" else (".", ",")
-    # Como en la norma tipográfica, los enteros de cuatro cifras (p. ej., años) no se agrupan.
     if not exponent and len(integer.lstrip("-")) >= 5:
         integer = f"{int(integer):,}".replace(",", thousands)
 
@@ -37,10 +43,11 @@ def format_number(value: Decimal | int | float, language="es") -> str:
     return mantissa + (f"e{int(exponent[0])}" if exponent else "")
 
 
+#
+# Redondea un número a la precisión de presentación y separa su exponente.
+#
 def _rounded(number):
     magnitude = number.adjusted()
-    # Por debajo de 0,01 se conservan dos cifras significativas; nunca se
-    # transforma un valor pequeño distinto de cero en un cero de presentación.
     places = max(2, 1 - magnitude) if magnitude < -2 else 2
     with localcontext() as context:
         context.prec = max(28, len(number.as_tuple().digits), magnitude + places + 2)
@@ -54,6 +61,9 @@ def _rounded(number):
     return mantissa, exponent
 
 
+#
+# Devuelve las plantillas de texto emergente de los puntos o intervalos de una serie.
+#
 def chart_hover_templates(series, *, histogram=False):
     if histogram:
         return [_bin_template(item) for item in series.bins]
@@ -64,17 +74,22 @@ def chart_hover_templates(series, *, histogram=False):
     ]
 
 
+#
+# Devuelve el texto emergente de un intervalo del histograma.
+#
 def _bin_template(item):
     lower = format_number(item.lower)
     upper = format_number(item.upper)
     if lower == upper and item.lower != item.upper:
-        # No colapsar dos límites diferentes al abreviar un intervalo.
         lower, upper = (str(value).replace(".", ",") for value in (item.lower, item.upper))
     closing = "]" if item.upper_inclusive else ")"
 
     return f"[{lower}; {upper}{closing}<br>Frecuencia: {item.count}<extra></extra>"
 
 
+#
+# Devuelve un valor formateado y escapado para el texto emergente.
+#
 def _hover_value(value):
     if value is None:
         return "Sin dato"
@@ -86,6 +101,9 @@ def _hover_value(value):
     return escape(text).replace("%", "&#37;")
 
 
+#
+# Devuelve el formato de los ejes numéricos de un gráfico.
+#
 def chart_axis_formats(chart):
     x_values, y_values = _axis_values(chart)
     axes = (("xaxis", chart.x_axis.field, x_values), ("yaxis", chart.y_axis.field, y_values))
@@ -98,6 +116,9 @@ def chart_axis_formats(chart):
     return result
 
 
+#
+# Devuelve los valores de los ejes X e Y de un gráfico.
+#
 def _axis_values(chart):
     x_values = []
     y_values = []
@@ -114,6 +135,9 @@ def _axis_values(chart):
     return x_values, y_values
 
 
+#
+# Devuelve el formato de las marcas de un eje según su tipo y magnitud.
+#
 def _tick_format(sql_type, values):
     if sql_type == "BIGINT":
         return "d"

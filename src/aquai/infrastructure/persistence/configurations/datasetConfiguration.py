@@ -21,6 +21,9 @@ from aquai.infrastructure.persistence.configurations.common import (
 )
 
 
+#
+# Define la tabla Dataset con sus restricciones y la mapea al modelo de dominio.
+#
 def configure(mapper_registry: registry) -> None:
     table = Table(
         "Dataset",
@@ -70,7 +73,6 @@ def configure(mapper_registry: registry) -> None:
             unique=True,
         ),
         *timestamp_columns(),
-        # Clave candidata: permite que MessageSource exija un dataset de su misma fuente.
         UniqueConstraint("id", "source_id", name="uq_Dataset_id_sourceId"),
         CheckConstraint('"rowCount" >= 0', name="row_count_nonnegative"),
         CheckConstraint("version >= 1", name="version_positive"),

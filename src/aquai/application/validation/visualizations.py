@@ -33,11 +33,17 @@ _X_AXIS_TYPES = {
 }
 
 
+#
+# Lanza un error de validación con el mensaje si la condición no se cumple.
+#
 def _check(condition, message):
     if not condition:
         raise PlannerValidationError(message)
 
 
+#
+# Convierte un valor de coordenada a su forma de presentación, rechazando rangos inválidos.
+#
 def _display(value):
     if isinstance(value, (int, Decimal)) and type(value) is not bool:
         number = float(value)
@@ -50,6 +56,9 @@ def _display(value):
     return value.isoformat() if isinstance(value, (date, datetime)) else value
 
 
+#
+# Valida que un gráfico conserve el plan, la procedencia, los datos y la figura.
+#
 def validate_visualization(chart, step, parent, rows, sources):
     request = step.visualization
     x, y, series_field = _chart_fields(request, parent)
@@ -69,6 +78,9 @@ def validate_visualization(chart, step, parent, rows, sources):
     _check_figure(chart, request, x)
 
 
+#
+# Obtiene los campos X, Y y de serie del gráfico a partir del resultado padre.
+#
 def _chart_fields(request, parent):
     fields = {field.name: field for field in parent.columns}
     x = fields[request.x.field]
@@ -78,6 +90,9 @@ def _chart_fields(request, parent):
     return x, y, series_field
 
 
+#
+# Construye el campo de conteo que se usa cuando el gráfico no tiene eje Y.
+#
 def _count_field(x) -> OutputField:
     return OutputField(
         name="count",
@@ -89,6 +104,9 @@ def _count_field(x) -> OutputField:
     )
 
 
+#
+# Comprueba que el gráfico corresponda a la operación, los campos y las etiquetas del plan.
+#
 def _check_plan_correspondence(chart, step, request, x, y, series_field):
     _check(
         chart.operation_id == step.id
@@ -107,6 +125,9 @@ def _check_plan_correspondence(chart, step, request, x, y, series_field):
     )
 
 
+#
+# Comprueba que los datasets del gráfico coincidan con sus fuentes de entrada.
+#
 def _check_provenance(chart, sources):
     expected_sources = {(item.dataset_id, item.source_id, item.version) for item in sources}
     actual_sources = {(item.dataset_id, item.source_id, item.version) for item in chart.datasets}
@@ -117,6 +138,9 @@ def _check_provenance(chart, sources):
     )
 
 
+#
+# Valida que el histograma conserve intervalos, frecuencias y observaciones de entrada.
+#
 def _check_histogram(chart, request, x, rows):
     _check(
         len(chart.series) == 1 and bool(chart.series[0].bins) and not chart.series[0].points,
@@ -142,6 +166,9 @@ def _check_histogram(chart, request, x, rows):
     )
 
 
+#
+# Valida que los intervalos del histograma sean ordenados y contiguos.
+#
 def _check_bin_edges(bins):
     for index, item in enumerate(bins):
         is_last = index == len(bins) - 1
@@ -156,6 +183,9 @@ def _check_bin_edges(bins):
             )
 
 
+#
+# Valida que los puntos del gráfico coincidan con las filas de entrada.
+#
 def _check_points(chart, request, x, y, series_field, rows):
     expected = _expected_points(request, x, y, series_field, rows)
     actual = Counter(
@@ -185,6 +215,9 @@ def _check_points(chart, request, x, y, series_field, rows):
         )
 
 
+#
+# Calcula los puntos esperados del gráfico a partir de las filas de entrada.
+#
 def _expected_points(request, x, y, series_field, rows) -> Counter:
     expected = Counter()
 
@@ -200,6 +233,9 @@ def _expected_points(request, x, y, series_field, rows) -> Counter:
     return expected
 
 
+#
+# Devuelve el nombre de serie como texto, o None si no hay clave.
+#
 def _series_name(key):
     if isinstance(key, (date, datetime)):
         return key.isoformat()
@@ -207,14 +243,23 @@ def _series_name(key):
     return str(key) if key is not None else None
 
 
+#
+# Indica si cada valor de X aparece una sola vez en la serie.
+#
 def _has_unique_x(series) -> bool:
     return len({point.x for point in series.points}) == len(series.points)
 
 
+#
+# Indica si los puntos de la serie están ordenados por X.
+#
 def _is_sorted_by_x(series) -> bool:
     return [point.x for point in series.points] == sorted(point.x for point in series.points)
 
 
+#
+# Valida la figura Plotly: sus trazas coinciden con las series y su diseño con el gráfico.
+#
 def _check_figure(chart, request, x):
     figure = chart.figure
     _check(
@@ -228,6 +273,9 @@ def _check_figure(chart, request, x):
     _check_layout(chart, request, x, figure.layout)
 
 
+#
+# Valida que una traza Plotly sea del tipo autorizado y conserve las etiquetas.
+#
 def _check_trace(trace, series, request):
     histogram = request.chart_type == "histogram"
     expected_type = "bar" if request.chart_type in {"bar", "histogram"} else "scatter"
@@ -252,6 +300,9 @@ def _check_trace(trace, series, request):
         _check_point_trace(trace, series, request.chart_type)
 
 
+#
+# Valida que las barras Plotly correspondan a los intervalos del histograma.
+#
 def _check_histogram_trace(trace, series):
     nonconstant = any(item.lower != item.upper for item in series.bins)
     if nonconstant:
@@ -274,10 +325,16 @@ def _check_histogram_trace(trace, series):
     )
 
 
+#
+# Devuelve los extremos de un intervalo y el tipo de cierre superior.
+#
 def _interval_edges(item) -> list:
     return [item.lower, item.upper, "]" if item.upper_inclusive else ")"]
 
 
+#
+# Valida que una traza de puntos conserve valores, modo y forma de línea.
+#
 def _check_point_trace(trace, series, chart_type):
     x_values = [_plotly_x(point.x) for point in series.points]
     _check(
@@ -303,10 +360,16 @@ def _check_point_trace(trace, series, chart_type):
         )
 
 
+#
+# Devuelve el valor de X listo para Plotly, con los booleanos como texto.
+#
 def _plotly_x(value):
     return str(value).lower() if type(value) is bool else value
 
 
+#
+# Valida el diseño de la figura: título, ejes, formatos, procedencia y advertencias.
+#
 def _check_layout(chart, request, x, layout):
     meta = layout.get("meta", {})
     _check(
@@ -345,6 +408,9 @@ def _check_layout(chart, request, x, layout):
     )
 
 
+#
+# Devuelve el tipo de eje X esperado según el gráfico y el tipo SQL del campo.
+#
 def _x_axis_type(chart, request, x) -> str:
     if request.chart_type == "histogram" and _has_only_point_bins(chart):
         return "category"
@@ -352,6 +418,9 @@ def _x_axis_type(chart, request, x) -> str:
     return _X_AXIS_TYPES.get(x.sql_type, "linear")
 
 
+#
+# Indica si todos los intervalos del histograma son puntuales.
+#
 def _has_only_point_bins(chart) -> bool:
     for series in chart.series:
         for item in series.bins:
@@ -361,6 +430,9 @@ def _has_only_point_bins(chart) -> bool:
     return True
 
 
+#
+# Devuelve el título del eje con su unidad o la advertencia de unidad no documentada.
+#
 def _axis_title(axis) -> str:
     label = escape(axis.label)
     status = presentation_unit_status(axis.field)
@@ -374,6 +446,9 @@ def _axis_title(axis) -> str:
     return label
 
 
+#
+# Devuelve los metadatos de procedencia que debe conservar la figura.
+#
 def _provenance_metadata(chart) -> dict:
     return {
         "operation_id": chart.operation_id,

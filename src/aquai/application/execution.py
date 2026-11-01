@@ -17,16 +17,25 @@ _MAX_NUMERIC_DIGITS = 1000
 _MAX_NUMERIC_EXPONENT = 1000
 
 
+#
+# Calcula la huella SHA-256 de un plan.
+#
 def plan_fingerprint(plan: PlanningResult) -> str:
     return sha256(plan.model_dump_json().encode("utf-8")).hexdigest()
 
 
+#
+# Calcula la huella SHA-256 del resultado SQL, o de un valor nulo si no hay.
+#
 def sql_result_fingerprint(sql: SqlExecutionResult | None) -> str:
     return sha256(
         (sql.model_dump_json() if sql is not None else "null").encode("utf-8")
     ).hexdigest()
 
 
+#
+# Calcula la huella SHA-256 conjunta del plan y de los resultados SQL y Python.
+#
 def evidence_fingerprint(plan, sql, python) -> str:
     digest = sha256()
 
@@ -37,6 +46,9 @@ def evidence_fingerprint(plan, sql, python) -> str:
     return digest.hexdigest()
 
 
+#
+# Calcula la huella de ejecución a partir del plan, el resultado SQL y la política aplicada.
+#
 def execution_fingerprint(
     plan: PlanningResult, sql: SqlExecutionResult | None, policy: str = ""
 ) -> str:
@@ -48,6 +60,9 @@ def execution_fingerprint(
     return digest.hexdigest()
 
 
+#
+# Valida que los resultados SQL recibidos pertenezcan al plan y a los datasets autorizados.
+#
 def validate_sql_transfer(plan: PlanningResult, sql: SqlExecutionResult | None) -> None:
     if sql is None:
         return
@@ -64,6 +79,9 @@ def validate_sql_transfer(plan: PlanningResult, sql: SqlExecutionResult | None) 
         _check_transferred_datasets(plan, sql)
 
 
+#
+# Verifica que las operaciones del resultado SQL sean las del plan y sin repetidas.
+#
 def _check_transferred_operations(plan: PlanningResult, sql: SqlExecutionResult) -> None:
     expected = {step.id: step for step in plan.operations}
     seen = set()
@@ -82,6 +100,9 @@ def _check_transferred_operations(plan: PlanningResult, sql: SqlExecutionResult)
             )
 
 
+#
+# Indica si un resultado materializado no coincide con el paso SQL autorizado.
+#
 def _differs_from_sql_step(record, step, read_only: bool) -> bool:
     return (
         step.tool != "sql"
@@ -92,6 +113,9 @@ def _differs_from_sql_step(record, step, read_only: bool) -> bool:
     )
 
 
+#
+# Verifica que las versiones y procedencia de los datasets del resultado SQL sean las autorizadas.
+#
 def _check_transferred_datasets(plan: PlanningResult, sql: SqlExecutionResult) -> None:
     actual = {item.dataset_id: item for item in sql.datasets}
     expected_ids = {item.dataset_id for item in plan.selected_datasets}
@@ -105,6 +129,9 @@ def _check_transferred_datasets(plan: PlanningResult, sql: SqlExecutionResult) -
             )
 
 
+#
+# Indica si un dataset del resultado difiere de la versión o procedencia del catálogo autorizado.
+#
 def _differs_from_catalog(item, selected) -> bool:
     return (
         item.version != selected.verified_version
@@ -114,6 +141,9 @@ def _differs_from_catalog(item, selected) -> bool:
     )
 
 
+#
+# Resume el estado de ejecución del plan: estado global, operaciones pendientes y avisos.
+#
 def summarize_execution(
     plan: PlanningResult | None,
     sql: SqlExecutionResult | None,
@@ -141,6 +171,9 @@ def summarize_execution(
     return ("failed" if errors else "not_executed"), pending, warnings
 
 
+#
+# Devuelve los registros de operaciones de SQL y Python por identificador, con Python prevaleciendo.
+#
 def _operation_records(sql, python) -> dict:
     records = {item.operation_id: item for item in sql.operations} if sql else {}
     if python:
@@ -149,6 +182,9 @@ def _operation_records(sql, python) -> dict:
     return records
 
 
+#
+# Reúne sin repetir las advertencias de los lotes de ejecución.
+#
 def _batch_warnings(*batches) -> list[str]:
     warnings = []
 
@@ -159,8 +195,10 @@ def _batch_warnings(*batches) -> list[str]:
     return list(dict.fromkeys(warnings))
 
 
+#
+# Devuelve los registros de ejecución del estado por operación, con Python prevaleciendo sobre SQL.
+#
 def execution_records(state):
-    """Python prevalece si SQL y Python informan la misma operación."""
     records = {}
 
     for batch in (state.execution, state.python_execution):
@@ -170,8 +208,10 @@ def execution_records(state):
     return records
 
 
+#
+# Convierte las filas de un resultado a los tipos del esquema verificado.
+#
 def decode_rows(record, fields, budget=None):
-    """Sólo rehidrata el tipo del esquema verificado, nunca interpreta un TEXT."""
     rows = []
     names = {field.name for field in fields}
 
@@ -187,6 +227,9 @@ def decode_rows(record, fields, budget=None):
     return rows
 
 
+#
+# Convierte cada valor de una fila según el tipo SQL de su campo.
+#
 def _decode_row(row, fields) -> dict:
     decoded = {}
 
@@ -196,6 +239,9 @@ def _decode_row(row, fields) -> dict:
     return decoded
 
 
+#
+# Convierte un valor con el decodificador de su tipo SQL o bloquea los tipos no habilitados.
+#
 def _decode_value(sql_type, value):
     if value is None:
         return None
@@ -209,6 +255,9 @@ def _decode_value(sql_type, value):
     return decoder(value)
 
 
+#
+# Convierte un valor NUMERIC a decimal finito dentro de los límites de precisión permitidos.
+#
 def _decode_numeric(value):
     if type(value) is str:
         value = _parse_canonical_decimal(value)
@@ -231,6 +280,9 @@ def _decode_numeric(value):
     return value
 
 
+#
+# Convierte un texto decimal canónico a Decimal o bloquea el análisis si no es válido.
+#
 def _parse_canonical_decimal(text: str) -> Decimal:
     if len(text) > _MAX_NUMERIC_TEXT_LENGTH or not _CANONICAL_DECIMAL.fullmatch(text):
         raise AnalysisBlocked(
@@ -240,6 +292,9 @@ def _parse_canonical_decimal(text: str) -> Decimal:
     return Decimal(text)
 
 
+#
+# Valida que un valor BIGINT sea un entero dentro del rango original.
+#
 def _decode_bigint(value):
     if type(value) is not int or not -(2**63) <= value < 2**63:
         raise AnalysisBlocked(
@@ -249,6 +304,9 @@ def _decode_bigint(value):
     return value
 
 
+#
+# Convierte un valor a fecha o bloquea el análisis si no coincide con DATE.
+#
 def _decode_date(value):
     value = date.fromisoformat(value) if type(value) is str else value
     if type(value) is not date:
@@ -257,6 +315,9 @@ def _decode_date(value):
     return value
 
 
+#
+# Convierte un valor a fecha y hora sin zona horaria o bloquea el análisis si no es válido.
+#
 def _decode_timestamp(value):
     value = datetime.fromisoformat(value) if type(value) is str else value
     if not isinstance(value, datetime) or value.tzinfo is not None:
@@ -268,6 +329,9 @@ def _decode_timestamp(value):
     return value
 
 
+#
+# Valida que un valor sea booleano.
+#
 def _decode_boolean(value):
     if type(value) is not bool:
         raise AnalysisBlocked("invalid_boolean", "La entrada no coincide con BOOLEAN.")
@@ -275,6 +339,9 @@ def _decode_boolean(value):
     return value
 
 
+#
+# Valida que un valor sea texto.
+#
 def _decode_text(value):
     if type(value) is not str:
         raise AnalysisBlocked("invalid_text", "La entrada no coincide con TEXT.")

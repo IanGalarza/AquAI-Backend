@@ -32,13 +32,14 @@ _FINISHED = {"completed", "failed", "cancelled"}
 
 
 class _Layout(NamedTuple):
-    """Datos de la tabla en la hoja: filas (o columnas, si los registros van por columna) sin encabezados."""
-
     by_columns: bool
     first: int
     last: int
 
 
+#
+# Devuelve el número de columna correspondiente a una letra de planilla.
+#
 def _column_index(letters):
     index = 0
     for letter in letters:
@@ -46,6 +47,9 @@ def _column_index(letters):
     return index
 
 
+#
+# Devuelve la letra de planilla correspondiente a un número de columna.
+#
 def _column_letter(index):
     letters = ""
     while index > 0:
@@ -54,6 +58,9 @@ def _column_letter(index):
     return letters
 
 
+#
+# Devuelve las posiciones enteras de una lista, o una lista vacía.
+#
 def _positions(value):
     if not isinstance(value, list):
         return []
@@ -61,8 +68,10 @@ def _positions(value):
     return [item for item in value if isinstance(item, int)]
 
 
+#
+# Devuelve la disposición de los datos en la hoja, o None si no es una planilla.
+#
 def _layout(provenance):
-    """Sólo las planillas conservan celdas reales; en un CSV el rango cuenta registros, no líneas del archivo."""
     locator = provenance.source_locator
     match = CELL_RANGE.match(str(locator.get("range", "")))
     if provenance.file_type not in SPREADSHEET_TYPES or match is None:
@@ -83,7 +92,6 @@ def _layout(provenance):
 
 
 class _Stored(BaseModel):
-    # Lectura tolerante: las fotografías anteriores conservan sus campos, aunque falten los nuevos.
     model_config = ConfigDict(extra="ignore")
 
 
@@ -189,6 +197,9 @@ class _Snapshot(_Stored):
     storage_warnings: list[str] = Field(default_factory=list)
 
 
+#
+# Devuelve la presentación estructurada de un mensaje del asistente, o None.
+#
 def present_message(view) -> MessagePresentation | None:
     if view["role"] != "assistant" or view["status"]["name"] not in _FINISHED:
         return None
@@ -202,15 +213,16 @@ def present_message(view) -> MessagePresentation | None:
     try:
         return _Presenter(_Snapshot.model_validate(data), view["sources"]).present(duration)
     except (ValidationError, LookupError, TypeError, ValueError):
-        # Una versión desconocida no debe impedir leer el historial: se conserva su texto original.
         _logger.warning(
             "Mensaje %s sin presentación estructurada; se muestra su texto.", view.get("id")
         )
         return plain
 
 
+#
+# Devuelve la duración del turno en milisegundos, o None si no es confiable.
+#
 def _duration_ms(view, data):
-    """Duración del turno en el servidor: desde su reserva hasta que se guardó el resultado."""
     error = data.get("error")
     interrupted = isinstance(error, dict) and error.get("code") == "interrupted_generation"
     if view["updated_at"] is None or interrupted:
@@ -222,6 +234,9 @@ def _duration_ms(view, data):
 
 
 class _Presenter:
+    #
+    # Guarda la fotografía de la respuesta, el idioma y las citas del mensaje.
+    #
     def __init__(self, snapshot, sources):
         self._snapshot = snapshot
         self._response = snapshot.response
@@ -239,6 +254,9 @@ class _Presenter:
             ref.evidence_id: ref.operation_id for ref in self._response.operation_references
         }
 
+    #
+    # Construye la presentación del mensaje con segmentos, citas, tablas y gráficos.
+    #
     def present(self, duration):
         response = self._response
         tables = {table.evidence_id: table for table in response.results}
@@ -258,8 +276,10 @@ class _Presenter:
             duration_ms=duration,
         )
 
+    #
+    # Devuelve las tablas que ningún segmento presenta, en respuestas sin segmentos.
+    #
     def _trailing_tables(self, views):
-        # En el formato estructurado, una tabla sin párrafo que la presente ya está descrita en el texto.
         if self._response.segments:
             return []
 
@@ -271,6 +291,9 @@ class _Presenter:
             if table.total_rows > 1 and table.evidence_id not in placed
         ]
 
+    #
+    # Devuelve los gráficos que ningún segmento presenta.
+    #
     def _trailing_charts(self, views):
         placed = {view.chart for view in views if view.chart}
 
@@ -280,21 +303,33 @@ class _Presenter:
             if chart.operation_id not in placed
         ]
 
+    #
+    # Devuelve la etiqueta de una columna de un dataset, o None.
+    #
     def _column(self, dataset_id, sql_name):
         column = self._columns.get((dataset_id, sql_name))
 
         return column_label(column["original_name"], column.get("unit")) if column else None
 
+    #
+    # Construye los segmentos de una respuesta anterior al formato estructurado.
+    #
     def _legacy_segments(self):
         hidden = {*self._response.limitations, " ".join(self._snapshot.storage_warnings)}
 
         return segments_from_text(self._response.answer, self._evidence, hidden)
 
+    #
+    # Devuelve las citas de los datasets indicados, sin repetidos.
+    #
     def _cite(self, dataset_ids):
         citations = [self._datasets[key] for key in dataset_ids if key in self._datasets]
 
         return list(dict.fromkeys(citations))
 
+    #
+    # Convierte los segmentos de la respuesta en vistas de segmento.
+    #
     def _segments(self, segments, tables, charts):
         views = []
         for index, segment in enumerate(segments):
@@ -303,8 +338,10 @@ class _Presenter:
 
         return views
 
+    #
+    # Convierte un segmento en su vista, con citas y tabla o gráfico adjuntos.
+    #
     def _segment(self, segment, following, tables, charts):
-        # Párrafos seguidos de una misma evidencia comparten la cita, al final del último o antes de su tabla.
         cited = (
             following is None
             or following.evidence_ids != segment.evidence_ids
@@ -321,6 +358,9 @@ class _Presenter:
             chart=operation if operation in charts else None,
         )
 
+    #
+    # Devuelve las citas de la evidencia de un segmento.
+    #
     def _segment_citations(self, segment):
         citations = []
         for key in segment.evidence_ids:
@@ -328,6 +368,9 @@ class _Presenter:
 
         return list(dict.fromkeys(citations))
 
+    #
+    # Construye las citas de las fuentes de la respuesta.
+    #
     def _build_citations(self):
         variables = self._variables()
         citations = []
@@ -341,6 +384,9 @@ class _Presenter:
 
         return citations
 
+    #
+    # Construye la cita de una fuente con su archivo, hoja, filas y variables.
+    #
     def _citation(self, source, citation_id, refs):
         provenance = source.provenance
         spreadsheet = provenance.file_type in SPREADSHEET_TYPES
@@ -362,6 +408,9 @@ class _Presenter:
             variables=[self._located(ref, layout, spreadsheet) for ref in refs],
         )
 
+    #
+    # Devuelve las columnas leídas agrupadas por dataset.
+    #
     def _variables(self):
         refs = self._read_columns() or self._result_columns()
         variables = {}
@@ -371,6 +420,9 @@ class _Presenter:
 
         return {key: list(values.values()) for key, values in variables.items()}
 
+    #
+    # Devuelve las columnas que leen los pasos del plan.
+    #
     def _read_columns(self):
         refs = []
         for step in self._steps.values():
@@ -378,6 +430,9 @@ class _Presenter:
 
         return refs
 
+    #
+    # Devuelve las columnas de origen de los resultados.
+    #
     def _result_columns(self):
         refs = []
         for table in self._response.results:
@@ -386,6 +441,9 @@ class _Presenter:
 
         return refs
 
+    #
+    # Devuelve la variable con su ubicación en la planilla original.
+    #
     def _located(self, ref, layout, spreadsheet):
         name = self._names.column(ref.dataset_id, ref.column)
         column = self._columns.get((ref.dataset_id, ref.column)) or {}
@@ -401,6 +459,9 @@ class _Presenter:
 
         return CitationVariable(name=name)
 
+    #
+    # Construye la vista de una tabla de resultados con sus columnas y citas.
+    #
     def _table(self, table):
         origin = self._names.origin(self._steps.get(table.operation_id))
         grains = _time_grains(origin) if origin else {}
@@ -412,6 +473,9 @@ class _Presenter:
             citations=self._evidence.get(table.evidence_id, []),
         )
 
+    #
+    # Construye la vista de una columna con su etiqueta, unidad y agrupación temporal.
+    #
     def _column_view(self, table, field, grains):
         unit, documented = display_unit(field, self._language)
 
@@ -424,6 +488,9 @@ class _Presenter:
             time_grain=grains.get(field.name),
         )
 
+    #
+    # Construye la vista de un gráfico con sus títulos y citas.
+    #
     def _chart(self, chart):
         source = chart.input_operation_ids[0] if chart.input_operation_ids else ""
         legend = None
@@ -439,6 +506,9 @@ class _Presenter:
             legend_title=legend,
         )
 
+    #
+    # Devuelve el título de un eje con su unidad formateada.
+    #
     def _axis_title(self, axis):
         if axis is None:
             return None
@@ -452,6 +522,9 @@ class _Presenter:
         return f"{label} ({unit})" if unit else label
 
 
+#
+# Devuelve las columnas guardadas de las fuentes por dataset y nombre.
+#
 def _stored_columns(sources):
     columns = {}
     for source in sources:
@@ -462,26 +535,37 @@ def _stored_columns(sources):
     return columns
 
 
+#
+# Devuelve la agrupación temporal de cada campo de un paso.
+#
 def _time_grains(step):
     return {item.output_name: item.time_grain for item in step.group_by if item.time_grain != "raw"}
 
 
+#
+# Devuelve la variable cuando no se puede verificar un rango de celdas.
+#
 def _unranged_variable(name, source_column, spreadsheet):
     if not isinstance(source_column, int):
         return CitationVariable(name=name)
 
-    # Sin rango verificable sólo se informa la columna; en un CSV, por su posición.
     column = _column_letter(source_column) if spreadsheet else str(source_column)
 
     return CitationVariable(name=name, column=column)
 
 
+#
+# Devuelve la variable de una fila con el rango de celdas que ocupa.
+#
 def _row_variable(name, row, layout):
     cells = f"{_column_letter(layout.first)}{row}:{_column_letter(layout.last)}{row}"
 
     return CitationVariable(name=name, row=row, cells=cells)
 
 
+#
+# Devuelve la variable de una columna con el rango de celdas que ocupa.
+#
 def _column_variable(name, position, layout):
     letter = _column_letter(position)
 

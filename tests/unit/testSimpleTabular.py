@@ -1,5 +1,3 @@
-"""Casos pequeños de conservación, estructura y límites de CSV/XLSX."""
-
 import io
 import unittest
 from datetime import date, time
@@ -15,6 +13,9 @@ from aquai.infrastructure.config.tabular import TabularSettings
 from aquai.infrastructure.processing.tabular import SimpleTabularProcessor
 
 
+#
+# Serializa un libro de Excel a bytes.
+#
 def workbook_bytes(workbook: Workbook) -> bytes:
     stream = io.BytesIO()
     workbook.save(stream)
@@ -23,9 +24,15 @@ def workbook_bytes(workbook: Workbook) -> bytes:
 
 
 class SimpleTabularTests(unittest.TestCase):
+    #
+    # Crea el procesador tabular con la configuración por defecto.
+    #
     def setUp(self) -> None:
         self.processor = SimpleTabularProcessor(TabularSettings(_env_file=None))
 
+    #
+    # Verifica que el CSV conserva registros, códigos, marcadores, ceros, falsos y nulos.
+    #
     def test_csv_preserves_all_records_codes_markers_zero_false_and_null(self) -> None:
         content = (
             b"codigo,,valor,marca,activo\n001,,0,NA,false\n002,,,nd,true\n,,,,\n002,,,nd,true\n"
@@ -43,6 +50,9 @@ class SimpleTabularTests(unittest.TestCase):
         self.assertIsNone(table.rows[1]["valor"])
         self.assertEqual(table.columns[1]["source_column"], 3)
 
+    #
+    # Verifica que los tipos se comprueban sobre la columna completa y los nombres son seguros.
+    #
     def test_types_are_verified_over_full_column_and_names_are_safe(self) -> None:
         content = (
             "valor,valor,fecha,medida [mg/L],_aquai_row,decimal\n"
@@ -64,6 +74,9 @@ class SimpleTabularTests(unittest.TestCase):
         self.assertFalse(table.columns[0]["numeric_eligible"])
         self.assertTrue(table.warnings)
 
+    #
+    # Verifica que Excel con varias regiones y hojas conserva encabezados combinados y procedencia.
+    #
     def test_excel_multiple_regions_sheets_merged_headers_and_provenance(self) -> None:
         workbook = Workbook()
         sheet = workbook.active
@@ -98,6 +111,9 @@ class SimpleTabularTests(unittest.TestCase):
         self.assertEqual(result.tables[3].columns[3]["original_name"], "categoria")
         self.assertTrue(any("vacía" in warning for warning in result.warnings))
 
+    #
+    # Verifica que encabezados parciales, tablas anchas y laterales conservan sus registros.
+    #
     def test_partial_headers_wide_tables_and_lateral_tables_keep_records(self) -> None:
         workbook = Workbook()
         wide = workbook.active
@@ -130,6 +146,9 @@ class SimpleTabularTests(unittest.TestCase):
             result.tables[-1].columns[1]["original_name"], "Mediciones | Sensor A | minimo"
         )
 
+    #
+    # Verifica que la proyección numérica conserva los marcadores originales y cuenta los excluidos.
+    #
     def test_numeric_projection_keeps_original_markers_and_excluded_count(self) -> None:
         content = b"Fecha,Abundancia,codigo,periodo\n2024-03-12,120,001,03/04/2024\n2024-03-13,135,002,04/05/2024\n2024-03-14,nd,nd,05/06/2024\n2024-03-15,180,004,06/07/2024\n"
         table = self.processor.prepare("markers.csv", content).tables[0]
@@ -149,6 +168,9 @@ class SimpleTabularTests(unittest.TestCase):
         self.assertEqual(len(table.columns), 5)
         self.assertTrue(any("excluidos" in warning for warning in table.warnings))
 
+    #
+    # Verifica que la transposición estructural comprueba coordenadas y rechaza pérdida de registros.
+    #
     def test_structural_transpose_verifies_coordinates_and_rejects_record_loss(self) -> None:
         workbook = Workbook()
         sheet = workbook.active
@@ -186,6 +208,9 @@ class SimpleTabularTests(unittest.TestCase):
         self.assertFalse(rejected.tables)
         self.assertTrue(any("verificarse" in warning for warning in rejected.warnings))
 
+    #
+    # Verifica que Excel conserva fórmulas, códigos con formato y fechas parciales.
+    #
     def test_excel_preserves_formulas_formatted_codes_and_partial_dates(self) -> None:
         workbook = Workbook()
         sheet = workbook.active
@@ -204,6 +229,9 @@ class SimpleTabularTests(unittest.TestCase):
         self.assertTrue(any("fórmulas" in warning for warning in table.warnings))
         self.assertTrue(any("parcial" in warning for warning in table.warnings))
 
+    #
+    # Verifica que las regiones poco fiables no se publican y los totales declarados se excluyen.
+    #
     def test_unreliable_regions_are_not_published_and_declared_totals_are_excluded(self) -> None:
         workbook = Workbook()
         notes = workbook.active
@@ -223,6 +251,9 @@ class SimpleTabularTests(unittest.TestCase):
         self.assertEqual(len(result.tables[0].rows), 1)
         self.assertGreaterEqual(len(result.warnings), 3)
 
+    #
+    # Verifica que la codificación, el delimitador y las filas físicas sobreviven a celdas multilínea.
+    #
     def test_csv_encoding_delimiter_and_physical_rows_survive_multiline_cells(self) -> None:
         content = 'nombre;comentario;cantidad\nPeña;"primera\nsegunda";2\nOtro;normal;3\n'.encode(
             "cp1252"
@@ -235,6 +266,9 @@ class SimpleTabularTests(unittest.TestCase):
         self.assertEqual(table.rows[0]["comentario"], "primera\nsegunda")
         self.assertEqual(table.rows[1]["_aquai_source_row"], 4)
 
+    #
+    # Verifica que la validación rechaza CSV binario y Excel inseguro o demasiado grande.
+    #
     def test_validation_rejects_binary_csv_and_unsafe_or_oversized_excel(self) -> None:
         self.assertEqual(
             self.processor.validate_upload("../folder\\sample.csv", b"a,b\n1,2\n"), "sample.csv"

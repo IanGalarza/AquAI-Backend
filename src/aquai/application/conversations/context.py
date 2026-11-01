@@ -27,23 +27,25 @@ _MAX_ANALYSIS_BYTES = 16_000
 _MAX_PENDING_REQUESTS = 8
 _MAX_CONTEXT_MESSAGES = 4
 _MAX_SCOPE = 12
-# Condiciones que definen el alcance de un análisis y que un seguimiento puede conservar.
 _SCOPE_KINDS = {"variable", "value", "dimension", "date"}
-# Análisis anteriores a la ventana reciente que una pregunta puede volver a traer.
 _MAX_RECALLED = 2
-# Solicitudes previas que acompañan un seguimiento: las operaciones verificadas ya resumen las anteriores.
 _MAX_CARRIED_REQUESTS = 3
 _MAX_CARRIED_PENDING = 4
 
 
+#
+# Serializa un valor a JSON en bytes UTF-8.
+#
 def json_bytes(value):
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode(
         "utf-8"
     )
 
 
+#
+# Construye el historial con la ventana reciente y los análisis anteriores que la pregunta recupera.
+#
 def build_history(rows, question=""):
-    """Ventana reciente y, de los mensajes anteriores, sólo los análisis que la pregunta vuelve a nombrar."""
     messages = [_history_message(row) for row in rows]
     _link_replays(messages)
     recent = {
@@ -63,6 +65,9 @@ def build_history(rows, question=""):
     return selected
 
 
+#
+# Convierte una fila de mensaje en un mensaje de historial.
+#
 def _history_message(row):
     message = HistoryMessage(
         message_id=row["id"],
@@ -91,21 +96,29 @@ def _history_message(row):
     return message
 
 
+#
+# Devuelve el texto visible de un mensaje, sin cortar palabras incompletas.
+#
 def _visible_text(row):
     text = row["text"]
     if row["text_complete"]:
         return text
 
-    # No publicar un prefijo cortado a mitad de una palabra o un número.
     parts = text.rsplit(maxsplit=1)
 
     return parts[0] if len(parts) == 2 else ""
 
 
+#
+# Indica si el mensaje pide una aclaración al usuario.
+#
 def _asks_clarification(row):
     return row["response_type"] == "clarification" or row["answer_status"] == "needs_clarification"
 
 
+#
+# Marca un mensaje como aclaración pendiente con sus solicitudes y contexto.
+#
 def _mark_pending_request(message, row):
     requests = [
         item
@@ -117,6 +130,9 @@ def _mark_pending_request(message, row):
     message.context_message_ids = _message_ids(row.get("context_ids") or [])[:_MAX_CONTEXT_MESSAGES]
 
 
+#
+# Convierte valores en identificadores de mensaje, omitiendo los inválidos.
+#
 def _message_ids(values):
     ids = []
     for value in values:
@@ -128,6 +144,9 @@ def _message_ids(values):
     return ids
 
 
+#
+# Devuelve las columnas asociadas a cada dataset de un mensaje.
+#
 def _source_columns(associations):
     columns = {}
     for item in associations:
@@ -140,8 +159,10 @@ def _source_columns(associations):
     return columns
 
 
+#
+# Devuelve las menciones que definen el alcance de un análisis.
+#
 def _scope_mentions(mentions):
-    """Variable, valores, dimensiones y fechas que el turno interpretó, con el texto literal del usuario."""
     scope = {}
     for item in mentions:
         if not _is_scope_mention(item):
@@ -152,6 +173,9 @@ def _scope_mentions(mentions):
     return list(scope.values())[:_MAX_SCOPE]
 
 
+#
+# Indica si una mención es válida y define el alcance de un análisis.
+#
 def _is_scope_mention(item):
     return (
         isinstance(item, dict)
@@ -161,6 +185,9 @@ def _is_scope_mention(item):
     )
 
 
+#
+# Devuelve el mensaje cuyo resultado reprodujo una respuesta histórica, si es único.
+#
 def _replayed_message(row):
     if row["response_type"] != "historical":
         return None
@@ -169,8 +196,10 @@ def _replayed_message(row):
     return ids[0] if len(ids) == 1 else None
 
 
+#
+# Hace que las respuestas que reprodujeron un resultado conserven su análisis.
+#
 def _link_replays(messages):
-    """Una respuesta que reprodujo un resultado conserva ese análisis: un seguimiento sobre ella lo continúa."""
     by_id = {message.message_id: message for message in messages}
     for message in messages:
         original = by_id.get(message.replay_of)
@@ -181,11 +210,10 @@ def _link_replays(messages):
         message.named_sources = message.named_sources or original.named_sources
 
 
+#
+# Devuelve los análisis anteriores a la ventana reciente que la pregunta vuelve a nombrar.
+#
 def _recalled(older, recent, question):
-    """Análisis fuera de la ventana reciente cuyas condiciones la pregunta vuelve a nombrar.
-
-    Hace falta nombrar dos condiciones, o un valor, una dimensión o una fecha, y que alguna no esté ya en la
-    ventana reciente: «el pH promedio de Punta Lara del principio» recupera ese resultado, «¿y el pH?» no."""
     if not question:
         return []
 
@@ -203,16 +231,25 @@ def _recalled(older, recent, question):
     return [message for *_, message in ranked[:_MAX_RECALLED]]
 
 
+#
+# Indica si la pregunta nombra una mención.
+#
 def _named_in(question, mention):
     text = variable_core(mention.text) if mention.kind == "variable" else mention.text
     return bool(text) and contains_phrase(question, text, plural_insensitive=True)
 
 
+#
+# Devuelve la clave normalizada de una mención de alcance.
+#
 def _scope_key(mention):
     text = variable_core(mention.text) if mention.kind == "variable" else mention.text
     return mention.kind, normalize_text(text)
 
 
+#
+# Indica si una respuesta es analítica y fue validada.
+#
 def _is_verified_answer(row):
     return (
         row["schema_version"] == 1
@@ -221,20 +258,24 @@ def _is_verified_answer(row):
     )
 
 
+#
+# Devuelve el análisis histórico verificado de una respuesta, o None si no es confiable.
+#
 def _verified_analysis(row):
     try:
         sources = _SOURCE_REFERENCES.validate_python(row["sources"])
         _check_associations(sources, row["associations"])
         analysis = _historical_analysis(row, sources)
-        # Nunca convertir un recorte de operaciones en contexto completo.
         fits = len(json_bytes(analysis.model_dump(mode="json"))) <= _MAX_ANALYSIS_BYTES
     except (ValidationError, ValueError, TypeError, KeyError):
-        # El texto permanece visible; no se autoriza como evidencia estructurada.
         return None
 
     return analysis if fits else None
 
 
+#
+# Verifica que las fuentes citadas coincidan con las registradas en el mensaje.
+#
 def _check_associations(sources, rows):
     associations = {(item["source_id"], item["dataset_id"], item["version"]): item for item in rows}
     for source in sources:
@@ -244,6 +285,9 @@ def _check_associations(sources, rows):
             raise ValueError("La referencia histórica no coincide con MessageSource.")
 
 
+#
+# Construye el análisis histórico de una respuesta con sus fuentes y operaciones.
+#
 def _historical_analysis(row, sources):
     raw_operations = row["operations"] or []
     complete = all("output_fields" in item for item in raw_operations)
@@ -262,6 +306,9 @@ def _historical_analysis(row, sources):
     )
 
 
+#
+# Construye el contexto del Router con el historial que cabe en el presupuesto.
+#
 def routing_context(question, history, budget, catalog_names=()):
     context = {"question": question, "catalog_names": list(catalog_names), "history": []}
     omitted = []
@@ -277,6 +324,9 @@ def routing_context(question, history, budget, catalog_names=()):
     return context, sha256(content).hexdigest(), len(content), omitted
 
 
+#
+# Devuelve el resumen de un mensaje para el contexto del Router.
+#
 def _routing_item(message):
     item = message.model_dump(
         mode="json", include={"message_id", "role", "text", "text_complete", "scientific"}
@@ -285,15 +335,16 @@ def _routing_item(message):
         item["clarification"] = True
         item["pending_requests"] = message.pending_requests
     if message.analysis is not None:
-        # Los números de respuestas anteriores no intervienen en la clasificación: sólo qué se analizó.
         item["text"] = "Respuesta analítica; utilizar sus metadatos estructurados."
         item["analysis"] = _analysis_summary(message)
 
     return item
 
 
+#
+# Devuelve qué se analizó en un mensaje, sin operaciones ni procedencia.
+#
 def _analysis_summary(message):
-    """Qué se analizó, sin operaciones ni procedencia: el Router sólo decide la ruta y qué mensaje cita."""
     analysis = message.analysis
     return {
         "request": analysis.request_history[-1] if analysis.request_history else None,
@@ -304,8 +355,10 @@ def _analysis_summary(message):
     }
 
 
+#
+# Devuelve el último análisis verificado que citó el Router.
+#
 def cited_analysis(history, message_ids):
-    """Último resultado verificado que citó el Router: un seguimiento conserva lo que no cambia de él."""
     cited = set(message_ids)
     for item in reversed(history):
         if item.message_id in cited and item.analysis is not None:
@@ -314,17 +367,13 @@ def cited_analysis(history, message_ids):
     return None
 
 
+#
+# Construye la pregunta para el Retriever y el Planner con lo que el seguimiento conserva.
+#
 def contextual_question(question, messages, *, redefined=False):
-    """Pregunta para Retriever y Planner con lo que el seguimiento conserva del análisis citado.
-
-    Si la pregunta define su propio cálculo («promedio por mes», «el máximo»), del análisis anterior sólo se
-    conservan sus lecturas (datasets, columnas y filtros): copiar sus cálculos contradiría el pedido nuevo."""
     pending, asked = _pending_clarification(messages)
     requests, analyses = _verified_history(messages, reads_only=redefined)
 
-    # Lo que ya tuvo una respuesta verificada es historial; sólo lo que esperaba la
-    # aclaración forma parte de la solicitud actual. Las operaciones verificadas ya resumen
-    # las solicitudes más antiguas de una cadena de seguimientos.
     requests = list(dict.fromkeys(requests))[-_MAX_CARRIED_REQUESTS:]
     pending = [item for item in dict.fromkeys(pending) if item != question and item not in requests]
     pending = pending[-_MAX_CARRIED_PENDING:]
@@ -338,6 +387,9 @@ def contextual_question(question, messages, *, redefined=False):
     return _with_history(current, requests, analyses, redefined), [*requests, *pending, question]
 
 
+#
+# Devuelve las solicitudes pendientes de aclaración y las aclaraciones pedidas.
+#
 def _pending_clarification(messages):
     pending = []
     asked = []
@@ -351,6 +403,9 @@ def _pending_clarification(messages):
     return pending, asked
 
 
+#
+# Devuelve las solicitudes y análisis verificados del historial.
+#
 def _verified_history(messages, *, reads_only=False):
     requests = []
     analyses = []
@@ -359,15 +414,16 @@ def _verified_history(messages, *, reads_only=False):
             continue
         requests.extend(message.analysis.request_history)
         analysis = _declarative_analysis(message.analysis, reads_only)
-        if analysis not in analyses:  # Una respuesta reproducida comparte el análisis original.
+        if analysis not in analyses:
             analyses.append(analysis)
 
     return requests, analyses
 
 
+#
+# Reduce un análisis a sus fuentes y operaciones declarativas.
+#
 def _declarative_analysis(analysis, reads_only=False):
-    # Sólo identidades y operaciones declarativas: hashes, localizadores y esquemas de
-    # salida no ayudan a replanificar y el Planner tiende a copiarlos como si fueran pasos.
     sources = [
         {key: source.get(key) for key in ("dataset_id", "dataset_name", "version")}
         for source in analysis.sources
@@ -381,6 +437,9 @@ def _declarative_analysis(analysis, reads_only=False):
     return {"sources": sources, "operations": operations}
 
 
+#
+# Construye la solicitud con la aclaración del usuario, que tiene prioridad.
+#
 def _clarified_request(question, pending, asked):
     clarification = f"\nAquAI pidió aclarar: {' '.join(asked)}" if asked else ""
 
@@ -392,6 +451,9 @@ def _clarified_request(question, pending, asked):
     )
 
 
+#
+# Agrega el contexto histórico verificado a la solicitud actual.
+#
 def _with_history(current, requests, analyses, redefined=False):
     evidence = json_bytes(
         {

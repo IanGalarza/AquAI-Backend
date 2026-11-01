@@ -17,6 +17,9 @@ class DatabaseSettings(BaseSettings):
 
     database_url: SecretStr = Field(validation_alias="DATABASE_URL")
 
+    #
+    # Valida la URL de la base de datos y la normaliza al driver postgresql+psycopg.
+    #
     @field_validator("database_url", mode="before")
     @classmethod
     def validate_database_url(cls, value: object) -> SecretStr:
@@ -38,7 +41,9 @@ class DatabaseSettings(BaseSettings):
 
         return SecretStr(url.render_as_string(hide_password=False))
 
+    #
+    # Devuelve la URL de SQLAlchemy sin exponerla en la representación de la configuración.
+    #
     @property
     def sqlalchemy_url(self) -> URL:
-        """Devuelve la URL procesada sin mostrarla en la representación de la configuración."""
         return make_url(self.database_url.get_secret_value())

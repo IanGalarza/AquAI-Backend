@@ -35,19 +35,27 @@ _REUSED_RESULT_WARNING = (
     "no se repitió el cálculo."
 )
 
-# Margen para los metadatos que se agregan al cerrar el resultado.
 _ENVELOPE_RESERVE_BYTES = 4096
 
 
+#
+# Devuelve el tamaño en bytes del modelo serializado a JSON.
+#
 def _json_size(model) -> int:
     return len(model.model_dump_json().encode("utf-8"))
 
 
 class _Budget:
+    #
+    # Guarda la configuración y el instante de inicio del presupuesto de ejecución.
+    #
     def __init__(self, settings, started):
         self.settings = settings
         self.started = started
 
+    #
+    # Lanza un bloqueo si se superó el presupuesto de tiempo de Python.
+    #
     def check(self):
         elapsed_ms = (perf_counter() - self.started) * 1000
 
@@ -56,6 +64,9 @@ class _Budget:
                 "python_timeout", "Se superó el presupuesto de tiempo de las herramientas Python."
             )
 
+    #
+    # Verifica que la entrada no supere los límites de filas, celdas, bytes ni memoria.
+    #
     def input(self, record):
         self.check()
         settings = self.settings
@@ -92,16 +103,20 @@ class _Run:
 
 @dataclass
 class _StepState:
-    """Registro vigente del paso: el cálculo puede reemplazarlo por una versión validada."""
-
     step: object
     record: OperationExecution
 
 
 class DeterministicPythonPlanExecutor:
+    #
+    # Guarda la configuración de ejecución Python.
+    #
     def __init__(self, settings: PythonExecutionSettings) -> None:
         self._settings = settings
 
+    #
+    # Ejecuta las operaciones Python del plan sobre los resultados SQL, reutilizando cálculos previos.
+    #
     def execute(
         self,
         plan: PlanningResult,
@@ -129,6 +144,9 @@ class DeterministicPythonPlanExecutor:
 
         return self._finish(result, plan, sql_result, started)
 
+    #
+    # Crea el resultado Python vacío con las huellas del plan y de la entrada SQL.
+    #
     def _new_result(self, plan, sql_result, now):
         settings = self._settings
         precision_warning = f"Cálculos NUMERIC con Decimal y precisión de {settings.decimal_precision} dígitos significativos; no se convierten silenciosamente a float."
@@ -144,6 +162,9 @@ class DeterministicPythonPlanExecutor:
             warnings=list(dict.fromkeys([*plan.warnings, precision_warning])),
         )
 
+    #
+    # Valida plan y transferencia SQL y calcula la huella de entrada, o registra el error.
+    #
     def _authorize_input(self, result, plan, sql_result) -> bool:
         try:
             validate_execution_plan(plan, plan.selected_datasets)
@@ -160,6 +181,9 @@ class DeterministicPythonPlanExecutor:
 
         return True
 
+    #
+    # Adjunta al resultado los datasets del plan, respetando el presupuesto de salida.
+    #
     def _attach_datasets(self, result, plan) -> bool:
         result.datasets = [
             ExecutionDataset(
@@ -185,6 +209,9 @@ class DeterministicPythonPlanExecutor:
 
         return True
 
+    #
+    # Devuelve los resultados y gráficos previos reutilizables si la huella de entrada coincide.
+    #
     @staticmethod
     def _reusable_results(previous, input_fingerprint):
         if previous is None or previous.input_fingerprint != input_fingerprint:
@@ -199,6 +226,9 @@ class DeterministicPythonPlanExecutor:
 
         return cached, charts
 
+    #
+    # Ejecuta un paso Python registrando su resultado, sus bloqueos y errores.
+    #
     def _run_step(self, run, step):
         state = _StepState(step, self._new_record(step, run.plan, run.records))
         run.result.operations.append(state.record)
@@ -224,6 +254,9 @@ class DeterministicPythonPlanExecutor:
         finally:
             state.record.duration_ms = round((perf_counter() - operation_started) * 1000, 3)
 
+    #
+    # Crea el registro de operación inicial con columnas, dependencias y datasets del paso.
+    #
     @staticmethod
     def _new_record(step, plan, records):
         record = OperationExecution(
@@ -246,6 +279,9 @@ class DeterministicPythonPlanExecutor:
 
         return record
 
+    #
+    # Marca el registro como bloqueado o no soportado y descarta sus filas.
+    #
     @staticmethod
     def _mark_blocked(record, error):
         record.status = "unsupported" if error.code == "unsupported_operation" else "blocked"
@@ -253,12 +289,18 @@ class DeterministicPythonPlanExecutor:
         record.materialized = False
         record.rows, record.rows_returned = [], 0
 
+    #
+    # Marca el registro como fallido con el código y mensaje indicados.
+    #
     @staticmethod
     def _mark_failed(record, code, message):
         record.status, record.materialized = "error", False
         record.rows, record.rows_returned = [], 0
         record.error = ExecutionError(code=code, message=message)
 
+    #
+    # Ejecuta un paso, reutilizando su resultado previo o calculándolo.
+    #
     def _execute_step(self, run, state):
         step = state.step
         run.budget.check()
@@ -271,6 +313,9 @@ class DeterministicPythonPlanExecutor:
         else:
             self._compute(run, state, parent)
 
+    #
+    # Devuelve el resultado padre autorizado, completo y con el esquema esperado.
+    #
     @staticmethod
     def _authorized_parent(run, step):
         if step.operation not in _PYTHON_OPERATIONS:
@@ -311,6 +356,9 @@ class DeterministicPythonPlanExecutor:
 
         return parent
 
+    #
+    # Reutiliza el resultado completo de una ejecución previa del mismo paso.
+    #
     def _reuse_cached(self, run, state, reused):
         step = state.step
 
@@ -342,15 +390,20 @@ class DeterministicPythonPlanExecutor:
 
         self._publish(run.result, record, chart)
 
+    #
+    # Reconstruye la figura de un gráfico previo conservando sus datos.
+    #
     @staticmethod
     def _rebuilt_chart(previous_chart, budget):
         chart = previous_chart.model_copy(deep=True)
-        # Conserva los datos del gráfico previo; sólo reconstruye su figura, sin repetir SQL ni análisis.
         chart.figure = build_plotly_figure(chart)
         budget.check()
 
         return chart
 
+    #
+    # Calcula el paso a partir del resultado padre y valida el registro resultante.
+    #
     def _compute(self, run, state, parent):
         step, record = state.step, state.record
         rows = decode_rows(parent, parent.columns, run.budget)
@@ -365,7 +418,6 @@ class DeterministicPythonPlanExecutor:
 
         run.budget.check()
         record.rows_returned = len(record.rows)
-        # Valida los tipos de salida sin perder Decimal mediante JSON.
         validated = OperationExecution.model_validate(record.model_dump())
         decode_rows(validated, step.output_fields, run.budget)
 
@@ -375,6 +427,9 @@ class DeterministicPythonPlanExecutor:
         self._replace_record(run, step, validated)
         self._publish(run.result, validated, chart)
 
+    #
+    # Crea el gráfico del paso a partir de las filas del padre.
+    #
     def _visualize(self, run, state, rows, parent):
         record = state.record
         datasets = [item for item in run.result.datasets if item.dataset_id in record.dataset_ids]
@@ -392,6 +447,9 @@ class DeterministicPythonPlanExecutor:
 
         return chart
 
+    #
+    # Aplica la operación tabular del paso y registra filas, exclusiones y filtros.
+    #
     def _tabulate(self, run, state, rows, parent):
         record = state.record
         period_key = self._period_key(run.plan, state.step, parent.columns)
@@ -404,11 +462,17 @@ class DeterministicPythonPlanExecutor:
         if filtered:
             record.warnings.append(f"Los filtros explícitos del paso excluyeron {filtered} filas.")
 
+    #
+    # Reemplaza el registro vigente del paso en el resultado y el índice de registros.
+    #
     @staticmethod
     def _replace_record(run, step, record):
         run.result.operations[-1] = record
         run.records[step.id] = record
 
+    #
+    # Agrega el registro y el gráfico al resultado, revirtiendo si excede el presupuesto.
+    #
     def _publish(self, result, record, chart):
         if chart is not None:
             result.visualizations.append(chart)
@@ -425,6 +489,9 @@ class DeterministicPythonPlanExecutor:
 
             raise
 
+    #
+    # Devuelve la función que obtiene el fin del período de una columna de texto temporal.
+    #
     @staticmethod
     def _period_key(plan, step, fields):
         if step.operation != "latest":
@@ -454,6 +521,9 @@ class DeterministicPythonPlanExecutor:
 
         return period_end
 
+    #
+    # Verifica que el resultado no exceda el límite de filas ni de bytes.
+    #
     def _output_budget(self, result):
         settings = self._settings
 
@@ -466,6 +536,9 @@ class DeterministicPythonPlanExecutor:
                 "El resultado completo excede el límite de filas/bytes de Python; no se publica un resultado recortado como completo.",
             )
 
+    #
+    # Cierra el resultado calculando su estado, errores pendientes y duración.
+    #
     def _finish(self, result, plan, sql_result, started):
         if _json_size(result) + _ENVELOPE_RESERVE_BYTES > self._settings.max_result_bytes:
             self._discard_details(result)
@@ -484,6 +557,9 @@ class DeterministicPythonPlanExecutor:
 
         return result
 
+    #
+    # Descarta el detalle del resultado cuando excede el presupuesto de bytes.
+    #
     @staticmethod
     def _discard_details(result):
         result.error = ExecutionError(
@@ -500,6 +576,9 @@ class DeterministicPythonPlanExecutor:
             if record.status == "executed":
                 record.status, record.error = "blocked", result.error
 
+    #
+    # Descarta las operaciones del resultado cuando su detalle excede el presupuesto.
+    #
     @staticmethod
     def _discard_operations(result, plan, sql_result):
         result.operations, result.datasets, result.visualizations = [], [], []

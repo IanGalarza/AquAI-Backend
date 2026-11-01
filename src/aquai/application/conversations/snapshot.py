@@ -63,18 +63,26 @@ _DIRECT_RESPONSE_TYPES = {
 }
 
 
+#
+# Indica si cada párrafo de la respuesta figura tal cual en el texto original.
+#
 def _reproduces(answer, original):
-    """Cada párrafo reproducido figura tal cual en la respuesta original."""
     paragraphs = [item for item in answer.split("\n\n") if item.strip()]
     return bool(paragraphs) and all(item in original for item in paragraphs)
 
 
+#
+# Calcula el tamaño en bytes UTF-8 del valor serializado como JSON compacto.
+#
 def _bytes(value):
     content = json.dumps(value, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
 
     return len(content.encode("utf-8"))
 
 
+#
+# Construye el registro del asistente para un turno fallido o cancelado.
+#
 def failure_record(turn, code, message, *, cancelled=False):
     return AssistantRecord(
         content=message,
@@ -90,6 +98,9 @@ def failure_record(turn, code, message, *, cancelled=False):
 
 
 class ConversationSnapshotBuilder:
+    #
+    # Guarda los límites de tamaño de mensaje, tablas y detalles de fuentes.
+    #
     def __init__(
         self, *, max_message_bytes, max_table_rows, max_table_bytes, max_source_details_bytes
     ):
@@ -98,6 +109,9 @@ class ConversationSnapshotBuilder:
         self._max_table_bytes = max_table_bytes
         self._max_source_details_bytes = max_source_details_bytes
 
+    #
+    # Arma el registro del asistente de un turno, validando la evidencia y ajustándolo a los límites.
+    #
     def build(self, state, turn, *, reused=False):
         if state.routing is not None and state.routing.route != "data":
             return self._direct(state, turn)
@@ -131,6 +145,9 @@ class ConversationSnapshotBuilder:
             status_name="failed" if response.generation.status == "failed" else "completed",
         )
 
+    #
+    # Guarda las tablas de resultados dentro de los presupuestos de filas y bytes, con avisos si se recortan.
+    #
     def _store_tables(self, state, references, allowed, stored):
         warnings = []
         budget = _TableBudget(self._max_table_rows, self._max_table_bytes)
@@ -150,6 +167,9 @@ class ConversationSnapshotBuilder:
 
         return warnings
 
+    #
+    # Reduce el snapshot por etapas hasta que cabe en el límite del mensaje o falla si no es posible.
+    #
     def _fit(self, snapshot, stored, operations, warnings, language):
         if self._too_large(snapshot):
             _drop_table_details(stored)
@@ -182,9 +202,15 @@ class ConversationSnapshotBuilder:
                 "Los metadatos mínimos exceden el límite de almacenamiento del mensaje."
             )
 
+    #
+    # Indica si el snapshot serializado supera el tamaño máximo permitido para un mensaje.
+    #
     def _too_large(self, snapshot):
         return len(snapshot.model_dump_json().encode("utf-8")) > self._max_message_bytes
 
+    #
+    # Arma el registro de una respuesta directa (general, catálogo, histórica o aclaración) sin datos nuevos.
+    #
     def _direct(self, state, turn):
         response = state.response
         routing = state.routing
@@ -231,6 +257,9 @@ class ConversationSnapshotBuilder:
             status_name="failed" if generation.status == "failed" else "completed",
         )
 
+    #
+    # Valida que una respuesta histórica reproduzca el mensaje citado y devuelve sus fuentes asociadas.
+    #
     def _historical_associations(self, response, routing, history):
         if len(routing.history_message_ids) != 1:
             raise ConversationStorageError("La referencia histórica es ambigua.")
@@ -258,6 +287,9 @@ class ConversationSnapshotBuilder:
 
         return associations
 
+    #
+    # Construye los detalles de una fuente citada en una respuesta histórica, con sus columnas originales.
+    #
     def _historical_details(self, source, message_id, references, original):
         dataset_id = str(source.dataset_id)
         details = {
@@ -275,11 +307,13 @@ class ConversationSnapshotBuilder:
         if _bytes(details) > self._max_source_details_bytes:
             raise ConversationStorageError("La referencia histórica supera su límite.")
 
-        # Las columnas del original permiten ubicar sus variables y celdas al reproducirlo.
         self._add_columns(details, original.source_columns.get(dataset_id, []))
 
         return details
 
+    #
+    # Agrega columnas a los detalles de una fuente mientras quepan en el límite de metadatos.
+    #
     def _add_columns(self, details, columns):
         for column in columns:
             details["columns"].append(column)
@@ -288,6 +322,9 @@ class ConversationSnapshotBuilder:
                 details["columns_complete"] = False
                 break
 
+    #
+    # Devuelve las fuentes únicas de la respuesta con los detalles de su procedencia y columnas.
+    #
     def _associations(self, state, response):
         selected = (
             {item.dataset_id: item for item in state.planning.selected_datasets}
@@ -309,6 +346,9 @@ class ConversationSnapshotBuilder:
 
         return result
 
+    #
+    # Construye los detalles de procedencia, referencias de operación y columnas de una fuente.
+    #
     def _source_details(self, source, dataset, operation_references):
         references = [
             item for item in operation_references if source.dataset_id in item.dataset_ids
@@ -339,10 +379,16 @@ class ConversationSnapshotBuilder:
 
 
 class _TableBudget:
+    #
+    # Guarda el máximo de filas y bytes disponibles para las tablas del mensaje.
+    #
     def __init__(self, rows, size):
         self._rows = rows
         self._bytes = size
 
+    #
+    # Toma las filas que caben en el presupuesto restante y descuenta lo consumido.
+    #
     def take(self, rows):
         taken = []
         for row in rows:
@@ -355,6 +401,9 @@ class _TableBudget:
 
         return taken
 
+    #
+    # Conserva las exclusiones de la tabla si caben en el presupuesto o las descarta con un aviso.
+    #
     def fit_exclusions(self, table):
         size = _bytes([item.model_dump(mode="json") for item in table.exclusions])
         if size <= self._bytes:
@@ -368,6 +417,9 @@ class _TableBudget:
         )
 
 
+#
+# Verifica que la respuesta conserve la evidencia validada y el contexto del turno.
+#
 def _check_turn(state, turn, reused):
     response = state.response
     validation = state.validation
@@ -387,6 +439,9 @@ def _check_turn(state, turn, reused):
         raise ConversationStorageError("El contexto estructurado cambió durante el turno.")
 
 
+#
+# Verifica que las fuentes y referencias de la respuesta correspondan a evidencia autorizada.
+#
 def _check_references(response, validation, allowed):
     if response.sources != validation.sources or response.validation_status != validation.status:
         raise ConversationStorageError("Las fuentes no corresponden a la respuesta validada.")
@@ -397,10 +452,16 @@ def _check_references(response, validation, allowed):
             raise ConversationStorageError("La respuesta contiene referencias no autorizadas.")
 
 
+#
+# Devuelve la identidad de una referencia: operación, herramienta y datasets.
+#
 def _reference_identity(reference):
     return reference.operation_id, reference.tool, reference.dataset_ids
 
 
+#
+# Crea la respuesta a almacenar sin resultados ni contexto completo de generación.
+#
 def _stored_response(response):
     generation = response.generation.model_dump(exclude={"context"})
     context = response.generation.context
@@ -411,6 +472,9 @@ def _stored_response(response):
     return StoredQueryResponse(**data, generation=StoredGeneration(**generation), results=[])
 
 
+#
+# Devuelve la evidencia autorizada de tipo tabla que respalda una referencia de resultado.
+#
 def _table_evidence(reference, allowed):
     evidence = allowed.get(reference.evidence_id)
     if (
@@ -423,6 +487,9 @@ def _table_evidence(reference, allowed):
     return evidence
 
 
+#
+# Devuelve el registro de ejecución completo de una tabla o falla si está truncada o incompleta.
+#
 def _complete_record(state, evidence):
     batch = state.execution if evidence.tool == "sql" else state.python_execution
     record = next(
@@ -440,6 +507,9 @@ def _complete_record(state, evidence):
     return record
 
 
+#
+# Construye la tabla almacenada con las filas conservadas y su estado de completitud.
+#
 def _stored_table(evidence, record, rows):
     complete = len(rows) == record.rows_returned
 
@@ -459,6 +529,9 @@ def _stored_table(evidence, record, rows):
     )
 
 
+#
+# Indica el modo de almacenamiento de una tabla: completa, vista previa o solo metadatos.
+#
 def _storage(complete, rows):
     if complete:
         return "inline"
@@ -466,8 +539,10 @@ def _storage(complete, rows):
     return "preview" if rows else "metadata_only"
 
 
+#
+# Verifica que cada gráfico de la respuesta coincida con la evidencia validada.
+#
 def _check_visualizations(state, validation, stored):
-    # Cada referencia de figura debe apuntar al objeto original autorizado.
     python = state.python_execution
     charts = {item.operation_id: item for item in python.visualizations} if python else {}
     chart_ids = {
@@ -480,6 +555,9 @@ def _check_visualizations(state, validation, stored):
             )
 
 
+#
+# Devuelve las operaciones del plan con un resumen de su ejecución para guardarlas en el historial.
+#
 def _stored_operations(state):
     records = {}
     for batch in (state.execution, state.python_execution):
@@ -500,6 +578,9 @@ def _stored_operations(state):
     return operations
 
 
+#
+# Devuelve la política de uso del historial y de reutilización de evidencia del turno.
+#
 def _analysis_context_policy(state, turn, reused):
     resolutions = state.planning.filter_value_resolutions if state.planning else []
 
@@ -513,6 +594,9 @@ def _analysis_context_policy(state, turn, reused):
     }
 
 
+#
+# Elimina las filas y exclusiones detalladas de las tablas, conservando sus metadatos.
+#
 def _drop_table_details(stored):
     for table in stored.results:
         if table.rows:
@@ -524,13 +608,15 @@ def _drop_table_details(stored):
         table.exclusions_complete = False
 
 
+#
+# Retira los gráficos del snapshot, guarda su resumen y añade una nota de aviso a la respuesta.
+#
 def _omit_visualizations(snapshot, stored, language):
     snapshot.omitted_visualizations = [
         chart.model_dump(mode="json", include=_OMITTED_CHART_FIELDS)
         for chart in stored.visualizations
     ]
     stored.visualizations = []
-    # Las tablas recortadas lo indican en su propia tarjeta; un gráfico omitido sólo tiene este aviso.
     note = (
         "Los gráficos no se guardaron en la conversación por su tamaño."
         if language == "es"
@@ -540,8 +626,10 @@ def _omit_visualizations(snapshot, stored, language):
     stored.answer = answer_text(stored.segments)
 
 
+#
+# Indica si la respuesta directa no corresponde al turno o arrastra resultados del flujo de datos.
+#
 def _differs_from_turn(state, turn, expected_type):
-    """La respuesta directa no es de este turno o arrastra resultados del flujo de datos."""
     response = state.response
     routing = state.routing
 
@@ -568,11 +656,17 @@ def _differs_from_turn(state, turn, expected_type):
     )
 
 
+#
+# Verifica que una respuesta general no contenga fuentes ni referencias.
+#
 def _check_without_references(response):
     if response.sources or response.operation_references or response.historical_message_ids:
         raise ConversationStorageError("Una respuesta general no puede inventar referencias.")
 
 
+#
+# Devuelve el dataset seleccionado que conserva la versión verificada de la fuente citada.
+#
 def _verified_dataset(selected, source):
     dataset = selected.get(source.dataset_id)
     if (

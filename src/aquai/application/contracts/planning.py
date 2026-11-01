@@ -10,12 +10,9 @@ from aquai.application.contracts.retrieval import (
 )
 
 PlanningStatus = Literal["plannable", "needs_clarification", "insufficient_coverage"]
-# "failed": el modelo no produjo un plan verificable tras reintentar; no es una pregunta al usuario.
 PlanningOutcome = Literal["plannable", "needs_clarification", "insufficient_coverage", "failed"]
 Identifier = Annotated[str, Field(pattern=r"^[a-z_][a-z0-9_]{0,62}$")]
-# Mayor cantidad de filas que un paso puede conservar; también acota la cantidad pedida por el usuario.
 MAX_ROW_LIMIT = 10000
-# Valores que admite un filtro («in» con a lo sumo 100 valores).
 MAX_FILTER_VALUES = 100
 _MEMBERSHIP = {"eq": "in", "ieq": "in", "ne": "not_in"}
 
@@ -63,16 +60,21 @@ class FilterSpec(PlanModel):
     ]
     values: list[str | int | float | bool] = Field(default_factory=list, max_length=MAX_FILTER_VALUES)
 
+    #
+    # Convierte una igualdad con varios valores en una pertenencia.
+    #
     @model_validator(mode="before")
     @classmethod
     def membership(cls, data):
-        """Una igualdad con varios valores sólo puede significar pertenencia: eq [a, b] es in [a, b]."""
         if not isinstance(data, dict) or len(data.get("values") or []) < 2:
             return data
 
         operator = _MEMBERSHIP.get(data.get("operator"))
         return {**data, "operator": operator} if operator else data
 
+    #
+    # Valida que la cantidad de valores corresponda al operador del filtro.
+    #
     @model_validator(mode="after")
     def valid_arity(self):
         count = len(self.values)
@@ -114,6 +116,9 @@ class CalculationSpec(PlanModel):
     quantile: float | None = Field(default=None, ge=0, le=1)
     ddof: Literal[0, 1] = 1
 
+    #
+    # Valida que los operandos, el cuantil y ddof correspondan a la función de cálculo.
+    #
     @model_validator(mode="after")
     def valid_arity(self):
         if (self.function == "quantile") != (self.quantile is not None):
@@ -121,7 +126,6 @@ class CalculationSpec(PlanModel):
                 "quantile requiere una probabilidad explícita entre 0 y 1, exclusiva de esa función."
             )
         if self.function != "stddev":
-            # ddof no interviene en otras funciones; se normaliza sin cambiar el cálculo.
             self.ddof = 1
         expected = 2 if self.function in {"difference", "ratio", "correlation"} else 1
         if self.function == "count" and not self.inputs:
@@ -276,6 +280,9 @@ class PlannerDecision(PlanModel):
     clarification_question: str | None = Field(default=None, max_length=1500)
     warnings: list[str] = Field(default_factory=list, max_length=50)
 
+    #
+    # Valida que el estado de la decisión sea coherente con sus datasets, pasos y avisos.
+    #
     @model_validator(mode="after")
     def coherent_status(self):
         if self.status == "plannable":
@@ -394,6 +401,9 @@ class RequestedPeriod(PlanModel):
     start: date | None = None
     end: date | None = None
 
+    #
+    # Valida que el período pedido tenga al menos un extremo.
+    #
     @model_validator(mode="after")
     def has_bound(self):
         if self.start is None and self.end is None:
@@ -410,8 +420,6 @@ class TemporalTextColumn(PlanModel):
     interpreted_values: int = Field(ge=0)
     uninterpreted_values: list[str] = Field(default_factory=list, max_length=10)
     precisions: list[str] = Field(default_factory=list)
-    # Valores distintos interpretados, para acotar un período pedido sin rangos sobre TEXT; complete indica que
-    # la consulta no los truncó. Nunca se envían al modelo.
     values: list[str] = Field(default_factory=list)
     complete: bool = False
 

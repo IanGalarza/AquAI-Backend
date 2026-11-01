@@ -4,6 +4,9 @@ from sqlalchemy.orm import registry, relationship
 from aquai.domain.models import MessageStatus
 
 
+#
+# Define la tabla catálogo MessageStatus y la mapea al modelo de dominio.
+#
 def configure(mapper_registry: registry) -> None:
     table = Table(
         "MessageStatus",

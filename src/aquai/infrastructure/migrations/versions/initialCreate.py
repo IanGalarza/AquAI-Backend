@@ -1,5 +1,3 @@
-"""Esquema inicial de fuentes, datasets y entidades de chat de AquAI."""
-
 import re
 
 import sqlalchemy as sa
@@ -12,8 +10,10 @@ branch_labels = None
 depends_on = None
 
 
+#
+# Crea el esquema inicial de conversaciones, mensajes, fuentes y datasets.
+#
 def upgrade() -> None:
-    """Crea el esquema consolidado; no interpreta ni transforma originales."""
     op.create_table(
         "Conversation",
         sa.Column("id", sa.UUID(), nullable=False),
@@ -203,8 +203,10 @@ def upgrade() -> None:
     )
 
 
+#
+# Elimina las tablas físicas de datasets y luego las tablas del esquema inicial.
+#
 def downgrade() -> None:
-    """Retira tablas físicas registradas y luego el catálogo según sus dependencias."""
     if not context.is_offline_mode():
         physical_tables = (
             op.get_bind().scalars(sa.text('SELECT "physicalTableName" FROM "Dataset"')).all()

@@ -35,6 +35,9 @@ _ERROR_STATUS_CODES = {
 }
 
 
+#
+# Crea un manejador que responde con el código HTTP dado y el mensaje del error.
+#
 def _error_handler(status_code: int) -> Callable[[Request, Exception], Awaitable[JSONResponse]]:
     async def handle(_request: Request, error: Exception) -> JSONResponse:
         return JSONResponse(status_code=status_code, content={"detail": str(error)})
@@ -42,6 +45,9 @@ def _error_handler(status_code: int) -> Callable[[Request, Exception], Awaitable
     return handle
 
 
+#
+# Registra en la aplicación los manejadores que traducen errores de dominio y de base de datos a HTTP.
+#
 def register_exception_handlers(app: FastAPI) -> None:
     for error_type, status_code in _ERROR_STATUS_CODES.items():
         app.add_exception_handler(error_type, _error_handler(status_code))

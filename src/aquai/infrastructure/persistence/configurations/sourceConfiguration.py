@@ -19,6 +19,9 @@ from aquai.infrastructure.persistence.configurations.common import (
 )
 
 
+#
+# Define la tabla Source con el archivo y su estado de procesamiento y la mapea.
+#
 def configure(mapper_registry: registry) -> None:
     table = Table(
         "Source",
