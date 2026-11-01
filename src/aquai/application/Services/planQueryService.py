@@ -1,12 +1,14 @@
 import asyncio
+import json
 import logging
 import re
-from dataclasses import dataclass
-from datetime import datetime, timezone
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from functools import partial
 from typing import NamedTuple
 
 from aquai.application.contracts.planning import (
+    MAX_FILTER_VALUES,
     ColumnRef,
     FilterSpec,
     GroupingSpec,
@@ -26,7 +28,10 @@ from aquai.application.interfaces.sources import SourceQueries
 from aquai.application.planning.context import (
     build_planning_context,
     chart_requested,
+    extreme_requested,
     latest_requested,
+    period_phrase,
+    requested_periods,
     requested_statistics,
     requested_thresholds,
 )
@@ -34,7 +39,10 @@ from aquai.application.planning.filterValues import resolve_filter_values
 from aquai.application.planning.followUp import (
     conserved_statistics,
     conserved_time_grain,
+    period_fields,
+    period_span_decision,
     previous_operations,
+    repeated_decision,
     requested_time_grain,
     reused_decision,
     stale_values,
@@ -47,14 +55,18 @@ from aquai.application.planning.limits import (
     requested_limit,
     result_limits,
 )
-from aquai.application.planning.temporalText import profile_temporal_text
+from aquai.application.planning.temporalText import profile_temporal_text, within_period
 from aquai.application.planning.validation import (
     applies_threshold,
+    filters_period,
+    period_columns,
+    period_matches,
     requested_dimensions,
     validate_operations,
     validate_requested_scope,
     validate_selections,
     validate_temporal_scope,
+    validate_unrequested_latest,
 )
 
 _logger = logging.getLogger(__name__)
@@ -62,8 +74,21 @@ _logger = logging.getLogger(__name__)
 _USER_DECISIONS = {"ambiguous_filter_value"}
 _MAX_ATTEMPTS = 2
 _CATEGORY_LENGTH = 80
+# Puestos que se publican al pedir un extremo («el valor máximo»): el extremo, sus empates y su contexto.
+_EXTREME_ROWS = 5
 # Una categoría omitida en group_by se busca primero entre los textos y después entre las fechas.
 _CATEGORY_PREFERENCE = ({"TEXT"}, {"DATE", "TIMESTAMP"})
+# Pasos y salidas que admite un plan (PlannableDecision).
+_MAX_PLAN_STEPS = 12
+# Cálculos que admiten texto: contar registros o valores distintos.
+_TEXT_CALCULATIONS = {"count", "count_distinct"}
+# Paso que el modelo llama como el campo output_steps para publicar otro.
+_PUBLICATION_STEP = re.compile(r"output_steps?(?:_[a-z0-9]+)?")
+# Un id copiado por período («read_1_p2») debe seguir siendo un identificador válido.
+_MAX_STEP_ID_LENGTH = 63
+# Valores distintos que se leen de una columna TEXT al perfilar períodos (distinct_text_values devuelve uno más).
+_DISTINCT_TEXT_LIMIT = 500
+_PERIOD_LITERAL = re.compile(r"(?:1[89]|2\d)\d{2}(?:-\d{1,2}(?:-\d{1,2}(?:[T ][\d:.]+)?)?)?")
 # Errores frecuentes del modelo y cómo corregirlos; el texto de la validación sólo describe el síntoma.
 _HINTS = {
     "resultado inexistente": "Cada paso expone sólo las salidas de su dependencia: para un valor por categoría, "
@@ -91,6 +116,7 @@ class _Requested(NamedTuple):
     """Lo que la consulta pide explícitamente y todo plan debe conservar."""
 
     thresholds: list
+    periods: list
     statistics: list
     dimensions: dict
     chart: bool
@@ -106,10 +132,18 @@ class _Requested(NamedTuple):
     grouping: str | None = None
     # Valores que filtraban el resultado citado y la consulta vigente reemplazó o quitó.
     stale: tuple = ()
+    # Columnas de las variables pedidas por dataset, según la evidencia de recuperación.
+    variables: dict | None = None
+    # Si la consulta, su historial o el resultado citado piden recencia; y si continúa un análisis sin ella.
+    latest_allowed: bool = True
+    follow_up: bool = False
+    # La consulta pide el extremo de una variable («el valor máximo»), no todos sus registros ordenados.
+    extreme: bool = False
 
 
 _UNRESTRICTED = _Requested(
     thresholds=[],
+    periods=[],
     statistics=[],
     dimensions={},
     chart=True,
@@ -127,6 +161,8 @@ class _Proposal:
     tokens: list
     verified: _VerifiedPlan | None = None
     error: Exception | None = None
+    # Motivo de cada intento rechazado, para la respuesta guardada y no sólo el log.
+    rejections: list[str] = field(default_factory=list)
 
 
 def _passthrough_origin(step, steps):
@@ -140,6 +176,50 @@ def _single_row(step, steps):
     """Un aggregate sin agrupar devuelve una única fila; sort y latest la conservan."""
     origin = _passthrough_origin(step, steps)
     return origin is not None and origin.operation == "aggregate" and not origin.group_by
+
+
+def _period_values(values) -> bool:
+    """Valores de filtro que nombran períodos: un año («2021», 2021) o una fecha ISO («2021-03», «2021-03-15»)."""
+    return bool(values) and all(_PERIOD_LITERAL.fullmatch(str(value).strip()) for value in values)
+
+
+def _period_filters(kind, sql_type, period, values) -> list[tuple[str, list]]:
+    """Filtros que acotan una columna a un período; un extremo None queda sin filtro. Una fecha TEXT se acota con sus
+    valores dentro del período, nunca con un rango de texto."""
+    start, end = period.start, period.end
+    if kind == "text":
+        return [("eq" if len(values) == 1 else "in", values)]
+    if kind == "year":
+        if start is not None and end is not None and start.year == end.year:
+            return [("eq", [start.year])]
+        return [*([("ge", [start.year])] if start else []), *([("le", [end.year])] if end else [])]
+    if sql_type == "TIMESTAMP":
+        following = end + timedelta(days=1) if end else None
+        return [
+            *([("ge", [f"{start.isoformat()}T00:00:00"])] if start else []),
+            *([("lt", [f"{following.isoformat()}T00:00:00"])] if following else []),
+        ]
+    return [*([("ge", [start.isoformat()])] if start else []), *([("le", [end.isoformat()])] if end else [])]
+
+
+def _renamed_step(step, renamed):
+    """Copia de un paso con otro id, que depende de las copias de sus pasos previos y cita sus resultados."""
+    data = _renamed_references(step.model_dump(mode="json"), renamed)
+    data["id"] = renamed[step.id]
+    data["depends_on"] = [renamed.get(key, key) for key in step.depends_on]
+    return type(step).model_validate_json(json.dumps(data))
+
+
+def _renamed_references(value, renamed):
+    if isinstance(value, list):
+        return [_renamed_references(item, renamed) for item in value]
+    if not isinstance(value, dict):
+        return value
+
+    copy = {key: _renamed_references(item, renamed) for key, item in value.items()}
+    if copy.get("kind") == "result" and copy.get("step_id") in renamed:
+        copy["step_id"] = renamed[copy["step_id"]]
+    return copy
 
 
 def _column_types(catalog):
@@ -166,10 +246,16 @@ class PlanQueryService:
         source_mentions=(),
         previous_analysis=None,
         conserved_mentions=(),
+        requested_period=None,
     ) -> PlanningResult:
         question = PlanningInput(question=question).question
         own = [item for item in data_mentions if item not in conserved_mentions]
         data_mentions = self._planning_mentions(data_mentions, retrieval, conserved_mentions)
+        dated_only = requested_period is not None
+        if dated_only:
+            # Se piden las fechas del resultado citado, no otro cálculo: ni su agrupación ni su estadística se
+            # exigen (las operaciones repetidas ya las conservan), tampoco al revalidar antes de ejecutar.
+            data_mentions = [item for item in data_mentions if item.kind != "dimension"]
         limits = requested_limit(data_mentions), conserved_limits(data_mentions, previous_analysis)
         if question != retrieval.question.strip():
             raise PlannerValidationError(
@@ -185,15 +271,23 @@ class PlanQueryService:
             require_latest
             or "latest" in previous
             or any(latest_requested(item) for item in request_history)
+            or dated_only
         )
-        catalog, excluded, periods = await self._temporal_scope(catalog, temporal, require_latest)
+        dates = requested_periods(data_mentions)
+        # Un período pedido también se acota con fechas guardadas como texto, si sus valores las nombran.
+        catalog, excluded, periods = await self._temporal_scope(
+            catalog, temporal or bool(dates), require_latest
+        )
         evidence = await self._with_categories(
             self._catalog_evidence(retrieval.evidence, catalog), catalog
         )
+        if dated_only:
+            evidence = [item.model_copy(update={"dimension_matches": {}}) for item in evidence]
 
         thresholds, asked_statistics = requested_thresholds(data_mentions), requested_statistics(asked)
         # Un seguimiento que no nombra otra estadística conserva la del resultado citado.
         statistics = asked_statistics or conserved_statistics(previous_analysis, asked)
+        statistics = [] if dated_only else statistics
         # Sólo la pregunta actual exige un gráfico; uno pedido antes se conserva sin exigirse.
         chart_required = chart_requested(asked)
         # Lo mismo con la agrupación temporal: otra dimensión pedida ahora la reemplaza.
@@ -211,6 +305,7 @@ class PlanQueryService:
             unmatched_values=retrieval.unmatched_values,
             source_mentions=source_mentions,
             thresholds=thresholds,
+            periods=dates,
             statistics=statistics,
             chart=chart_required,
             time_grain=grain,
@@ -229,12 +324,14 @@ class PlanQueryService:
             return self._over_budget(common)
 
         values = [item.text for item in data_mentions if item.kind == "value"]
-        asks_dimension = bool(retrieval.dimension_mentions) or any(
-            item.kind == "dimension" for item in data_mentions
+        asks_dimension = not dated_only and (
+            bool(retrieval.dimension_mentions)
+            or any(item.kind == "dimension" for item in data_mentions)
         )
         # Un gráfico pedido antes («graficalo») se conserva al cambiar sólo el sitio o la variable.
         requested = _Requested(
             thresholds=thresholds,
+            periods=dates,
             statistics=statistics,
             dimensions=requested_dimensions(context.evidence, catalog),
             chart=chart_required
@@ -247,6 +344,13 @@ class PlanQueryService:
             time_grain=grain,
             grouping=grain or (None if regrouped else conserved_time_grain(previous_analysis)),
             stale=tuple(stale_values(previous_analysis, data_mentions)),
+            variables={
+                item.dataset_id: {name for names in item.variable_matches.values() for name in names}
+                for item in evidence
+            },
+            latest_allowed=temporal,
+            follow_up=previous_analysis is not None,
+            extreme=extreme_requested(asked),
         )
         verify = partial(
             self._verify,
@@ -259,6 +363,14 @@ class PlanQueryService:
             limits=limits,
             requested=requested,
         )
+        if dated_only:
+            proposal = await self._period_proposal(previous_analysis, catalog, periods, verify)
+            if proposal is None:
+                return self._without_period(common, retrieval.warnings)
+            return self._planning_result(
+                proposal, retrieval.unmatched_values, context, excluded, periods
+            )
+
         reusable = chart_required and not (own or source_mentions or asked_statistics or grain)
         reused = reused_decision(previous_analysis, catalog, asked) if reusable else None
         proposal = await self._reuse(reused, verify) if reused else None
@@ -398,8 +510,47 @@ class PlanQueryService:
             return None
         return _Proposal(0, None, [None, None], verified=verified)
 
+    async def _period_proposal(self, analysis, catalog, periods, verify):
+        """«¿Y de qué año es?» no se planifica de nuevo: se repiten las operaciones del resultado citado si publican
+        fechas, o se leen la primera y la última fecha de sus registros. El modelo tendía a inventar otra consulta
+        (la medición más reciente) cuyas fechas no son las del resultado."""
+        repeated = repeated_decision(analysis, catalog)
+        proposal = await self._reuse(repeated, verify) if repeated else None
+        if self._dates_published(proposal, periods):
+            return proposal
+
+        spanned = period_span_decision(analysis, catalog)
+        return await self._reuse(spanned, verify) if spanned else None
+
+    @staticmethod
+    def _without_period(common, retrieval_warnings):
+        return PlanningResult(
+            **common,
+            status="insufficient_coverage",
+            llm_status=None,
+            reason="El resultado citado no publica fechas y sus datasets no tienen una única columna de fecha "
+            "con la que leer su período.",
+            missing_information=[
+                "Una columna de fecha que permita indicar el período del resultado anterior."
+            ],
+            warnings=list(retrieval_warnings),
+        )
+
+    @staticmethod
+    def _dates_published(proposal, periods):
+        if proposal is None:
+            return False
+
+        decision, _selected, operations, _issues, _resolutions = proposal.verified
+        steps = {step.id: step for step in operations}
+        return any(
+            period_fields(steps[key], steps, periods)
+            for key in decision.output_steps
+            if key in steps
+        )
+
     async def _propose(self, context, verify):
-        feedback, attempt, model, tokens = [], 0, None, [None, None]
+        feedback, attempt, model, tokens, rejections = [], 0, None, [None, None], []
         while True:
             attempt += 1
             if feedback:
@@ -413,14 +564,15 @@ class PlanQueryService:
             except (LLMProviderError, PlannerValidationError) as error:
                 context.sent_to_model = True
                 _logger.warning("Planner intento %s rechazado: %s", attempt, error)
+                rejections.append(f"intento {attempt}: {error}")
                 if attempt < _MAX_ATTEMPTS:
                     feedback = self._rejection_feedback(error)
                     continue
-                return _Proposal(attempt, model, tokens, error=error)
+                return _Proposal(attempt, model, tokens, error=error, rejections=rejections)
 
             defects = self._plan_defects(verified.issues)
             if not defects or attempt >= _MAX_ATTEMPTS:
-                return _Proposal(attempt, model, tokens, verified=verified)
+                return _Proposal(attempt, model, tokens, verified=verified, rejections=rejections)
 
             _logger.warning(
                 "Planner intento %s con defectos: %s",
@@ -428,6 +580,7 @@ class PlanQueryService:
                 [issue.message for issue in defects],
             )
             feedback = [issue.message for issue in defects]
+            rejections.append(f"intento {attempt}: {' '.join(feedback)}")
 
     @staticmethod
     def _rejection_feedback(error):
@@ -462,7 +615,8 @@ class PlanQueryService:
             llm_status=None,
             attempts=attempt,
             model=proposal.model,
-            reason=f"El modelo no produjo un plan verificable en {attempt} intentos: {error}",
+            reason=f"El modelo no produjo un plan verificable en {attempt} intentos: "
+            + " | ".join(proposal.rejections or [str(error)]),
             missing_information=[],
             warnings=list(retrieval_warnings),
         )
@@ -478,15 +632,17 @@ class PlanQueryService:
         status = self._final_status(defects, decisions, decision)
 
         absent = self._absent_values(issues, defects, unmatched_values)
-        if absent:
+        undated = self._undated_periods(issues, defects, selected, context, periods)
+        if absent or undated:
             status, defects = "insufficient_coverage", []
-            decision = decision.model_copy(
-                update={
-                    "missing_information": [
-                        f"No hay registros de {value} en los datos consultados." for value in absent
-                    ]
-                }
-            )
+            missing = [
+                *(f"No hay registros de {value} en los datos consultados." for value in absent),
+                *(
+                    f"Los datos consultados no tienen fechas que permitan acotarlos {period_phrase(period)}."
+                    for period in undated
+                ),
+            ]
+            decision = decision.model_copy(update={"missing_information": missing})
 
         warnings = self._result_warnings(excluded, periods, operations, decision, selected, issues)
         reason = self._result_reason(defects, decisions, status, selected, operations)
@@ -539,6 +695,20 @@ class PlanQueryService:
         ):
             return []
         return unmatched_values
+
+    @staticmethod
+    def _undated_periods(issues, defects, selected, context, text_periods):
+        """Períodos pedidos que ningún dataset elegido puede acotar porque no tiene fechas ni años, si son lo único
+        que impidió el plan: falta información, no es un defecto del modelo."""
+        blocking = {issue.code for issue in issues if issue.severity == "clarification"}
+        if (
+            not defects
+            or blocking != {"missing_requested_period"}
+            or period_columns(selected, text_periods)
+        ):
+            return []
+
+        return list(context.evidence.get("requested_periods", []))
 
     @staticmethod
     def _result_warnings(excluded, periods, operations, decision, selected, issues):
@@ -640,8 +810,16 @@ class PlanQueryService:
                     categories=requested.categories,
                     chart=requested.chart_required,
                     time_grain=requested.time_grain,
+                    periods=requested.periods,
+                    dated_columns=period_columns(selected, periods),
                 )
             )
+            if not requested.latest_allowed:
+                issues.extend(
+                    validate_unrequested_latest(
+                        operations, decision.output_steps, follow_up=requested.follow_up
+                    )
+                )
 
         issues.extend(await self._catalog_changes(selected, catalog))
         return _VerifiedPlan(decision, selected, operations, issues, resolutions)
@@ -652,19 +830,27 @@ class PlanQueryService:
         decision = PlanQueryService._merged_selections(decision)
         decision = PlanQueryService._read_selections(decision, catalog)
         decision = without_stale_filters(decision, requested.stale)
+        # Antes de exigir ids únicos: el modelo repite pasos «output_steps», uno por rama, sólo para publicar.
+        decision = PlanQueryService._publication_steps(decision)
         decision = PlanQueryService._dependency_order(decision)
         decision = PlanQueryService._unrequested_charts(decision, requested.chart)
-        decision = PlanQueryService._publication_steps(decision)
         decision = PlanQueryService._single_row_republications(decision, {"latest"})
         decision = PlanQueryService._unpublished_branches(decision)
+        decision = PlanQueryService._parallel_branches(decision, requested.variables)
+        decision = PlanQueryService._text_measurement_branches(decision, catalog, requested.variables)
         decision = PlanQueryService._result_references(decision)
         decision = PlanQueryService._missing_groupings(decision, catalog)
         decision = PlanQueryService._omitted_categories(decision, catalog, requested)
         decision = with_time_grain(decision, requested.grouping, _column_types(catalog))
+        decision = PlanQueryService._undated_groupings(decision, catalog, requested.time_grain)
         decision = PlanQueryService._omitted_thresholds(decision, catalog, requested.thresholds)
+        decision = PlanQueryService._omitted_periods(decision, catalog, requested.periods, periods)
         if not requested.several_rows:
             decision = PlanQueryService._single_row_republications(decision, {"sort"})
         decision = PlanQueryService._extremes_as_sort(decision, catalog)
+        if requested.extreme:
+            decision = PlanQueryService._extreme_rankings(decision, catalog)
+        decision = PlanQueryService._measured_latest(decision, requested.variables)
         return PlanQueryService._latest_in_python(decision, periods)
 
     async def _catalog_changes(self, selected, catalog):
@@ -775,6 +961,9 @@ class PlanQueryService:
             kept = [name for name in selection.columns if name in existing or name in used]
             columns = list(dict.fromkeys([*kept, *(name for name in used if name in existing)]))
             selection.columns = columns or selection.columns
+        # Un dataset que ningún read lee no aporta nada al plan; la respuesta informa los que no se analizaron.
+        if read:
+            changed.datasets = [item for item in changed.datasets if item.dataset_id in read]
         return changed if changed != decision else decision
 
     @staticmethod
@@ -842,6 +1031,119 @@ class PlanQueryService:
         if not forgotten:
             return decision
         return decision.model_copy(update={"output_steps": [*decision.output_steps, *forgotten]})
+
+    @staticmethod
+    def _parallel_branches(decision, variables):
+        """Una rama que calcula lo mismo que una salida publicada, sobre otro dataset y con una variable pedida, y quedó
+        fuera de output_steps es una salida olvidada («aggregate_2» junto a «aggregate_1»): se publica, y las
+        reparaciones siguientes la acotan como a las demás. No se publica si sus operaciones difieren, si lee un
+        dataset ya publicado o si no mide ninguna variable pedida."""
+        if decision.status != "plannable":
+            return decision
+
+        steps = {step.id: step for step in decision.steps}
+        consumed = {key for step in decision.steps for key in step.depends_on}
+        chains = [
+            PlanQueryService._published_chain(steps.get(key), steps) for key in decision.output_steps
+        ]
+        shapes = {PlanQueryService._parallel_shape(chain) for chain in chains if chain}
+        read = {
+            chain[-1].columns[0].dataset_id
+            for chain in chains
+            if chain and chain[-1].operation == "read" and chain[-1].columns
+        }
+        forgotten = []
+        for step in decision.steps:
+            if step.id in consumed or step.id in decision.output_steps:
+                continue
+            chain = PlanQueryService._published_chain(step, steps)
+            source = chain[-1] if chain[-1].operation == "read" and chain[-1].columns else None
+            dataset_id = source.columns[0].dataset_id if source else None
+            measured = (variables or {}).get(dataset_id, set())
+            if (
+                source is None
+                or dataset_id in read
+                or PlanQueryService._parallel_shape(chain) not in shapes
+                or not measured & {ref.column for ref in source.columns}
+            ):
+                continue
+            forgotten.append(step.id)
+            read.add(dataset_id)
+
+        if not forgotten or len(decision.output_steps) + len(forgotten) > _MAX_PLAN_STEPS:
+            return decision
+        return decision.model_copy(update={"output_steps": [*decision.output_steps, *forgotten]})
+
+    @staticmethod
+    def _text_measurement_branches(decision, catalog, variables):
+        """Una rama que calcula u ordena una medición guardada como texto sin representación numérica no puede
+        responder (un promedio de «N-NO3» con valores como «<0,001»): se quita si quedan otras ramas, y la respuesta
+        explica por qué ese archivo no se incluyó."""
+        if decision.status != "plannable":
+            return decision
+
+        textual = {
+            (dataset.dataset_id, column.sql_name)
+            for dataset in catalog
+            for column in dataset.columns_metadata
+            if column.sql_type == "TEXT"
+            and not column.numeric_eligible
+            and column.sql_name in (variables or {}).get(dataset.dataset_id, set())
+        }
+        steps = {step.id: step for step in decision.steps}
+        blocked = []
+        for key in decision.output_steps:
+            chain = PlanQueryService._published_chain(steps.get(key), steps)
+            read = chain[-1] if chain and chain[-1].operation == "read" and chain[-1].columns else None
+            if read is None:
+                continue
+            dataset_id = read.columns[0].dataset_id
+            if any((dataset_id, name) in textual for name in PlanQueryService._computed_fields(chain)):
+                blocked.append(key)
+
+        if not blocked or len(blocked) == len(decision.output_steps):
+            return decision
+        return PlanQueryService._without_outputs(decision.model_copy(deep=True), blocked)
+
+    @staticmethod
+    def _computed_fields(chain):
+        """Campos que la rama usa como números: entradas de cálculos que no son conteos y criterios de orden."""
+        refs = [
+            ref
+            for step in chain
+            for calculation in step.calculations
+            if calculation.function not in _TEXT_CALCULATIONS
+            for ref in calculation.inputs
+        ]
+        refs += [item.field for step in chain if step.operation == "sort" for item in step.order_by]
+        return {ref.field if isinstance(ref, ResultRef) else ref.column for ref in refs}
+
+    @staticmethod
+    def _parallel_shape(chain):
+        """Operaciones y valores filtrados de una rama: otra que filtre otro sitio no la duplica sobre otro dataset."""
+        values = sorted(
+            {
+                str(value).casefold()
+                for step in chain
+                for predicate in step.filters
+                if predicate.operator in {"eq", "ieq", "in"}
+                for value in predicate.values
+                if isinstance(value, str) and not _PERIOD_LITERAL.fullmatch(value.strip())
+            }
+        )
+        return PlanQueryService._branch_shape(chain), tuple(values)
+
+    @staticmethod
+    def _branch_shape(chain):
+        """Operaciones de una rama sin sus filtros ni nombres de columnas: cálculos y agrupaciones temporales."""
+        return tuple(
+            (
+                step.operation,
+                tuple(sorted(item.function for item in step.calculations)),
+                tuple(item.time_grain for item in step.group_by),
+            )
+            for step in chain
+        )
 
     @staticmethod
     def _ancestors(step, steps):
@@ -1050,6 +1352,264 @@ class PlanQueryService:
         return changed if modified else decision
 
     @staticmethod
+    def _omitted_periods(decision, catalog, requested, text_periods):
+        """«Durante 2021» acota la fecha. Cada rama se acota exactamente al período pedido con la única columna de
+        fecha de su dataset; sin ella, con su único año numérico si el período abarca años enteros, o con su única
+        fecha guardada como texto, eligiendo los valores que caen dentro del período («3/2013», nunca
+        «12/2012-01/2013» para 2013). Los filtros de período del modelo se reemplazan: suele escribirlos sin una fecha
+        ISO o sobre otra columna («fecha = 2021»). Un extremo abierto («desde 2020») sólo acota ese lado.
+
+        Con varios períodos («2019 y 2021») una rama que ya acota exactamente uno se conserva; las demás se copian una
+        vez por cada período que ninguna rama equivalente responde.
+
+        Una rama cuyo dataset no tiene con qué acotar el período no puede responder por él: se quita si quedan otras
+        ramas, y la respuesta informa que ese archivo no se incluyó."""
+        if not requested or decision.status != "plannable":
+            return decision
+
+        dated, types = period_columns(catalog, text_periods), _column_types(catalog)
+        texts = {(item.dataset_id, item.column): item for item in text_periods}
+        keys = {*texts, *dated}
+        changed = decision.model_copy(deep=True)
+        steps = {step.id: step for step in changed.steps}
+        undated, kept, copied = [], [], []
+        for key in changed.output_steps:
+            chain = PlanQueryService._published_chain(steps.get(key), steps)
+            read = chain[-1] if chain and chain[-1].operation == "read" else None
+            if read is None:
+                continue
+
+            dataset_id = read.columns[0].dataset_id
+            targets = [
+                PlanQueryService._period_target(dataset_id, dated, period, texts)
+                for period in requested
+            ]
+            if None in targets:
+                undated.append(key)
+            elif len(requested) > 1:
+                covered = PlanQueryService._covered_period(chain, dated, requested)
+                if covered is None:
+                    copied.append((key, chain, targets))
+                else:
+                    kept.append((chain, targets, covered))
+            else:
+                PlanQueryService._without_period_filters(changed, chain, keys, types)
+                PlanQueryService._bounded_read(changed, read, targets[0], requested[0], types)
+
+        if len(requested) > 1:
+            changed = PlanQueryService._period_copies(changed, copied, kept, requested, keys, types)
+            if changed is None:
+                return decision
+        if undated and len(undated) < len(changed.output_steps):
+            return PlanQueryService._without_outputs(changed, undated)
+        return changed if changed != decision else decision
+
+    @staticmethod
+    def _covered_period(chain, dated, requested):
+        """Índice del único período pedido que la rama ya acota exactamente; None si no acota ninguno o varios."""
+        applied = filters_period([predicate for step in chain for predicate in step.filters], dated)
+        matched = [index for index, period in enumerate(requested) if period_matches(applied, period)]
+        return matched[0] if len(matched) == 1 else None
+
+    @staticmethod
+    def _period_copies(decision, copied, kept, periods, keys, types):
+        """Una salida por período pedido. Una rama que ya acota uno se conserva; para cada período que ninguna rama
+        equivalente responde, una de ellas se copia (ids «_p1», «_p2») y la copia se acota a ese período. Ramas iguales
+        se copian una sola vez y los pasos que comparten (un read con dos cálculos, un gráfico y su agregado),
+        también. Las ramas sin período propio se quitan. None si el plan resultante excede lo que admite un plan."""
+        covered, templates = {}, {}
+        for _key, chain, targets in copied:
+            templates.setdefault(PlanQueryService._branch_signature(chain, keys, types), (chain, targets))
+        for chain, targets, index in kept:
+            signature = PlanQueryService._branch_signature(chain, keys, types)
+            covered.setdefault(signature, set()).add(index)
+            templates.setdefault(signature, (chain, targets))
+
+        branches = [
+            (chain, targets, missing)
+            for signature, (chain, targets) in templates.items()
+            if (missing := [index for index in range(len(periods)) if index not in covered.get(signature, set())])
+        ]
+        if not branches and not copied:
+            return decision
+
+        order = {step.id: position for position, step in enumerate(decision.steps)}
+        renamed, bounded = {}, set()
+        for index in range(len(periods)):
+            needed = [chain for chain, _, missing in branches if index in missing]
+            union = sorted({step.id: step for chain in needed for step in chain}.values(), key=lambda s: order[s.id])
+            renamed[index] = {step.id: f"{step.id}_p{index + 1}" for step in union}
+            copies = {step.id: _renamed_step(step, renamed[index]) for step in union}
+            decision.steps.extend(copies.values())
+            # Primero se quitan los filtros de período de todas las copias: un read compartido se acota una sola vez.
+            chains = [
+                ([copies[step.id] for step in chain], targets[index])
+                for chain, targets, missing in branches
+                if index in missing
+            ]
+            for chain, _target in chains:
+                PlanQueryService._without_period_filters(decision, chain, keys, types)
+            for chain, target in chains:
+                if chain[-1].id not in bounded:
+                    PlanQueryService._bounded_read(decision, chain[-1], target, periods[index], types)
+                    bounded.add(chain[-1].id)
+
+        copied_keys = {key for key, _, _ in copied}
+        published = [
+            renamed[index][chain[0].id] for chain, _, missing in branches for index in missing
+        ]
+        decision.output_steps = [
+            *(key for key in decision.output_steps if key not in copied_keys),
+            *published,
+        ]
+        changed = PlanQueryService._without_outputs(decision, [])
+        too_large = (
+            len(changed.steps) > _MAX_PLAN_STEPS
+            or len(changed.output_steps) > _MAX_PLAN_STEPS
+            or any(len(step.id) > _MAX_STEP_ID_LENGTH for step in changed.steps)
+        )
+        return None if too_large else changed
+
+    @staticmethod
+    def _branch_signature(chain, keys, types):
+        """Una rama sin sus filtros de período: dataset, operaciones y los demás filtros."""
+        names = PlanQueryService._period_names(chain, keys)
+        scope = sorted(
+            (repr(predicate.field), predicate.operator, repr(predicate.values))
+            for step in chain
+            for predicate in step.filters
+            if not PlanQueryService._period_filter(predicate, keys, names, types)
+        )
+        return chain[-1].columns[0].dataset_id, PlanQueryService._branch_shape(chain), tuple(scope)
+
+    @staticmethod
+    def _without_period_filters(decision, chain, periods, types):
+        """Quita los filtros con que la rama acota su período: los de una columna de fecha, año o período TEXT o de una
+        fecha agrupada, y los que comparan otra columna TEXT o inexistente con años o fechas. Un umbral sobre una
+        medición no se toca. Una columna inexistente que sólo servía a esos filtros deja de leerse."""
+        read = chain[-1]
+        names = PlanQueryService._period_names(chain, periods)
+        removed = set()
+        for step in chain:
+            kept = []
+            for predicate in step.filters:
+                if PlanQueryService._period_filter(predicate, periods, names, types):
+                    if isinstance(predicate.field, ColumnRef):
+                        removed.add(predicate.field.column)
+                    continue
+                kept.append(predicate)
+            step.filters = kept
+
+        invented = {name for name in removed if (read.columns[0].dataset_id, name) not in types}
+        read.columns = [ref for ref in read.columns if ref.column not in invented] or read.columns
+        for selection in decision.datasets:
+            if selection.dataset_id == read.columns[0].dataset_id:
+                selection.columns = [name for name in selection.columns if name not in invented]
+
+    @staticmethod
+    def _period_names(chain, periods):
+        """Nombres con que los pasos posteriores citan una fecha, un año o una fecha agrupada."""
+        return {column for _, column in periods} | {
+            item.output_name for step in chain for item in step.group_by if item.time_grain != "raw"
+        }
+
+    @staticmethod
+    def _period_filter(predicate, periods, names, types):
+        """El filtro acota el período: una columna de fecha, año o período TEXT, o años o fechas comparados con otra
+        columna TEXT o inexistente. Un umbral sobre una medición no lo es."""
+        ref = predicate.field
+        if not isinstance(ref, ColumnRef):
+            return ref.field in names
+
+        key = (ref.dataset_id, ref.column)
+        return key in periods or (types.get(key) in {None, "TEXT"} and _period_values(predicate.values))
+
+    @staticmethod
+    def _undated_groupings(decision, catalog, grain):
+        """«Promedio por mes»: una rama que calcula sobre un dataset sin columna DATE/TIMESTAMP no puede agruparse por
+        ese período. Se quita si quedan otras ramas, y la respuesta informa que ese archivo no se incluyó."""
+        if grain is None or decision.status != "plannable":
+            return decision
+
+        dated = {owner for (owner, _), kind in period_columns(catalog).items() if kind == "date"}
+        steps = {step.id: step for step in decision.steps}
+        undated = []
+        for key in decision.output_steps:
+            chain = PlanQueryService._published_chain(steps.get(key), steps)
+            read = chain[-1] if chain and chain[-1].operation == "read" else None
+            calculates = any(step.operation == "aggregate" for step in chain)
+            if read is not None and calculates and read.columns[0].dataset_id not in dated:
+                undated.append(key)
+
+        if not undated or len(undated) == len(decision.output_steps):
+            return decision
+        return PlanQueryService._without_outputs(decision.model_copy(deep=True), undated)
+
+    @staticmethod
+    def _period_target(dataset_id, dated, period, texts):
+        """Columna con que el dataset acota el período: su única fecha; si no, su único año (sólo años enteros); si no,
+        su única fecha TEXT con los valores que caen dentro (al menos uno y no más de los que admite un filtro)."""
+        columns = {}
+        for (owner, column), kind in dated.items():
+            if owner == dataset_id:
+                columns.setdefault("text" if kind.startswith("text") else kind, []).append(column)
+
+        whole_years = (period.start is None or (period.start.month, period.start.day) == (1, 1)) and (
+            period.end is None or (period.end.month, period.end.day) == (12, 31)
+        )
+        if "date" in columns:
+            return (columns["date"][0], "date", None) if len(columns["date"]) == 1 else None
+        if len(columns.get("year", [])) == 1 and whole_years:
+            return columns["year"][0], "year", None
+        if len(columns.get("text", [])) != 1:
+            return None
+
+        text = texts[(dataset_id, columns["text"][0])]
+        values = [
+            value
+            for value in text.values
+            if within_period(value, text.day_first, period.start, period.end)
+        ]
+        return (text.column, "text", values) if 0 < len(values) <= MAX_FILTER_VALUES else None
+
+    @staticmethod
+    def _bounded_read(decision, read, target, period, types):
+        column, kind, values = target
+        dataset_id = read.columns[0].dataset_id
+        ref = ColumnRef(kind="column", dataset_id=dataset_id, column=column)
+        if ref not in read.columns:
+            read.columns.append(ref)
+        for selection in decision.datasets:
+            if selection.dataset_id == dataset_id and column not in selection.columns:
+                selection.columns.append(column)
+
+        bounds = _period_filters(kind, types.get((dataset_id, column)), period, values)
+        read.filters += [
+            FilterSpec(field=ref, operator=operator, values=items) for operator, items in bounds
+        ]
+
+    @staticmethod
+    def _without_outputs(decision, removed):
+        """Quita salidas y los pasos y datasets que sólo ellas usaban."""
+        steps = {step.id: step for step in decision.steps}
+        outputs = [key for key in decision.output_steps if key not in removed]
+        used = {
+            key
+            for output in outputs
+            for key in {output, *PlanQueryService._ancestors(steps[output], steps)}
+        }
+        decision.steps = [step for step in decision.steps if step.id in used]
+        read = {
+            ref.dataset_id
+            for step in decision.steps
+            if step.operation == "read"
+            for ref in step.columns
+        }
+        decision.datasets = [item for item in decision.datasets if item.dataset_id in read]
+        decision.output_steps = outputs
+        return decision
+
+    @staticmethod
     def _published_chain(step, steps):
         """Pasos que producen una salida, desde ella hasta su read; un gráfico publica su entrada."""
         chain = []
@@ -1119,6 +1679,57 @@ class PlanQueryService:
         return changed if modified else decision
 
     @staticmethod
+    def _extreme_rankings(decision, catalog):
+        """«El valor máximo de Cond» se responde con el extremo y sus empates: un sort publicado de los registros por
+        una variable medida, sin límite, publicaría todos (y una tabla extensa no se transfiere completa). Se
+        limita a los primeros puestos conservando empates, como indica la gramática del plan; una cantidad pedida
+        lo reemplaza después."""
+        if decision.status != "plannable":
+            return decision
+
+        types = _column_types(catalog)
+        steps = {step.id: step for step in decision.steps}
+        changed, modified = decision.model_copy(deep=True), False
+        targets = {
+            PlanQueryService._ranked_records(steps.get(key), steps, types)
+            for key in decision.output_steps
+        } - {None}
+        for step in changed.steps:
+            if step.id in targets:
+                step.limit = _EXTREME_ROWS
+                modified = True
+
+        # Los registros leídos que alimentan otra salida son su entrada, no un resultado pedido.
+        inputs = {
+            key
+            for output in decision.output_steps
+            if output in steps
+            for key in PlanQueryService._ancestors(steps[output], steps)
+        }
+        outputs = [
+            key
+            for key in changed.output_steps
+            if not (key in inputs and key in steps and steps[key].operation == "read")
+        ]
+        if outputs and outputs != changed.output_steps:
+            changed.output_steps, modified = outputs, True
+        return changed if modified else decision
+
+    @staticmethod
+    def _ranked_records(step, steps, types):
+        """Id del sort sin límite que ordena registros leídos por una variable medida y publica (o grafica)."""
+        if step is not None and step.operation == "visualize" and step.depends_on:
+            step = steps.get(step.depends_on[0])
+        if step is None or step.operation != "sort" or step.limit is not None:
+            return None
+
+        read = _passthrough_origin(steps.get(step.depends_on[0]), steps)
+        field = step.order_by[0].field
+        name = field.field if isinstance(field, ResultRef) else field.column
+        measured = read is not None and read.operation == "read"
+        return step.id if measured and PlanQueryService._is_measured(name, read, types) else None
+
+    @staticmethod
     def _extreme_ordering(step, parent, read, types):
         if PlanQueryService._is_measured(step.order_by[0].field.field, read, types):
             return OrderingSpec(field=step.order_by[0].field, direction="desc")
@@ -1178,18 +1789,44 @@ class PlanQueryService:
             return decision
 
         used = {key for step in decision.steps for key in step.depends_on}
-        replace = {
-            step.id: source
-            for step in decision.steps
-            if (source := PlanQueryService._republished_step(step, used)) is not None
-        }
+        # Un mismo id repetido («output_steps» por cada rama) publica cada una de sus dependencias.
+        replace = {}
+        for step in decision.steps:
+            source = PlanQueryService._republished_step(step, used)
+            if source is not None:
+                replace.setdefault(step.id, []).append(source)
         if not replace:
             return decision
 
         changed = decision.model_copy(deep=True)
         changed.steps = [step for step in changed.steps if step.id not in replace]
+        # Un paso «output_steps» que la lista no nombra también publica su dependencia, si ninguna salida ya la usa:
+        # es la salida que el modelo quiso declarar (un read que alimenta un cálculo publicado no lo es).
+        steps = {step.id: step for step in changed.steps}
+        feeding = {
+            key
+            for output in changed.output_steps
+            if output in steps
+            for key in PlanQueryService._ancestors(steps[output], steps)
+        }
+        unlisted = [
+            source
+            for key, sources in replace.items()
+            if key not in decision.output_steps and _PUBLICATION_STEP.fullmatch(key)
+            for source in sources
+            if source not in feeding
+        ]
         changed.output_steps = list(
-            dict.fromkeys(replace.get(key, key) for key in changed.output_steps)
+            dict.fromkeys(
+                [
+                    *(
+                        published
+                        for key in changed.output_steps
+                        for published in replace.get(key, [key])
+                    ),
+                    *unlisted,
+                ]
+            )
         )
         return changed
 
@@ -1251,7 +1888,7 @@ class PlanQueryService:
             return None
 
         republishes = (
-            re.fullmatch(r"output_steps?(?:_[a-z0-9]+)?", step.id)
+            _PUBLICATION_STEP.fullmatch(step.id)
             and len(step.depends_on) == 1
             and step.operation in {"aggregate", "calculate", "sort"}
         )
@@ -1323,6 +1960,36 @@ class PlanQueryService:
         return changed
 
     @staticmethod
+    def _measured_latest(decision, variables):
+        """«La última medición de pH» es la fecha más reciente con pH registrado: si el read de un latest lee una
+        única columna de la variable pedida sin acotarla, se excluyen sus nulos antes de elegir la fecha.
+
+        Con varias variables leídas no se elige cuál exigir."""
+        if decision.status != "plannable" or not variables:
+            return decision
+
+        changed = decision.model_copy(deep=True)
+        steps = {step.id: step for step in changed.steps}
+        modified = False
+        for step in changed.steps:
+            read = PlanQueryService._read_ancestor(step, steps) if step.operation == "latest" else None
+            if read is None:
+                continue
+
+            measured = [
+                ref for ref in read.columns if ref.column in variables.get(ref.dataset_id, set())
+            ]
+            constrained = {
+                item.field.column for item in read.filters if isinstance(item.field, ColumnRef)
+            }
+            if len(measured) != 1 or measured[0].column in constrained:
+                continue
+
+            read.filters.append(FilterSpec(field=measured[0], operator="is_not_null", values=[]))
+            modified = True
+        return changed if modified else decision
+
+    @staticmethod
     def _read_ancestor(step, steps):
         parent = steps.get(step.depends_on[0]) if step.depends_on else None
         while parent is not None and parent.operation != "read":
@@ -1347,6 +2014,11 @@ class PlanQueryService:
             profile = profile_temporal_text(items)
             if profile:
                 found.append(
-                    TemporalTextColumn(dataset_id=dataset.dataset_id, column=name, **profile)
+                    TemporalTextColumn(
+                        dataset_id=dataset.dataset_id,
+                        column=name,
+                        complete=len(items) <= _DISTINCT_TEXT_LIMIT,
+                        **profile,
+                    )
                 )
         return found

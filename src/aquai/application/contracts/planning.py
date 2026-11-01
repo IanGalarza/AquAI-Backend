@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import date, datetime
 from typing import Annotated, Literal
 from uuid import UUID
 
@@ -15,6 +15,8 @@ PlanningOutcome = Literal["plannable", "needs_clarification", "insufficient_cove
 Identifier = Annotated[str, Field(pattern=r"^[a-z_][a-z0-9_]{0,62}$")]
 # Mayor cantidad de filas que un paso puede conservar; también acota la cantidad pedida por el usuario.
 MAX_ROW_LIMIT = 10000
+# Valores que admite un filtro («in» con a lo sumo 100 valores).
+MAX_FILTER_VALUES = 100
 _MEMBERSHIP = {"eq": "in", "ieq": "in", "ne": "not_in"}
 
 
@@ -59,7 +61,7 @@ class FilterSpec(PlanModel):
     operator: Literal[
         "eq", "ieq", "ne", "lt", "le", "gt", "ge", "in", "not_in", "is_null", "is_not_null"
     ]
-    values: list[str | int | float | bool] = Field(default_factory=list, max_length=100)
+    values: list[str | int | float | bool] = Field(default_factory=list, max_length=MAX_FILTER_VALUES)
 
     @model_validator(mode="before")
     @classmethod
@@ -384,6 +386,21 @@ class RequestedThreshold(PlanModel):
     compares_statistic: bool
 
 
+class RequestedPeriod(PlanModel):
+    """Período pedido («durante 2021»): cada salida acota una fecha o un año exactamente a ese intervalo. Un extremo
+    ausente queda abierto: «desde 2020» no tiene fin y «antes de 2021», inicio."""
+
+    text: str
+    start: date | None = None
+    end: date | None = None
+
+    @model_validator(mode="after")
+    def has_bound(self):
+        if self.start is None and self.end is None:
+            raise ValueError("Un período pedido necesita al menos un extremo.")
+        return self
+
+
 class TemporalTextColumn(PlanModel):
     """Columna TEXT cuyos valores distintos nombran períodos explícitos verificados."""
 
@@ -393,6 +410,10 @@ class TemporalTextColumn(PlanModel):
     interpreted_values: int = Field(ge=0)
     uninterpreted_values: list[str] = Field(default_factory=list, max_length=10)
     precisions: list[str] = Field(default_factory=list)
+    # Valores distintos interpretados, para acotar un período pedido sin rangos sobre TEXT; complete indica que
+    # la consulta no los truncó. Nunca se envían al modelo.
+    values: list[str] = Field(default_factory=list)
+    complete: bool = False
 
 
 class PlanningResult(BaseModel):

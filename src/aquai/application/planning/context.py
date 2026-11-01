@@ -2,13 +2,28 @@ import json
 import re
 from hashlib import sha256
 
-from aquai.application.contracts.planning import PlanningContextRecord, RequestedThreshold
+from aquai.application.contracts.planning import (
+    PlanningContextRecord,
+    RequestedPeriod,
+    RequestedThreshold,
+)
 from aquai.application.contracts.retrieval import VerifiedDataset
-from aquai.application.matching import contains_phrase, numeric_comparisons
+from aquai.application.matching import (
+    contains_any_phrase,
+    contains_phrase,
+    numeric_comparisons,
+    period_ranges,
+    period_text,
+)
 from aquai.application.Rules.vocabulary import (
     CHART_WORDS,
+    EXTREME_CUES,
+    FULL_ORDER_CUES,
+    NUMBER_WORDS,
     OBSERVATION_NOUNS_EN,
     OBSERVATION_NOUNS_ES,
+    RECENT_INTERVAL_NOUNS,
+    RECENT_WORDS,
     REQUESTED_STATISTICS,
 )
 
@@ -33,17 +48,29 @@ _MAX_DESCRIPTION_LENGTH = 160
 _MAX_MEANING_LENGTH = 100
 
 
-def latest_requested(question: str) -> bool:
-    observation = OBSERVATION_NOUNS_ES
-    english = OBSERVATION_NOUNS_EN
+_NUMBER_WORDS = "|".join(word for words in NUMBER_WORDS.values() for word in words)
+_LATEST = re.compile(
+    rf"\b(?:(?:[uú]ltim[oa]s?|m[aá]s\s+recientes?)\s+{OBSERVATION_NOUNS_ES}|"
+    rf"(?:latest|most\s+recent|last)\s+{OBSERVATION_NOUNS_EN})\b|"
+    # «la turbiedad más reciente», «el pH actual», «el último pH», «the latest pH». «Actual» sólo en castellano,
+    # tras lo que califica: en inglés («the actual values») significa «real».
+    rf"\b(?:m[aá]s\s+recientes?|most\s+recent|actualmente)\b|"
+    r"(?<=\w\s)actual(?:es)?\b(?!\s+[^\W\d_])|(?<=\w\s)actual(?:es)?(?=\s+(?:en|de|del|para|seg[uú]n)\b)|"
+    # «Por último, …» ordena la pregunta; no pide la última medición.
+    rf"(?<!\bpor\s)\b{RECENT_WORDS}\s+(?:(?:de|del|of|the)\s+)?"
+    rf"(?!(?:{RECENT_INTERVAL_NOUNS}|{_NUMBER_WORDS})\b)(?!\d)\w",
+    re.IGNORECASE,
+)
 
-    return bool(
-        re.search(
-            rf"\b(?:(?:[uú]ltim[oa]s?|m[aá]s\s+recientes?)\s+{observation}|"
-            rf"{observation}\s+m[aá]s\s+recientes?|(?:latest|most\s+recent|last)\s+{english})\b",
-            question,
-            re.IGNORECASE,
-        )
+
+def latest_requested(question: str) -> bool:
+    return _LATEST.search(question) is not None
+
+
+def extreme_requested(question: str) -> bool:
+    """La pregunta pide el extremo de una variable («el valor máximo»), no todos sus registros ordenados."""
+    return contains_any_phrase(question, EXTREME_CUES) and not contains_any_phrase(
+        question, FULL_ORDER_CUES
     )
 
 
@@ -72,6 +99,27 @@ def requested_thresholds(mentions) -> list[RequestedThreshold]:
     return list(thresholds.values())
 
 
+def requested_periods(mentions) -> list[RequestedPeriod]:
+    """Períodos de las menciones date con una fecha legible; «la última fecha» no fija ninguno. Una mención con fechas
+    sueltas («2019 y 2021») pide cada período por separado."""
+    periods = {}
+    for item in mentions:
+        ranges = period_ranges(item.text) if item.kind == "date" else []
+        for start, end in ranges:
+            text = item.text if len(ranges) == 1 else period_text(start, end)
+            periods[(start, end)] = RequestedPeriod(text=text, start=start, end=end)
+
+    return list(periods.values())
+
+
+def period_phrase(period: dict, language: str = "es") -> str:
+    """Período pedido tras «acotarlos»: «a 2021» o, si es abierto, «al período desde 2020»."""
+    closed = period.get("start") is not None and period.get("end") is not None
+    if language == "es":
+        return ("a " if closed else "al período ") + period["text"]
+    return ("to " if closed else "to the period ") + period["text"]
+
+
 def build_planning_context(
     question: str,
     datasets: list[VerifiedDataset],
@@ -85,6 +133,7 @@ def build_planning_context(
     unmatched_values=(),
     source_mentions=(),
     thresholds=(),
+    periods=(),
     statistics=(),
     chart=False,
     time_grain=None,
@@ -113,6 +162,9 @@ def build_planning_context(
     if thresholds:
         # Operador y valor exactos de cada comparación pedida; se revalidan antes de ejecutar.
         evidence["requested_thresholds"] = [item.model_dump(mode="json") for item in thresholds]
+    if periods:
+        # Intervalo exacto de cada período pedido; toda salida debe acotar su fecha a él.
+        evidence["requested_periods"] = [item.model_dump(mode="json") for item in periods]
     if statistics:
         evidence["requested_statistics"] = list(statistics)
     if chart:

@@ -21,11 +21,14 @@ from aquai.application.matching import (
     normalize_name,
     normalize_text,
     numeric_comparisons,
+    qualified_period,
+    qualified_variable,
+    qualifies_variable,
     starts_with_phrase,
     variable_core,
 )
 from aquai.application.planning.context import chart_requested, requested_statistics
-from aquai.application.planning.followUp import requested_time_grain
+from aquai.application.planning.followUp import requested_period, requested_time_grain
 from aquai.application.Rules.vocabulary import (
     ADDITIVE_CUES,
     CATEGORY_CUES,
@@ -33,10 +36,12 @@ from aquai.application.Rules.vocabulary import (
     CONTINUATION_CUES,
     MEASURED_STATISTICS,
     MENTION_CONNECTORS,
+    PLACE_WORDS,
     SOURCE_ALIAS_CUES,
     SOURCE_CUE_WINDOW,
     SOURCE_CUE_WORDS,
     SOURCE_NAME_CONNECTORS,
+    TIME_GRAIN_CUES,
     UPLOADED_FILE_EXTENSION,
 )
 
@@ -48,8 +53,13 @@ _SCOPE_KINDS = {"value", "dimension", "threshold", "date"}
 # Condiciones de un análisis citado que un seguimiento conserva si no las cambia; umbrales y cantidades
 # viajan con sus operaciones verificadas.
 _CONSERVED_KINDS = {"variable", "value", "dimension", "date"}
+# Menciones que acotan registros: un inventario de fuentes no las responde.
+_RECORD_SCOPE_KINDS = {"value", "date", "threshold"}
+# Menciones que cambian lo calculado: una pregunta por el período del resultado no las incluye.
+_CALCULATION_KINDS = {"variable", "value", "dimension", "threshold", "limit"}
 # Palabras que no agregan un pedido propio a un fragmento («¿Y en Punta Piedras?»).
 _ELLIPSIS_WORDS = {*MENTION_CONNECTORS, *(word for cue in CONTINUATION_CUES for word in cue.split())}
+_PLACE_NAMES = {normalize_text(word) for word in PLACE_WORDS}
 _CHART_FILLERS = {*MENTION_CONNECTORS, "un", "una", "a", "an"}
 _CHART_WORD = re.compile(rf"\b{CHART_WORDS}\b", re.IGNORECASE)
 # «los datos de ABSA», «la base FQ»: la palabra siguiente puede abreviar el nombre de una fuente.
@@ -63,6 +73,8 @@ SOURCE_CUE = re.compile(
     rf"(?:(?:{'|'.join(SOURCE_NAME_CONNECTORS)})\s+)*[«\"“']?\s*$",
     re.IGNORECASE,
 )
+# «¿Cuándo se cargó el archivo?» pregunta por una fuente, no por el período de un resultado.
+_SOURCE_WORD = re.compile(rf"\b(?:{'|'.join(SOURCE_CUE_WORDS)})s?\b", re.IGNORECASE)
 
 
 def _sheet(dataset_name: str) -> str:
@@ -157,7 +169,14 @@ class RouteQueryService:
             route = "data"
 
         anchor = self._anchor(state.conversation_history, allowed)
-        if anchor is not None and self._fragment(decision, route, asked, state.question):
+        subject = self._period_subject(state.question, asked, messages, anchor, route, decision)
+        if subject is not None:
+            # Se responde con las fechas de ese resultado, recalculado con sus mismas operaciones: repetir
+            # sus párrafos no contesta el año, y planificar de nuevo puede cambiar lo que se calculó.
+            route = "data"
+            result.requested_period = requested_period(state.question)
+            messages = self._with_context([subject], provided)
+        elif anchor is not None and self._fragment(decision, route, asked, state.question):
             # Un fragmento («¿Y el pH?», «La conductividad») continúa el último análisis o aclaración,
             # aunque el modelo cite otro mensaje, pida aclarar o el último turno haya fallado.
             route = "data"
@@ -177,6 +196,7 @@ class RouteQueryService:
 
     async def _resolve_route(self, state, catalog, result, decision, route, messages):
         explicit, aliases = await self._named_sources(decision, state.question, catalog, result)
+        explicit = await self._stored_values(explicit, state.question, catalog, result)
         if route == "general" and explicit:
             route = "catalog"  # Una pregunta sobre una fuente nombrada se responde con el catálogo.
         result.route = route
@@ -191,10 +211,58 @@ class RouteQueryService:
             explicit, state.question, catalog, partial=route == "catalog"
         )
         self._record_sources(result, resolved, aliases)
+        if route == "catalog" and self._restricts_records(result):
+            # «¿Cuántas muestras hay de Bagliardi?» cuenta registros de un sitio: el inventario no lo responde.
+            route = result.route = "data"
+            result.warnings.append(
+                "La pregunta acota registros por un valor, una fecha o un umbral: "
+                "se consultaron los datos y no el inventario de fuentes."
+            )
         if route == "catalog":
             return self._catalog_result(result, bindings)
 
         return self._data_result(state, result, messages, bindings, resolved)
+
+    async def _stored_values(self, explicit, question, catalog, result):
+        """Un nombre que no es el de ninguna fuente pero figura en los registros («Bagliardi») es un valor que
+        acota la consulta: descartarlo como fuente perdería ese filtro."""
+        kept, found = [], []
+        for mention in explicit:
+            unknown = not self._catalog_matches(
+                mention, normalize_name(mention), self._as_identifier(mention), catalog, True
+            )
+            if (
+                unknown
+                and not self._has_source_cue(mention, question)
+                and await self._stored_anywhere(mention, catalog)
+            ):
+                found.append(DataMention(text=mention, kind="value"))
+                continue
+            kept.append(mention)
+
+        if found:
+            # Como cualquier valor nombrado ahora, reemplaza al conservado del análisis anterior.
+            additive = contains_any_phrase(question, ADDITIVE_CUES)
+            replaced = [
+                item for item in result.conserved_mentions if item.kind == "value" and not additive
+            ]
+            result.data_mentions = [
+                *(item for item in result.data_mentions if item not in replaced),
+                *(item for item in found if item not in result.data_mentions),
+            ]
+            result.conserved_mentions = [
+                item for item in result.conserved_mentions if item not in replaced
+            ]
+            result.warnings.append(
+                "Se interpretó como valor de los registros, no como fuente: "
+                + "; ".join(item.text for item in found)
+                + "."
+            )
+        return kept
+
+    @staticmethod
+    def _restricts_records(result):
+        return any(item.kind in _RECORD_SCOPE_KINDS for item in result.data_mentions)
 
     @staticmethod
     def _apply_reply(result, reply, preferred_language):
@@ -248,6 +316,26 @@ class RouteQueryService:
         )
 
     @staticmethod
+    def _period_subject(question, asked, messages, anchor, route, decision):
+        """Análisis verificado cuyo período pregunta un seguimiento sin condiciones propias («¿Y de qué año es?»):
+        el único citado o, si no, el último. Una pregunta por una fuente o por el catálogo («¿Cuándo se cargó el
+        archivo?», «¿Qué fechas abarca ABSA?») no lo es."""
+        own = [item for item in asked if item.kind in _CALCULATION_KINDS]
+        about_source = (
+            route == "catalog"
+            or _SOURCE_WORD.search(question) is not None
+            or any(RouteQueryService._literal(text, question) for text in decision.source_mentions)
+        )
+        if own or about_source or chart_requested(question) or requested_period(question) is None:
+            return None
+
+        cited = [item for item in messages if item.analysis is not None]
+        if len(cited) == 1:
+            return cited[0]
+
+        return anchor if anchor is not None and anchor.analysis is not None else None
+
+    @staticmethod
     def _needs_implicit_reference(decision, route, asked, messages):
         # Sin variable, valor, fecha ni fuente propios no hay nada que recuperar («Ahora mostrame todos»):
         # la consulta sólo puede continuar el último resultado, aunque el modelo no lo haya marcado.
@@ -295,11 +383,51 @@ class RouteQueryService:
             mentions, [question, *RouteQueryService._pending_requests(messages)]
         )
         mentions = RouteQueryService._without_chart_phrases(mentions)
-        own, conserved = RouteQueryService._conserved_scope(
-            RouteQueryService._separated_variables(mentions), question, messages
+        mentions = RouteQueryService._qualified_variables(
+            RouteQueryService._separated_variables(mentions), question
         )
+        mentions = RouteQueryService._asked_dimensions(mentions, question)
+        own, conserved = RouteQueryService._conserved_scope(mentions, question, messages)
         result.data_mentions = [*own, *conserved]
         result.conserved_mentions = conserved
+
+    @staticmethod
+    def _qualified_variables(mentions, question):
+        """«¿Y la temperatura del aire?»: el calificativo que sigue a la variable en la pregunta es parte de ella aunque
+        el modelo lo omita; sin él se respondería con la temperatura del agua. Lo mismo el extremo de una fecha:
+        «desde 2020» no es «2020»."""
+        qualify = {"variable": qualified_variable, "date": qualified_period}
+        qualified = [
+            item.model_copy(update={"text": qualify[item.kind](item.text, question)})
+            if item.kind in qualify
+            else item
+            for item in mentions
+        ]
+        # El modelo a veces repite el calificativo como valor («aire»): no es un sitio ni otro valor registrado.
+        variables = [item.text for item in qualified if item.kind == "variable"]
+        return [
+            item
+            for item in qualified
+            if not (item.kind == "value" and any(qualifies_variable(item.text, text) for text in variables))
+        ]
+
+    @staticmethod
+    def _asked_dimensions(mentions, question):
+        """«¿Qué sitios…?», «por estación»: el lugar que se pregunta es una dimensión aunque el modelo no la marque.
+        Sin ella, un dataset sin esa columna se agruparía por cualquier otra (un identificador de muestra)."""
+        words = normalize_text(question).split()
+        asked = [
+            following
+            for word, following in zip(words, words[1:])
+            if word in CATEGORY_CUES and following in _PLACE_NAMES
+        ]
+        known = [item.text for item in mentions if item.kind in {"dimension", "value"}]
+        added = [
+            DataMention(text=word, kind="dimension")
+            for word in dict.fromkeys(asked)
+            if not any(contains_phrase(text, word, plural_insensitive=True) for text in known)
+        ]
+        return [*mentions, *added]
 
     @staticmethod
     def _without_chart_phrases(mentions):
@@ -467,6 +595,10 @@ class RouteQueryService:
 
         if not resolved:
             bindings = self._historical_bindings(messages)
+            result.reselects_datasets = bool(bindings) and self._reselects(result, messages)
+            result.inherits_named_sources = bool(bindings) and any(
+                item.named_sources for item in messages
+            )
         unique = self._by_dataset(bindings)
         result.dataset_bindings = list(unique.values())
         if len(unique) > state.candidate_limit:
@@ -506,6 +638,18 @@ class RouteQueryService:
             or requested_time_grain(question)
             or regroups
         )
+
+    @staticmethod
+    def _reselects(result, messages):
+        """«¿Y en Bagliardi?» después de Punta Lara: los datasets de aquel resultado se eligieron por Punta Lara, no
+        por el usuario, y otros pueden registrar la variable en Bagliardi. Si el usuario nombró las fuentes, se
+        conservan."""
+        changes = any(
+            item.kind in {"value", "variable"}
+            for item in result.data_mentions
+            if item not in result.conserved_mentions
+        )
+        return changes and not any(item.named_sources for item in messages)
 
     @staticmethod
     def _without_context(result):
@@ -680,7 +824,10 @@ class RouteQueryService:
                 for text, comparison in found
                 if RouteQueryService._overlaps(item.text, comparison, text)
             ]
-            if item.kind not in _NUMERIC_KINDS or not compared:
+            # Sólo el número copiado es parte del umbral: un sitio dentro de la comparación sigue acotando
+            # registros («mayor que 8 en Punta Lara en promedio»).
+            copied = item.kind == "threshold" or any(char.isdigit() for char in item.text)
+            if item.kind not in _NUMERIC_KINDS or not compared or not copied:
                 kept.append(item)
             elif item.kind == "threshold":
                 variables.extend(RouteQueryService._compared_variable(item.text, compared[0]))
@@ -718,6 +865,9 @@ class RouteQueryService:
             text, kind = item.text, item.kind
             for other in others if kind == "variable" else ():
                 text = RouteQueryService._without_edge(text, other)
+            if kind == "variable":
+                # «turbiedad promedio por mes»: la agrupación temporal la lee el Planner de la pregunta.
+                text = RouteQueryService._without_time_grain(text)
             # «cada punto de muestreo» o «qué sitios» nombran una categoría, nunca un valor almacenado.
             words = normalize_text(text).split()
             names_category = kind == "value" and bool(words) and words[0] in CATEGORY_CUES
@@ -729,6 +879,16 @@ class RouteQueryService:
                 (text.casefold(), kind), item.model_copy(update={"text": text, "kind": kind})
             )
         return list(separated.values())
+
+    @staticmethod
+    def _without_time_grain(text):
+        words = (RouteQueryService._trimmed(text) or text).split()
+        for cue in (cue for cues in TIME_GRAIN_CUES.values() for cue in cues):
+            size = len(cue.split())
+            if len(words) > size and normalize_text(" ".join(words[-size:])) == cue:
+                return RouteQueryService._trimmed(" ".join(words[:-size])) or text
+
+        return text
 
     @staticmethod
     def _without_edge(text, other):

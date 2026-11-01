@@ -14,6 +14,7 @@ from aquai.application.matching import contains_any_phrase, contains_phrase
 from aquai.application.Rules.vocabulary import (
     CHART_TYPE_WORDS,
     MEASURED_STATISTICS,
+    PERIOD_QUESTION_CUES,
     TIME_GRAIN_CUES,
 )
 
@@ -22,6 +23,7 @@ _TEMPORAL_TYPES = {"DATE", "TIMESTAMP"}
 _NUMERIC_TYPES = {"NUMERIC", "BIGINT"}
 # Una fecha agrupada se rotula por su período, no como un día concreto.
 _GRAIN_LABELS = {"day": "Día", "month": "Mes", "year": "Año"}
+_GRAIN_FIELDS = {"day": "dia", "month": "mes", "year": "anio"}
 # Cálculos que un seguimiento sin otra estadística conserva y la validación exige.
 _CONSERVED_STATISTICS = {"mean", "median", "sum", "stddev", "count"}
 _STEP_FIELDS = (
@@ -46,6 +48,18 @@ def previous_operations(analysis) -> set[str]:
 def requested_time_grain(question: str) -> str | None:
     return next(
         (grain for grain, cues in TIME_GRAIN_CUES.items() if contains_any_phrase(question, cues)),
+        None,
+    )
+
+
+def requested_period(question: str) -> str | None:
+    """Precisión del período que la pregunta pide conocer: «¿de qué año es?» → year, «¿cuándo?» → day."""
+    return next(
+        (
+            precision
+            for precision, cues in PERIOD_QUESTION_CUES.items()
+            if contains_any_phrase(question, cues)
+        ),
         None,
     )
 
@@ -149,7 +163,39 @@ def with_time_grain(decision, grain, column_types):
                 modified = True
     if not modified:
         modified = _grouped_periods(changed, grain, column_types)
+    if not modified:
+        modified = _undated_aggregates(changed, grain, column_types)
     return changed if modified else decision
+
+
+def _undated_aggregates(decision, grain, column_types) -> bool:
+    """Un aggregate que no agrupa ninguna fecha no responde «por mes»: se agrega la única fecha de su dataset
+    agrupada por ese período. Con varias fechas en el dataset no se elige y la validación pide corregirlo."""
+    steps = {step.id: step for step in decision.steps}
+    modified = False
+    for step in decision.steps:
+        if step.operation != "aggregate" or len(step.depends_on) != 1:
+            continue
+        if any(
+            _field_type(item.field, steps, column_types) in _TEMPORAL_TYPES for item in step.group_by
+        ):
+            continue
+
+        read = steps.get(step.depends_on[0])
+        column = _only_date(read, decision, column_types)
+        if column is None:
+            continue
+
+        exposed = {item.output_name for item in [*step.group_by, *step.calculations]}
+        step.group_by.append(
+            GroupingSpec(
+                field=ResultRef(kind="result", step_id=read.id, field=column.column),
+                output_name=_unused_id(_GRAIN_FIELDS[grain], exposed),
+                time_grain=grain,
+            )
+        )
+        modified = True
+    return modified
 
 
 def _grouped_periods(decision, grain, column_types) -> bool:
@@ -269,6 +315,143 @@ def reused_decision(analysis, catalog, question):
         return PlannableDecision.model_validate(data, strict=False)
     except ValidationError:
         return None
+
+
+def repeated_decision(analysis, catalog):
+    """«¿Y de qué año es?»: las mismas operaciones verificadas del resultado citado, sin gráficos, para leer sus
+    fechas. Sólo si sus datasets conservan la versión verificada."""
+    if analysis is None or not analysis.complete or analysis.status != "validated":
+        return None
+    if not _same_versions(analysis.sources, catalog):
+        return None
+
+    steps = {item["id"]: item for item in analysis.operations if item["operation"] != "visualize"}
+    referenced = list(
+        dict.fromkeys(
+            item.get("operation_id")
+            for item in analysis.operation_references
+            if item.get("operation_id") in steps
+        )
+    )
+    # Los pasos intermedios también se citan como evidencia; se publican sólo los finales de cada rama.
+    inputs = {key for output in referenced for key in _ancestry(output, steps) - {output}}
+    outputs = [key for key in referenced if key not in inputs]
+    if not outputs:
+        return None
+
+    used = {key for output in outputs for key in _ancestry(output, steps)}
+    chain = [step for key, step in steps.items() if key in used]
+    data = {
+        "status": "plannable",
+        "reason": "Se repiten las operaciones verificadas del resultado citado para leer su período.",
+        "datasets": _selections(chain, analysis.sources),
+        "steps": [_proposed(item) for item in chain],
+        "output_steps": outputs,
+        "warnings": [
+            "Se reutilizaron las operaciones verificadas del resultado anterior sin planificar de nuevo; "
+            "los datos se consultaron otra vez sobre la versión vigente."
+        ],
+    }
+    try:
+        return PlannableDecision.model_validate(data, strict=False)
+    except ValidationError:
+        return None
+
+
+def period_span_decision(analysis, catalog):
+    """«¿Y de qué año es?» sobre un resultado sin fechas (un promedio): la primera y la última fecha de los registros
+    que leyó, con sus mismos filtros. Sólo para datasets con una única columna DATE/TIMESTAMP y sin cambios de
+    versión; los filtros posteriores a la lectura (umbrales sobre promedios) no acotan ese período."""
+    if analysis is None or not analysis.complete or analysis.status != "validated":
+        return None
+    if not _same_versions(analysis.sources, catalog):
+        return None
+
+    dates = {}
+    for dataset in catalog:
+        columns = [
+            item.sql_name for item in dataset.columns_metadata if item.sql_type in _TEMPORAL_TYPES
+        ]
+        if len(columns) == 1:
+            dates[str(dataset.dataset_id)] = columns[0]
+
+    reads = [item for item in analysis.operations if item["operation"] == "read"]
+    used = {item["id"] for item in analysis.operations}
+    steps, outputs = [], []
+    for read in reads:
+        dataset_id = str(read["columns"][0]["dataset_id"])
+        if dataset_id not in dates:
+            continue
+
+        date = dates[dataset_id]
+        known = {(str(item["dataset_id"]), item["column"]) for item in read["columns"]}
+        added = [] if (dataset_id, date) in known else [
+            {"kind": "column", "dataset_id": dataset_id, "column": date}
+        ]
+        span = _unused_id(f"periodo_{read['id']}", used)
+        used.add(span)
+        steps += [
+            {**_proposed(read), "columns": [*read["columns"], *added]},
+            _date_span(span, read["id"], date),
+        ]
+        outputs.append(span)
+    if not outputs:
+        return None
+
+    data = {
+        "status": "plannable",
+        "reason": "Primera y última fecha de los registros que leyó el resultado citado.",
+        "datasets": _selections(steps, analysis.sources),
+        "steps": steps,
+        "output_steps": outputs,
+        "warnings": [
+            "El período se calculó sobre las mismas lecturas verificadas del resultado anterior, "
+            "consultadas otra vez sobre la versión vigente."
+        ],
+    }
+    try:
+        return PlannableDecision.model_validate(data, strict=False)
+    except ValidationError:
+        return None
+
+
+def _date_span(step_id, read_id, column) -> dict:
+    field = {"kind": "result", "step_id": read_id, "field": column}
+    return {
+        "id": step_id,
+        "tool": "sql",
+        "operation": "aggregate",
+        "depends_on": [read_id],
+        "calculations": [
+            {"function": "min", "inputs": [field], "output_name": "primera_fecha"},
+            {"function": "max", "inputs": [field], "output_name": "ultima_fecha"},
+        ],
+        "purpose": "Primera y última fecha de los registros del resultado citado.",
+    }
+
+
+def period_fields(step, steps, periods) -> list[str]:
+    """Campos de un resultado que ubican sus filas en el tiempo: fechas, períodos TEXT verificados o la fecha
+    agrupada por día, mes o año. steps son los pasos validados por id; periods, las columnas TEXT de períodos."""
+    texts = {(item.dataset_id, item.column) for item in periods}
+    origin = step
+    while origin is not None and origin.operation in {"sort", "latest"} and origin.depends_on:
+        origin = steps.get(origin.depends_on[0])
+    grains = {
+        item.output_name for item in (origin.group_by if origin else []) if item.time_grain != "raw"
+    }
+
+    return [
+        field.name
+        for field in step.output_fields
+        if field.sql_type in _TEMPORAL_TYPES
+        or field.name in grains
+        or (
+            field.sql_type == "TEXT"
+            and len(field.sources) == 1
+            and (field.sources[0].dataset_id, field.sources[0].column) in texts
+        )
+    ]
 
 
 def _same_versions(sources, catalog) -> bool:

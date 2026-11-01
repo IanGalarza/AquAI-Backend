@@ -106,11 +106,18 @@ SOURCE_ALIAS_CUES = ("datos", "base", "archivo", "planilla", "fuente", "data", "
 # Observaciones puntuales: «la última medición» pide un dato, «el último año» pide un intervalo.
 # OBSERVATION_NOUNS_ES/EN son fragmentos de regex que se insertan sin escapar («medici[oó]n»).
 OBSERVATION_NOUNS_ES = (
-    r"(?:datos?|medici[oó]n|mediciones|registros?|observaci[oó]n|observaciones|valores?|"
+    r"(?:datos?|medici[oó]n|mediciones|registros?|observaci[oó]n|observaciones|valor(?:es)?|"
     r"lecturas?|muestras?|fechas?)"
 )
 OBSERVATION_NOUNS_EN = (
     r"(?:measurements?|observations?|records?|readings?|values?|data(?:\s+points?)?)"
+)
+# «Último» seguido de una variable («el último pH») también pide la medición más reciente; seguido de un
+# período o de una cantidad («el último año», «los últimos 5») pide un intervalo o varias filas.
+RECENT_WORDS = r"(?:[uú]ltim[oa]s?|latest|last|current)"
+RECENT_INTERVAL_NOUNS = (
+    r"(?:a[nñ]os?|mes(?:es)?|semanas?|d[ií]as?|per[ií]odos?|d[eé]cadas?|trimestres?|semestres?|"
+    r"horas?|campa[nñ]as?|years?|months?|weeks?|days?|periods?|decades?|hours?)"
 )
 
 PLACE_WORDS = {
@@ -198,6 +205,8 @@ COMPARED_STATISTICS = {
     "promedios",
     "media",
     "medias",
+    "medio",
+    "medios",
     "mediana",
     "medianas",
     "maximo",
@@ -233,6 +242,8 @@ COMPARISON_FILLERS = {
     "is",
     "was",
 }
+# Conectores entre el número y una estadística que lo sigue: «mayor que 8 en promedio», «500 como media».
+FOLLOWING_STATISTIC_FILLERS = {"en", "como", "por", "on", "as"}
 # Lo anterior a estas palabras ya no es lo comparado: «el pH promedio de las muestras con turbiedad mayor que 100».
 COMPARISON_BOUNDARIES = {
     "con",
@@ -352,6 +363,98 @@ TIME_GRAIN_CUES = {
     "day": ("por dia", "por dias", "cada dia", "diario", "diaria", "per day", "daily", "by day"),
 }
 
+# Meses por su nombre, para leer períodos pedidos («marzo de 2022»); palabras normalizadas.
+MONTH_NAMES = {
+    **{
+        name: index
+        for index, name in enumerate(
+            (
+                "enero",
+                "febrero",
+                "marzo",
+                "abril",
+                "mayo",
+                "junio",
+                "julio",
+                "agosto",
+                "septiembre",
+                "octubre",
+                "noviembre",
+                "diciembre",
+            ),
+            1,
+        )
+    },
+    "setiembre": 9,
+    **{
+        name: index
+        for index, name in enumerate(
+            (
+                "january",
+                "february",
+                "march",
+                "april",
+                "may",
+                "june",
+                "july",
+                "august",
+                "september",
+                "october",
+                "november",
+                "december",
+            ),
+            1,
+        )
+    },
+}
+# Años de una fecha pedida: «durante 2021», «entre 2019 y 2021».
+REQUESTED_YEAR = re.compile(r"\b(1[89]\d{2}|2\d{3})\b")
+# Una fecha con un solo extremo no es un intervalo cerrado: «desde 2020» empieza el 1/1/2020 y no termina, «después
+# de 2019» empieza en 2020, «hasta 2022» termina el 31/12/2022 y «antes de 2021», el 31/12/2020. Frases normalizadas.
+PERIOD_BOUND_CUES = {
+    "from": ("desde", "a partir", "since", "from"),
+    "after": ("despues", "posterior", "posteriores", "after"),
+    "until": ("hasta", "until", "through"),
+    "before": ("antes", "anterior", "anteriores", "before", "prior to"),
+}
+# Varias fechas forman un intervalo sólo si se piden como rango: «entre 2019 y 2021», «de marzo a junio de 2022»,
+# «2019-2021»; «en 2019 y en 2021» son dos años sueltos. RANGE_CUES son frases normalizadas; RANGE_CONNECTORS, un
+# fragmento de regex entre dos fechas que se inserta sin escapar.
+RANGE_CUES = ("entre", "between")
+# «Desde 2020 hasta hoy» sólo tiene un extremo: el otro es el presente. Frases normalizadas.
+OPEN_END_WORDS = ("hoy", "ahora", "la actualidad", "la fecha", "today", "now", "the present")
+RANGE_CONNECTORS = r"(?:-|–|\ba\b|\bal\b|\bhasta\b|\bto\b|\buntil\b|\bthrough\b)"
+# Las estaciones del año cambian de meses con el hemisferio: no fijan un intervalo. Palabras normalizadas.
+SEASON_WORDS = (
+    "verano",
+    "otono",
+    "invierno",
+    "primavera",
+    "summer",
+    "autumn",
+    "fall",
+    "winter",
+    "spring",
+)
+# Columnas numéricas que guardan el año de cada registro; nombres normalizados en singular.
+YEAR_COLUMN_NAMES = {("ano",), ("anio",), ("year",)}
+
+# Preguntas por el período de un resultado («¿Y de qué año es?»), con la precisión que piden; frases normalizadas.
+PERIOD_QUESTION_CUES = {
+    "year": ("que ano", "que anos", "cual ano", "what year", "which year"),
+    "month": ("que mes", "que meses", "cual mes", "what month", "which month"),
+    "day": (
+        "que fecha",
+        "que fechas",
+        "que dia",
+        "cual fecha",
+        "cuando",
+        "what date",
+        "which date",
+        "when",
+    ),
+}
+
 # Tipo de gráfico que nombra una pregunta; frases normalizadas.
 CHART_TYPE_WORDS = {
     "bar": ("barra", "barras", "bar", "bars"),
@@ -359,6 +462,38 @@ CHART_TYPE_WORDS = {
     "scatter": ("dispersion", "scatter"),
     "histogram": ("histograma", "histogram"),
 }
+
+# Pedidos del extremo de una variable («el valor máximo de Cond», «la turbiedad más alta»); frases normalizadas.
+EXTREME_CUES = (
+    "maximo",
+    "maxima",
+    "minimo",
+    "minima",
+    "mas alto",
+    "mas alta",
+    "mas bajo",
+    "mas baja",
+    "mas elevado",
+    "mas elevada",
+    "mayor valor",
+    "menor valor",
+    "highest",
+    "lowest",
+    "maximum",
+    "minimum",
+)
+# Pedidos de un orden completo, no de un extremo: «ordená los registros de mayor a menor».
+FULL_ORDER_CUES = (
+    "de mayor a menor",
+    "de menor a mayor",
+    "ordenados",
+    "ordenadas",
+    "ordena",
+    "ordenalos",
+    "from highest to lowest",
+    "from lowest to highest",
+    "sorted",
+)
 
 # Estadísticas de una variable medida: sin la variable no hay qué calcular («¿Cuál es el promedio en Punta Lara?»).
 MEASURED_STATISTICS = (

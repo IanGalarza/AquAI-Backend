@@ -65,10 +65,21 @@ class DatasetEvidence(BaseModel):
     category_values: dict[str, list[str]] = Field(default_factory=dict)
 
 
+class OmittedCandidate(BaseModel):
+    """Dataset con la variable y los valores pedidos que no llegó al Planner: no identifica la dimensión preguntada
+    o quedó fuera del límite de candidatos."""
+
+    dataset_id: UUID
+    name: str
+    source_name: str
+    reason: Literal["missing_dimension", "beyond_limit"]
+
+
 class DatasetRetrievalResult(BaseModel):
     question: str
     candidates: list[DatasetCandidate | VerifiedDataset]
     evidence: list[DatasetEvidence] = Field(default_factory=list)
+    omitted_candidates: list[OmittedCandidate] = Field(default_factory=list)
     unmatched_values: list[str] = Field(default_factory=list)
     dimension_mentions: list[str] = Field(default_factory=list)
     confirmed_values: list[str] = Field(default_factory=list)

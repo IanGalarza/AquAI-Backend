@@ -138,4 +138,23 @@ def profile_temporal_text(values, *, min_coverage=0.9):
         "interpreted_values": len(interpreted),
         "uninterpreted_values": [value for value, bounds in parsed.items() if bounds is None][:10],
         "precisions": sorted({parsed[value][2] for value in interpreted}),
+        # Fechas AAAA-MM-DD junto a D/M/AAAA delatan días y meses invertidos al leer la planilla: sus valores no
+        # acotan períodos pedidos.
+        "values": [] if _mixed_day_notations(distinct) else interpreted,
     }
+
+
+def _mixed_day_notations(values) -> bool:
+    texts = [_collapsed(value) for value in values]
+    return any(_ISO.match(text) for text in texts) and any(_DAY.match(text) for text in texts)
+
+
+def within_period(value: str, day_first: bool | None, start, end) -> bool:
+    """El período que nombra el valor cae entero dentro del pedido; un extremo None queda abierto: «12/2009-01/2010»
+    no está dentro de 2009."""
+    bounds = period_bounds(value, day_first)
+    if bounds is None:
+        return False
+
+    first, last, _precision = bounds
+    return (start is None or first >= start) and (end is None or last <= end)

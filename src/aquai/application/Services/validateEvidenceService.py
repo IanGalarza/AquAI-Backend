@@ -163,6 +163,12 @@ class _EvidenceEvaluation:
         self._result.status = plan.status
         self._result.clarification_question = plan.clarification_question
         self._result.missing_information = list(plan.missing_information)
+        if plan.status in {"failed", "insufficient_coverage"}:
+            # Trazabilidad: el motivo del Planner y lo que bloqueó el plan quedan en la respuesta guardada.
+            self._issue(f"planning_{plan.status}", plan.reason)
+            for item in plan.validation_issues:
+                if item.severity == "clarification":
+                    self._issue(item.code, item.message, item.step_id)
 
         clarification_missing = (
             plan.status == "needs_clarification" and not plan.clarification_question

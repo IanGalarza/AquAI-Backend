@@ -5,6 +5,7 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from aquai.application.dtos.responses.sourceState import SourceStateResponse
+from aquai.application.units import documented_unit
 
 
 class ColumnDetail(BaseModel):
@@ -18,6 +19,15 @@ class ColumnDetail(BaseModel):
     derived_from: str | None = None
     excluded_count: int | None = Field(default=None, ge=0)
     header_missing: bool = False
+
+    @model_validator(mode="after")
+    def header_documented_unit(self):
+        """Una medición cuyo encabezado documenta la unidad («Turbiedad (NTU)», «Cond | mS cm-1») la conserva
+        aunque la ingesta que la cargó no la haya reconocido; nunca se deduce del nombre de la variable."""
+        if self.unit is None and self.numeric_eligible:
+            self.unit = documented_unit(self.original_name)
+
+        return self
 
 
 class SourceLocator(BaseModel):

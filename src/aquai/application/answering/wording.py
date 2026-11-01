@@ -4,6 +4,7 @@ from decimal import Decimal
 
 from aquai.application.answering.presentation import format_number, format_unit
 from aquai.application.planning.temporalText import period_bounds
+from aquai.application.Rules.units import STACKED_HEADER_SEPARATOR
 from aquai.application.Rules.vocabulary import (
     NUMBER_WORDS,
     PLACE_NAME_LOWERCASE_WORDS,
@@ -184,9 +185,10 @@ def column_label(original_name: str, unit: str | None = None) -> str:
     if not unit:
         return label
 
-    for suffix in (f" [{unit}]", f" ({unit})"):
+    # «Cond | mS cm-1» y «T | (°C)» son encabezados apilados: la fila inferior es la unidad.
+    for suffix in (f" [{unit}]", f" ({unit})", f"{STACKED_HEADER_SEPARATOR}{unit}"):
         if label.endswith(suffix):
-            return label[: -len(suffix)]
+            return label[: -len(suffix)].rstrip(STACKED_HEADER_SEPARATOR)
 
     return label
 

@@ -5,18 +5,14 @@ from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 
 from aquai.application.Rules.ingestion import (
+    CENSORED_VALUE,
+    DECIMAL_COMMA,
     IDENTIFIER_COLUMN,
     MEASUREMENT_COLUMN,
     MISSING_VALUE_MARKER,
     NON_MEASUREMENT_COLUMN,
 )
-from aquai.application.Rules.units import (
-    HEADER_UNIT,
-    INVERSE_UNIT,
-    MAX_UNIT_LENGTH,
-    RATIO_UNIT,
-    SIMPLE_UNIT,
-)
+from aquai.application.units import header_unit
 from aquai.infrastructure.processing.tabular.reader import LiteralText, is_empty
 
 RESERVED_COLUMNS = {"_aquai_row", "_aquai_source_row", "_aquai_source_column"}
@@ -57,24 +53,6 @@ def _unused_name(base: str, used: set[str]) -> str:
         count += 1
 
     return name
-
-
-def header_unit(name: str) -> str | None:
-    match = HEADER_UNIT.search(name)
-
-    if not match:
-        return None
-
-    unit = (match.group(1) or match.group(2)).strip()
-
-    if "\ufffd" in unit or len(unit) > MAX_UNIT_LENGTH:
-        return None
-
-    recognized = (
-        SIMPLE_UNIT.fullmatch(unit) or INVERSE_UNIT.fullmatch(unit) or RATIO_UNIT.fullmatch(unit)
-    )
-
-    return unit if recognized else None
 
 
 def text_value(value: object) -> str | None:
@@ -243,7 +221,8 @@ def _mixed_text_warning(name: str, present: list[object]) -> str | None:
 
 
 def numeric_projection(name: str, values: list[object]) -> tuple[list[Decimal | None], int] | None:
-    """Deriva números inequívocos sin reemplazar el texto ni interpretar marcadores."""
+    """Deriva números inequívocos sin reemplazar el texto ni interpretar marcadores. Un valor censurado («<0,001») es
+    una medición, no texto libre: cuenta como tal pero queda sin dato, igual que un marcador de faltante."""
     if NON_MEASUREMENT_COLUMN.search(name):
         return None
 
@@ -251,22 +230,71 @@ def numeric_projection(name: str, values: list[object]) -> tuple[list[Decimal | 
         return None
 
     present = [value for value in values if not is_empty(value)]
-    numbers = [_number(value) for value in present]
+    convert = _projection_parser(present)
+    numbers = [convert(value) for value in present]
     convertible = sum(number is not None for number in numbers)
+    censored = sum(_is_censored(value) for value, number in zip(present, numbers) if number is None)
 
-    if not _mostly_numeric_with_gaps(convertible, len(present)):
+    if not _mostly_numeric_with_gaps(convertible, censored, len(present)):
         return None
 
     markers = [value for value, number in zip(present, numbers) if number is None]
 
-    if not all(_is_missing_marker(value) for value in markers):
+    if not all(_is_missing_marker(value) or _is_censored(value) for value in markers):
         return None
 
-    return _converted(values, _number), len(present) - convertible
+    return _converted(values, convert), len(present) - convertible
 
 
-def _mostly_numeric_with_gaps(convertible: int, present: int) -> bool:
-    return convertible >= 2 and convertible != present and convertible * 4 >= present * 3
+def _mostly_numeric_with_gaps(convertible: int, censored: int, present: int) -> bool:
+    measured = convertible + censored
+    return convertible >= 2 and convertible != present and measured * 4 >= present * 3
+
+
+def _is_censored(value: object) -> bool:
+    return isinstance(value, str) and CENSORED_VALUE.fullmatch(value.strip()) is not None
+
+
+def _projection_parser(present: list[object]):
+    """La columna demuestra cómo escribe sus decimales: con coma («12,5») o con punto aunque haya valores como «1.337»
+    que, solos, podrían ser miles («0.837» y «9.12» prueban que son decimales). Sin esa prueba, no se adivina."""
+    if _uses_decimal_comma(present):
+        return _comma_number
+    if _uses_decimal_point(present):
+        return _point_number
+    return _number
+
+
+def _uses_decimal_point(present: list[object]) -> bool:
+    texts = [value.strip() for value in present if isinstance(value, str)]
+    decimals = [text for text in texts if NUMBER.fullmatch(text) and "." in text.split("e")[0].split("E")[0]]
+    return any(not _ambiguous_thousands_separator(text) for text in decimals) and not any(
+        DECIMAL_COMMA.fullmatch(text) for text in texts
+    )
+
+
+def _point_number(value: object) -> Decimal | None:
+    if isinstance(value, str) and NUMBER.fullmatch(value.strip()):
+        number = Decimal(value.strip())
+        return number if number.is_finite() and abs(number.adjusted()) <= 1000 else None
+    return _number(value)
+
+
+def _uses_decimal_comma(present: list[object]) -> bool:
+    """La columna escribe decimales con coma: ninguno con punto y alguno que no puede ser un separador de miles."""
+    texts = [value.strip() for value in present if isinstance(value, str)]
+    commas = [text for text in texts if DECIMAL_COMMA.fullmatch(text)]
+    dotted = any(NUMBER.fullmatch(text) and "." in text for text in texts)
+    unambiguous = any(
+        len(text.split(",")[1]) != 3 or text.lstrip("+-").startswith("0,") for text in commas
+    )
+    return bool(commas) and not dotted and unambiguous
+
+
+def _comma_number(value: object) -> Decimal | None:
+    if isinstance(value, str) and DECIMAL_COMMA.fullmatch(value.strip()):
+        return _number(value.strip().replace(",", "."))
+    return _number(value)
 
 
 def _is_missing_marker(value: object) -> bool:

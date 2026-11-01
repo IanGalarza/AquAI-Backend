@@ -45,6 +45,8 @@ class HistoryMessage(BaseModel):
     scope: list[DataMention] = Field(default_factory=list, max_length=12)
     # Una respuesta que reprodujo otra remite a ese resultado verificado.
     replay_of: UUID | None = None
+    # El usuario eligió las fuentes de ese turno por su nombre: un seguimiento conserva esa selección.
+    named_sources: bool = False
     # Mensaje anterior a la ventana reciente, recuperado porque la pregunta actual lo menciona.
     recalled: bool = False
     # Párrafos con citas y columnas de cada fuente (por dataset_id); sólo se reproducen, nunca se envían al Router.
@@ -109,6 +111,14 @@ class RoutingResult(BaseModel):
     conserved_mentions: list[DataMention] = Field(default_factory=list)
     # Respuesta breve a una aclaración sin menciones: sólo cuenta si existe en los registros.
     tentative_values: list[str] = Field(default_factory=list)
+    # Seguimiento que sólo pregunta el período del resultado citado («¿Y de qué año es?») y con qué precisión.
+    requested_period: Literal["year", "month", "day"] | None = None
+    # Seguimiento que cambia el sitio o la variable de un análisis cuyas fuentes no nombró el usuario: los datasets
+    # heredados no lo restringen y se vuelve a buscar en todo el catálogo.
+    reselects_datasets: bool = False
+    # Los datasets heredados los eligió el usuario en un turno anterior («los datos de ABSA»): los seguimientos
+    # siguientes también los conservan aunque esta pregunta no los nombre.
+    inherits_named_sources: bool = False
     context_used: bool = False
     question_contextualized: bool = False
     clarification_question: str | None = None

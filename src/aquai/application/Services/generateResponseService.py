@@ -5,6 +5,7 @@ from aquai.application.answering.context import (
     build_response_context,
     response_language,
 )
+from aquai.application.answering.coverage import coverage_notes, period_notes, unit_notes
 from aquai.application.answering.segments import answer_text
 from aquai.application.contracts.answering import (
     AnswerSegment,
@@ -91,27 +92,33 @@ class GenerateResponseService:
         catalog = {item["sentence_id"]: item for item in context.evidence["sentence_catalog"]}
         entries = [(entry, entry["direct"]) for entry in self._ordered_entries(catalog, refs)]
         introduction = _introduction(context)
+        notes = [
+            *unit_notes(state, language),
+            *coverage_notes(state, language),
+            *period_notes(state, language),
+        ]
+        coverage = [AnswerSegment(kind="note", text=text) for text in notes]
 
         if validation.status == "partial":
             self._publish_partial(response, state, language, introduction, entries)
-            return self._finish(response, started)
-
-        if len(catalog) <= self._deterministic_sentences:
+        elif len(catalog) <= self._deterministic_sentences:
             # El orden (resultado, alcance, detalles) ya está determinado y los textos son verificados;
             # el modelo sólo elegía entre ellos y demoraba entre 4 y 24 s. Un umbral menor reactiva el proveedor.
             self._publish(response, [*introduction, *self._segments(entries)])
-            return self._finish(response, started)
+        else:
+            await self._publish_model_draft(
+                response,
+                context,
+                catalog=catalog,
+                refs=refs,
+                introduction=introduction,
+                entries=entries,
+                language=language,
+            )
 
-        await self._publish_model_draft(
-            response,
-            context,
-            catalog=catalog,
-            refs=refs,
-            introduction=introduction,
-            entries=entries,
-            language=language,
-        )
-
+        # Lo que el resultado no abarca se informa siempre después de lo que responde.
+        if coverage:
+            self._publish(response, [*response.segments, *coverage])
         return self._finish(response, started)
 
     def _reject_changed_evidence(self, response, language):

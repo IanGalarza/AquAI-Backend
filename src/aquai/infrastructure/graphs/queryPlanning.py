@@ -110,6 +110,7 @@ def build_query_planning_graph(
             dataset_bindings=state.routing.dataset_bindings,
             data_mentions=_structured_mentions(state.routing),
             tentative_values=state.routing.tentative_values,
+            reselect=state.routing.reselects_datasets,
         )
 
         return {
@@ -134,6 +135,7 @@ def build_query_planning_graph(
                 state.conversation_history, state.routing.history_message_ids
             ),
             conserved_mentions=state.routing.conserved_mentions,
+            requested_period=state.routing.requested_period,
         )
 
         return {

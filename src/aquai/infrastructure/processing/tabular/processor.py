@@ -15,6 +15,7 @@ from aquai.application.contracts.ingestion import (
 )
 from aquai.application.errors import FileTooLargeError
 from aquai.application.Rules.ingestion import NOTE_ROW, TOTAL_ROW_LABELS
+from aquai.application.Rules.units import STACKED_HEADER_SEPARATOR
 from aquai.infrastructure.config.tabular import TabularSettings
 from aquai.infrastructure.processing.tabular.normalization import (
     column_names,
@@ -331,7 +332,7 @@ def _stacked_names(grid: list[list[object]], columns: list[int]) -> list[str]:
 
     for index, column in enumerate(columns):
         parts = dict.fromkeys(str(row[index]) for row in grid if not is_empty(row[index]))
-        names.append(" | ".join(parts) or _placeholder_name(column))
+        names.append(STACKED_HEADER_SEPARATOR.join(parts) or _placeholder_name(column))
 
     return names
 
@@ -382,7 +383,7 @@ def _unit_row_name(parent: object, child: object) -> str:
     if _label_unit(child):
         return f"{parent} [{child}]"
 
-    return f"{parent} | {child}"
+    return f"{parent}{STACKED_HEADER_SEPARATOR}{child}"
 
 
 def _single_row_header(

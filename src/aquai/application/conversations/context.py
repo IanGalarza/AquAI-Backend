@@ -81,6 +81,7 @@ def _history_message(row):
     message.source_columns = _source_columns(row.get("associations") or [])
     message.scope = _scope_mentions(row.get("mentions") or [])
     message.replay_of = _replayed_message(row)
+    message.named_sources = bool(row.get("named_sources")) or bool(row.get("inherited_named_sources"))
 
     if _is_verified_answer(row):
         analysis = _verified_analysis(row)
@@ -177,6 +178,7 @@ def _link_replays(messages):
             continue
         message.analysis = original.analysis
         message.scope = message.scope or original.scope
+        message.named_sources = message.named_sources or original.named_sources
 
 
 def _recalled(older, recent, question):

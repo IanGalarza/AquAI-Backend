@@ -2,13 +2,15 @@ import re
 from decimal import ROUND_HALF_UP, Decimal, localcontext
 from html import escape
 
+from aquai.application.units import repaired_symbols
+
 _SUPERSCRIPTS = str.maketrans("0123456789", "⁰¹²³⁴⁵⁶⁷⁸⁹")
 # Sólo exponentes negativos tras un símbolo (mL-1): PO4 o N-NO3 son fórmulas, no potencias.
 _NEGATIVE_EXPONENT = re.compile(r"(?<=[A-Za-zµμ])-(\d{1,2})(?![\d.,])")
 
 
 def format_unit(unit: str) -> str:
-    return _NEGATIVE_EXPONENT.sub(_superscript_exponent, unit)
+    return _NEGATIVE_EXPONENT.sub(_superscript_exponent, repaired_symbols(unit))
 
 
 def _superscript_exponent(match):

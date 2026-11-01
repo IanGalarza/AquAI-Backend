@@ -1,4 +1,6 @@
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
+from difflib import get_close_matches
+from typing import NamedTuple
 from uuid import UUID
 
 from aquai.application.contracts.planning import (
@@ -8,6 +10,7 @@ from aquai.application.contracts.planning import (
     PlannableDecision,
     PlannerDecision,
     PlanningResult,
+    RequestedPeriod,
     RequestedThreshold,
     SelectedDataset,
     ValidatedStep,
@@ -15,13 +18,19 @@ from aquai.application.contracts.planning import (
 )
 from aquai.application.contracts.retrieval import VerifiedDataset
 from aquai.application.errors import PlannerValidationError
-from aquai.application.matching import contains_phrase
-from aquai.application.units import presentation_unit_status
+from aquai.application.matching import contains_phrase, singular_words
+from aquai.application.planning.temporalText import period_bounds
+from aquai.application.Rules.vocabulary import YEAR_COLUMN_NAMES
+from aquai.application.units import comparable_unit, presentation_unit_status
 
 _EQUALITY_OPERATORS = {"eq", "ieq", "in"}
 _RANGE_OPERATORS = {"lt", "le", "gt", "ge"}
 _NUMERIC_TYPES = {"BIGINT", "NUMERIC"}
 _TEMPORAL_TYPES = {"DATE", "TIMESTAMP"}
+# Orden de día y mes demostrado por una columna TEXT de períodos (None: no hay fechas D/M/AAAA ambiguas).
+_TEXT_PERIOD_KINDS = {None: "text", True: "text-dmy", False: "text-mdy"}
+# Palabras de una columna de fecha inventada («fecha», «anio», «date»), en singular.
+_DATE_WORDS = {"fecha", "date", "ano", "anio", "year", "mes", "month", "dia", "day"}
 _ISO_PARSERS = {"DATE": date.fromisoformat, "TIMESTAMP": datetime.fromisoformat}
 _COMBINE_OPERATIONS = {"join", "append"}
 _PASSTHROUGH_OPERATIONS = {"sort", "latest"}
@@ -107,6 +116,34 @@ def validate_temporal_scope(operations, output_steps, *, require_latest=False, r
     issues.extend(_unscoped_output_issues(outputs, requested_values))
 
     return issues
+
+
+def validate_unrequested_latest(operations, output_steps, *, follow_up=False) -> list[ValidationIssue]:
+    """Un latest que la consulta no pidió restringe el resultado a la última fecha sin que la respuesta lo diga:
+    un promedio pasa a ser el de un solo día. Publicado directamente se lee como «la medición más reciente», salvo
+    en un seguimiento de un resultado que no lo usaba («¿Y el pH?» después de un máximo), que cambia lo pedido."""
+    steps = {step.id: step for step in operations}
+    relevant = _reachable_step_ids(steps, output_steps)
+    calculated = {
+        key
+        for step in operations
+        if step.id in relevant and step.operation in {"aggregate", "calculate"}
+        for key in _reachable_step_ids(steps, step.depends_on)
+    }
+
+    return [
+        ValidationIssue(
+            code="unrequested_latest",
+            severity="clarification",
+            step_id=step.id,
+            message=f"La consulta no pide la medición más reciente, pero el paso {step.id} (latest) restringe el "
+            "resultado a la última fecha: quitalo y calculá sobre todas las fechas del alcance pedido.",
+        )
+        for step in operations
+        if step.operation == "latest"
+        and step.id in relevant
+        and (follow_up or step.id in calculated)
+    ]
 
 
 def _reachable_step_ids(steps, output_steps) -> set[str]:
@@ -212,8 +249,11 @@ def validate_requested_scope(
     categories=False,
     chart=False,
     time_grain=None,
+    periods=(),
+    dated_columns=None,
 ) -> list[ValidationIssue]:
-    """Cada umbral, estadística, dimensión, agrupación temporal y gráfico pedidos deben llegar a una salida publicada.
+    """Cada umbral, período, estadística, dimensión, agrupación temporal y gráfico pedidos deben llegar a una salida
+    publicada; dated_columns son las columnas de fecha o año de los datasets (period_columns).
 
     También se revalida antes de ejecutar: un plan que pierde un filtro pedido no responde la consulta."""
     steps = {step.id: step for step in operations}
@@ -221,6 +261,7 @@ def validate_requested_scope(
     published = [step for step in operations if step.id in relevant]
     issues = [
         *_threshold_issues(steps, output_steps, thresholds),
+        *_period_issues(steps, output_steps, periods, dated_columns or {}),
         *_statistic_issues(published, statistics),
     ]
 
@@ -234,8 +275,267 @@ def validate_requested_scope(
             )
         )
 
+    if time_grain:
+        issues.extend(_time_grain_issues(steps, output_steps, time_grain))
+
+    # Contar una categoría («cuántos sitios») no la enumera.
+    if categories and "count" not in statistics:
+        issues.extend(_dimension_issues(steps, output_steps, dimensions or {}))
+
+    return issues
+
+
+def period_columns(datasets, text_periods=()) -> dict[tuple[UUID, str], str]:
+    """Columnas que ubican cada registro en el tiempo: fechas DATE/TIMESTAMP («date»), años numéricos («year») y
+    columnas TEXT cuyos valores nombran períodos verificados («text», «text-dmy» o «text-mdy» según el orden de día y
+    mes que demuestra la columna). Una columna TEXT sólo cuenta si se leyeron todos sus valores."""
+    columns = {
+        (dataset.dataset_id, column.sql_name): (
+            "date" if column.sql_type in _TEMPORAL_TYPES else "year"
+        )
+        for dataset in datasets
+        for column in dataset.columns_metadata
+        if column.sql_type in _TEMPORAL_TYPES
+        or (
+            column.sql_type == "BIGINT"
+            and singular_words(column.original_name) in YEAR_COLUMN_NAMES
+        )
+    }
+    ids = {dataset.dataset_id for dataset in datasets}
+    columns |= {
+        (item.dataset_id, item.column): _TEXT_PERIOD_KINDS[item.day_first]
+        for item in text_periods
+        if item.dataset_id in ids and item.values and item.complete
+    }
+    return columns
+
+
+def text_period_day_first(kind) -> bool | None:
+    return {value: key for key, value in _TEXT_PERIOD_KINDS.items()}[kind]
+
+
+class _Applied(NamedTuple):
+    """Cómo acota su fecha una rama: extremos (None si queda abierto) y los períodos que nombran sus valores TEXT."""
+
+    start: date | None
+    end: date | None
+    named: tuple = ()
+
+
+def _applied_period(chain, steps, columns) -> _Applied | None:
+    """Intervalo al que los filtros de una rama acotan su fecha o su año; None si no la acotan."""
+    return _period_of(
+        (predicate, _period_kind(_filtered_field(step, predicate, steps), columns))
+        for step in chain
+        for predicate in step.filters
+    )
+
+
+def filters_period(filters, columns) -> _Applied | None:
+    """Período al que acotan filtros sobre columnas, antes de validar los pasos: sirve para reparar un plan."""
+    return _period_of(
+        (predicate, columns.get((predicate.field.dataset_id, predicate.field.column)))
+        for predicate in filters
+        if isinstance(predicate.field, ColumnRef)
+    )
+
+
+def period_matches(applied, period) -> bool:
+    return _bounds_period(applied, period)
+
+
+def _period_of(pairs) -> _Applied | None:
+    lower, upper, named = [], [], []
+    for predicate, kind in pairs:
+        if kind is None:
+            continue
+        if kind.startswith("text"):
+            if predicate.operator in {"eq", "in"}:
+                named += [
+                    bounds for value in predicate.values if (bounds := _period_value(value, kind))
+                ]
+            continue
+
+        low, high = _predicate_bounds(predicate, kind)
+        lower += low
+        upper += high
+
+    if not (lower or upper or named):
+        return None
+    return _Applied(max(lower) if lower else None, min(upper) if upper else None, tuple(named))
+
+
+def _filtered_field(step, predicate, steps) -> OutputField | None:
+    ref = predicate.field
+    if isinstance(ref, ColumnRef):
+        return next((item for item in step.output_fields if item.name == ref.column), None)
+
+    source = steps.get(ref.step_id)
+    return next((item for item in source.output_fields if item.name == ref.field), None)
+
+
+def _period_kind(field, columns) -> str | None:
+    if field is None:
+        return None
+    if field.sql_type in _TEMPORAL_TYPES:
+        return "date"
+    if len(field.sources) != 1:
+        return None
+
+    source = field.sources[0]
+    kind = columns.get((source.dataset_id, source.column))
+    # Un entero que proviene de una fecha es su año agrupado (time_grain=year).
+    if field.sql_type == "BIGINT":
+        return "year" if kind else None
+    return kind if field.sql_type == "TEXT" and kind and kind.startswith("text") else None
+
+
+def _predicate_bounds(predicate, kind) -> tuple[list[date], list[date]]:
+    """Días extremos que admite un filtro: «< 2022-01-01» termina el 31/12/2021 y «> 2020» empieza en 2021."""
+    values = [
+        parsed for value in predicate.values if (parsed := _period_value(value, kind)) is not None
+    ]
+    if not values:
+        return [], []
+
+    first = min(start for start, _ in values)
+    last = max(end for _, end in values)
+    day = timedelta(days=1)
+    bounds = {
+        "eq": ([first], [last]),
+        "in": ([first], [last]),
+        "ge": ([first], []),
+        "gt": ([last + day], []),
+        "le": ([], [last]),
+        "lt": ([], [first - day]),
+    }
+    return bounds.get(predicate.operator, ([], []))
+
+
+def _period_value(value, kind) -> tuple[date, date] | None:
+    """Primer y último día que nombra un valor de filtro: un año entero, el día de una fecha o el período que nombra
+    un texto («3/2013», «10-11/2007»)."""
+    if kind == "year":
+        plausible = type(value) is int and 1000 <= value <= 9999
+        return (date(value, 1, 1), date(value, 12, 31)) if plausible else None
+    if not isinstance(value, str):
+        return None
+    if kind.startswith("text"):
+        bounds = period_bounds(value, text_period_day_first(kind))
+        return bounds[:2] if bounds else None
+
+    try:
+        day = datetime.fromisoformat(value).date()
+    except ValueError:
+        return None
+
+    return day, day
+
+
+def _period_issues(steps, output_steps, periods, columns) -> list[ValidationIssue]:
+    """Como un umbral, cada salida debe acotar su fecha exactamente al período pedido; un extremo abierto («desde
+    2020») no admite otra cota. Con varios períodos cada salida acota uno de ellos y ninguno queda sin salida; si son
+    contiguos («2019 y 2020»), también vale una salida que los abarque juntos."""
+    if not periods:
+        return []
+
+    applied = {
+        key: _applied_period(
+            [steps[item] for item in _reachable_step_ids(steps, [key])], steps, columns
+        )
+        for key in output_steps
+    }
+    accepted = [*periods, *_contiguous_span(periods)]
+    covered, issues = set(), []
+    for key, interval in applied.items():
+        matched = {index for index, period in enumerate(accepted) if _bounds_period(interval, period)}
+        if not matched:
+            issues.append(_missing_period(key, periods))
+        covered |= matched
+
+    if len(periods) > 1 and len(periods) not in covered:
+        issues += [
+            _missing_period(None, [period])
+            for index, period in enumerate(periods)
+            if index not in covered
+        ]
+    return issues
+
+
+def _bounds_period(applied, period) -> bool:
+    """Valores TEXT acotan el período si todos los períodos que nombran caen dentro de él (el Planner los elige
+    así); una fecha o un año, si sus cotas son exactamente las pedidas."""
+    if applied is None:
+        return False
+    if applied.named:
+        return (
+            applied.start is None
+            and applied.end is None
+            and all(
+                (period.start is None or start >= period.start)
+                and (period.end is None or end <= period.end)
+                for start, end in applied.named
+            )
+        )
+    return (applied.start, applied.end) == (period.start, period.end)
+
+
+def _contiguous_span(periods) -> list[RequestedPeriod]:
+    """Períodos cerrados y seguidos («2019 y 2020») también se responden juntos; separados («2019 y 2021»), no."""
+    if len(periods) < 2 or any(period.start is None or period.end is None for period in periods):
+        return []
+
+    ordered = sorted(periods, key=lambda period: period.start)
+    if any(after.start != before.end + timedelta(days=1) for before, after in zip(ordered, ordered[1:])):
+        return []
+
+    text = " y ".join(period.text for period in ordered)
+    return [RequestedPeriod(text=text, start=ordered[0].start, end=ordered[-1].end)]
+
+
+def _missing_period(key, periods) -> ValidationIssue:
+    requested = " o ".join(f"{period.text} ({_interval_text(period)})" for period in periods)
+    target = f"la salida {key} no" if key is not None else "ninguna salida"
+    return ValidationIssue(
+        code="missing_requested_period",
+        severity="clarification",
+        step_id=key,
+        message=f"La consulta pide {requested}, pero {target} acota la fecha a ese intervalo: filtrá la columna de "
+        "fecha del read con ge y le esos días, sólo con la cota que existe si el período es abierto (o el año).",
+    )
+
+
+def _interval_text(period) -> str:
+    if period.start is None:
+        return f"hasta el {period.end.isoformat()}"
+    if period.end is None:
+        return f"desde el {period.start.isoformat()}"
+    return f"del {period.start.isoformat()} al {period.end.isoformat()}"
+
+
+def _time_grain_issues(steps, output_steps, time_grain) -> list[ValidationIssue]:
+    """«Promedio por mes»: cada salida que calcula debe agrupar una fecha por ese período; que otra rama lo haga no
+    alcanza. Sin cálculos (registros leídos), la agrupación no aplica a esa salida."""
+    issues = []
+    for key in output_steps:
+        chain = [steps[item] for item in _reachable_step_ids(steps, [key])]
+        calculates = any(step.operation == "aggregate" for step in chain)
+        grouped = {grouping.time_grain for step in chain for grouping in step.group_by}
+        if calculates and time_grain not in grouped:
+            issues.append(
+                ValidationIssue(
+                    code="missing_requested_time_grain",
+                    severity="clarification",
+                    step_id=key,
+                    message=f"La consulta pide agrupar por {_GRAIN_NAMES[time_grain]}: el aggregate de la "
+                    f"salida {key} debe agrupar la fecha con time_grain={time_grain}, no por fecha exacta.",
+                )
+            )
+
+    published = [steps[key] for key in _reachable_step_ids(steps, output_steps)]
+    calculated = any(step.operation == "aggregate" for step in published)
     grouped = {grouping.time_grain for step in published for grouping in step.group_by}
-    if time_grain and time_grain not in grouped:
+    if not calculated and time_grain not in grouped:
         issues.append(
             ValidationIssue(
                 code="missing_requested_time_grain",
@@ -244,10 +544,6 @@ def validate_requested_scope(
                 f"la fecha con time_grain={time_grain}, no por fecha exacta.",
             )
         )
-
-    # Contar una categoría («cuántos sitios») no la enumera.
-    if categories and "count" not in statistics:
-        issues.extend(_dimension_issues(steps, output_steps, dimensions or {}))
 
     return issues
 
@@ -451,6 +747,26 @@ def validate_selections(
     return result
 
 
+def _invented_columns(dataset: VerifiedDataset, invented: list[str]) -> str:
+    """Rechazo que nombra las columnas inventadas y las reales más parecidas, para el reintento y la trazabilidad."""
+    names = [column.sql_name for column in dataset.columns_metadata]
+    similar = list(
+        dict.fromkeys(match for name in invented for match in get_close_matches(name, names, n=3, cutoff=0.6))
+    )
+    message = (
+        f"El modelo seleccionó una columna inexistente en {dataset.name}: {', '.join(invented)}."
+        + (f" Columnas parecidas que sí existen: {', '.join(similar)}." if similar else "")
+    )
+    dated = any(_names_date(column.original_name) for column in dataset.columns_metadata)
+    if not dated and not period_columns([dataset]) and any(_names_date(name) for name in invented):
+        message += " Ese dataset no tiene columna de fecha ni año: no se puede acotar por período."
+    return message
+
+
+def _names_date(name: str) -> bool:
+    return bool(set(singular_words(name)) & _DATE_WORDS)
+
+
 def _selected_dataset(selection: DatasetSelection, dataset: VerifiedDataset) -> SelectedDataset:
     _require(
         selection.version == dataset.verified_version,
@@ -458,10 +774,8 @@ def _selected_dataset(selection: DatasetSelection, dataset: VerifiedDataset) -> 
     )
     columns = {column.sql_name: column for column in dataset.columns_metadata}
     _require(len(set(selection.columns)) == len(selection.columns), "La selección repite columnas.")
-    _require(
-        set(selection.columns).issubset(columns),
-        "El modelo seleccionó una columna inexistente.",
-    )
+    invented = [name for name in selection.columns if name not in columns]
+    _require(not invented, _invented_columns(dataset, invented))
 
     names = _with_projection_origins(selection.columns, columns)
 
@@ -904,8 +1218,22 @@ class _OperationValidator:
                 step.id,
             )
 
+    def _comparable(self, field: OutputField) -> tuple[str, str | None]:
+        source = field.sources[0] if len(field.sources) == 1 else None
+        dataset = self._datasets.get(source.dataset_id) if source else None
+        column = next(
+            (item for item in dataset.columns_metadata if item.sql_name == source.column), None
+        ) if dataset else None
+        return comparable_unit(column.original_name if column else field.name, field.unit)
+
     def _check_comparable_units(self, step, operands: list[OutputField]) -> None:
-        compatible = operands[0].unit is not None and operands[0].unit == operands[1].unit
+        # La misma unidad con otra grafía («mg/L» y «mg L-1») es comparable si también lo es su base química (mg N/L
+        # y mg/L sin base no lo son); no se convierte entre unidades.
+        compatible = (
+            operands[0].unit is not None
+            and operands[1].unit is not None
+            and self._comparable(operands[0]) == self._comparable(operands[1])
+        )
         same_variable = operands[0].sources == operands[1].sources
 
         if not compatible and not same_variable:
@@ -1055,6 +1383,8 @@ def validate_execution_plan(plan: PlanningResult, catalog: list[VerifiedDataset]
             categories=_asks_categories(evidence),
             chart=evidence.get("requested_chart", False),
             time_grain=evidence.get("requested_time_grain"),
+            periods=_requested_periods(evidence),
+            dated_columns=period_columns(selected, plan.temporal_text_columns),
         )
     )
     _require(
@@ -1118,6 +1448,13 @@ def _asks_categories(evidence) -> bool:
     return any(item["kind"] == "dimension" for item in evidence.get("query_mentions", [])) or any(
         item.get("requested_dimension_columns") for item in observed
     )
+
+
+def _requested_periods(evidence) -> list[RequestedPeriod]:
+    return [
+        RequestedPeriod.model_validate(item, strict=False)
+        for item in evidence.get("requested_periods", [])
+    ]
 
 
 def _requested_thresholds(evidence) -> list[RequestedThreshold]:

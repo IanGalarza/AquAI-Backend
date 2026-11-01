@@ -7,19 +7,112 @@ from aquai.application.contracts.retrieval import (
     DatasetCandidate,
     DatasetEvidence,
     DatasetRetrievalResult,
+    OmittedCandidate,
     ValueMatch,
 )
 from aquai.application.contracts.routing import DatasetBinding
 from aquai.application.interfaces.retrieval import DatasetSemanticSearch
 from aquai.application.interfaces.sources import SourceQueries
-from aquai.application.matching import contains_phrase, variable_core
+from aquai.application.matching import (
+    contains_phrase,
+    formula_named,
+    normalize_text,
+    other_quantity,
+    secondary_quantity,
+    singular_words,
+    symbol_named,
+    variable_core,
+    variable_variants,
+    without_medium,
+)
+from aquai.application.Rules.vocabulary import MENTION_CONNECTORS, PLACE_WORDS
 from aquai.domain.enums.sourceStatus import SemanticIndexStatus
 
 _logger = logging.getLogger(__name__)
+_PLACE_NAMES = {singular_words(word) for word in PLACE_WORDS}
+_DISCARD_REASONS = {
+    "medium": "descartadas por medir otro medio que el pedido",
+    "sum": "descartadas por sumar varias magnitudes",
+    "secondary": "descartadas por ser una proporción o un recuento en otra unidad, con el valor absoluto en el "
+    "mismo dataset",
+}
 
 
 def _named_columns(dataset, text):
     return [column.sql_name for column in dataset.columns_metadata if _column_named(column, text)]
+
+
+def _variable_columns_named(dataset, text):
+    return [column.sql_name for column in _variable_columns_found(dataset, text)[0]]
+
+
+def _variable_columns_found(dataset, text):
+    """Columnas de la variable por su nombre o uno equivalente («turbidez» → Turbiedad, Turb), por su fórmula química
+    («nitrato» → N-NO3) o por un símbolo que su unidad confirma («temperatura» → T (°C)), y las descartadas con su
+    motivo: miden otra cosa con ese nombre (la temperatura del aire, una suma), o son una proporción o un recuento de
+    colonias y el dataset tiene el valor absoluto. El medio pedido («del aire») no forma parte del nombre buscado: lo
+    exige other_quantity."""
+    base = without_medium(text)
+    variants = variable_variants(base)
+    named = [
+        column
+        for column in dataset.columns_metadata
+        if any(_column_named(column, variant) for variant in variants)
+        or formula_named(column.original_name, base)
+        or symbol_named(column.original_name, column.unit, base)
+    ]
+    discarded = {
+        column.sql_name: reason
+        for column in named
+        if (reason := other_quantity(column.original_name, text)) is not None
+    }
+    kept = [column for column in named if column.sql_name not in discarded]
+    primary = [
+        column
+        for column in kept
+        if not secondary_quantity(column.original_name, column.unit, text)
+    ]
+    if primary:
+        discarded |= {column.sql_name: "secondary" for column in kept if column not in primary}
+
+    return primary or kept, discarded
+
+
+def _match_reason(column, text):
+    """Cómo se reconoció una columna que no lleva el nombre pedido; None si lo lleva."""
+    base = without_medium(text)
+    if _column_named(column, base):
+        return None
+    if any(_column_named(column, variant) for variant in variable_variants(base)):
+        return "reconocidas por un nombre equivalente"
+    if formula_named(column.original_name, base):
+        return "reconocidas por su fórmula química"
+    return "reconocidas por su símbolo y su unidad"
+
+
+def _dimension_columns(dataset, text):
+    """La columna llamada como la dimensión («Sitio» para «qué sitios») la identifica. Las que sólo contienen esa
+    palabra («Nombre Sitio Literal», «Código Sitio») son transcripciones o códigos y se usan si no existe aquélla."""
+    named = [column for column in dataset.columns_metadata if _column_named(column, text)]
+    asked = _content_words(text)
+    exact = [column for column in named if _content_words(column.original_name) == asked]
+
+    return [column.sql_name for column in exact or named]
+
+
+def _place_columns(dataset):
+    """Columnas de texto llamadas sólo como un lugar: «Sitio», «Localidad», «Estación»."""
+    return {
+        column.sql_name
+        for column in dataset.columns_metadata
+        if column.sql_type == "TEXT" and _content_words(column.original_name) in _PLACE_NAMES
+    }
+
+
+def _content_words(text):
+    """Palabras en singular sin conectores: «qué sitios» y «Sitio», «punto de muestreo» y «Punto muestreo»."""
+    words = [word for word in normalize_text(text).split() if word not in MENTION_CONNECTORS]
+    return singular_words(" ".join(words))
 
 
 def _column_named(column, text):
@@ -51,16 +144,25 @@ class _Coverage:
         matches = self._evidence[dataset.dataset_id].variable_matches
         return bool(self._variables) and len(matches) == len(self._variables)
 
+    def has_dimensions(self, dataset):
+        matches = self._evidence[dataset.dataset_id].dimension_matches
+        return len(matches) == len(self._dimensions)
+
+    def covers_records(self, dataset):
+        """Registra las variables y los valores pedidos, aunque no identifique la dimensión preguntada."""
+        return (
+            bool(self._values or self._variables)
+            and (self.has_variables(dataset) or not self._variables)
+            and (self.has_values(dataset) or not self._values)
+        )
+
     def complete(self, dataset):
         # La dimensión preguntada («qué sitio») exige una columna que la identifique.
-        dimensions = len(self._evidence[dataset.dataset_id].dimension_matches) == len(
-            self._dimensions
-        )
         return (
             (bool(self._values) or bool(self._variables))
             and (self.has_values(dataset) or not self._values)
             and (self.has_variables(dataset) or not self._variables)
-            and dimensions
+            and self.has_dimensions(dataset)
         )
 
     def matches(self, dataset):
@@ -81,6 +183,7 @@ class RetrieveDatasetsService:
         dataset_bindings: list[DatasetBinding] | None = None,
         data_mentions=(),
         tentative_values=(),
+        reselect=False,
     ) -> DatasetRetrievalResult:
         if not dataset_bindings:
             return await self._search(question, limit, data_mentions, tentative_values)
@@ -92,7 +195,9 @@ class RetrieveDatasetsService:
         ranked = await self._rank(
             result, data_mentions, limit=None, restrict=inherited, tentative=tentative_values
         )
-        if not inherited or self._answers(ranked, data_mentions):
+        # Otro sitio u otra variable («¿y en Bagliardi?») se busca en todo el catálogo aunque un dataset heredado
+        # también los registre: otros pueden tenerlos con datos.
+        if not inherited or (self._answers(ranked, data_mentions) and not reselect):
             return ranked
 
         # Un seguimiento sobre otra variable o sitio («¿y la turbiedad?») no queda atado a
@@ -235,6 +340,8 @@ class RetrieveDatasetsService:
         if limit is not None:
             ranked = ranked[:limit]
 
+        result.omitted_candidates = self._omitted(candidates, ranked, coverage)
+        result.warnings.extend(self._rule_notes(ranked, variables))
         result.candidates = ranked
         result.evidence = [
             evidence[item.dataset_id]
@@ -264,13 +371,42 @@ class RetrieveDatasetsService:
 
     @staticmethod
     def _variable_columns(candidates, variable):
-        # La estadística de la mención («pH promedio») se descarta sólo si ningún candidato nombra la mención entera.
-        exact = {dataset.dataset_id: _named_columns(dataset, variable) for dataset in candidates}
-        if any(exact.values()):
-            return exact
+        text = RetrieveDatasetsService._matched_text(candidates, variable)
+        return {
+            dataset.dataset_id: _variable_columns_named(dataset, text) for dataset in candidates
+        }
 
-        core = variable_core(variable)
-        return {dataset.dataset_id: _named_columns(dataset, core) for dataset in candidates}
+    @staticmethod
+    def _matched_text(candidates, variable):
+        # La estadística de la mención («pH promedio») se descarta sólo si ningún candidato nombra la mención entera.
+        if any(_variable_columns_named(dataset, variable) for dataset in candidates):
+            return variable
+        return variable_core(variable)
+
+    @staticmethod
+    def _rule_notes(ranked, variables):
+        """Trazabilidad de las reglas de dominio en los avisos: columnas reconocidas sin el nombre pedido (un nombre
+        equivalente, una fórmula, un símbolo con su unidad) y columnas que lo llevan pero se descartaron."""
+        notes = []
+        for variable in variables:
+            text = RetrieveDatasetsService._matched_text(ranked, variable)
+            reasons = {}
+            for dataset in ranked:
+                kept, discarded = _variable_columns_found(dataset, text)
+                names = {column.sql_name: column.original_name for column in dataset.columns_metadata}
+                for column in kept:
+                    if (reason := _match_reason(column, text)) is not None:
+                        reasons.setdefault(reason, []).append(column.original_name)
+                for column, reason in discarded.items():
+                    reasons.setdefault(_DISCARD_REASONS[reason], []).append(names[column])
+
+            described = [
+                f"{reason}: " + ", ".join(f"«{name}»" for name in dict.fromkeys(names))
+                for reason, names in reasons.items()
+            ]
+            if described:
+                notes.append(f"Variable «{variable}»: " + "; ".join(described) + ".")
+        return notes
 
     @staticmethod
     def _split_dimensions(result, candidates, evidence, values, variables, dimensions):
@@ -301,7 +437,7 @@ class RetrieveDatasetsService:
             evidence[dataset.dataset_id].dimension_matches = {
                 dimension: names
                 for dimension in result.dimension_mentions
-                if (names := _named_columns(dataset, dimension))
+                if (names := _dimension_columns(dataset, dimension))
             }
         if reclassified:
             result.warnings.append(
@@ -346,9 +482,14 @@ class RetrieveDatasetsService:
     def _record_value_matches(candidates, evidence, found, values):
         for dataset in candidates:
             item = evidence[dataset.dataset_id]
+            places = _place_columns(dataset)
             for value in values:
                 rows = found.get(dataset.dataset_id, {}).get(value, [])
                 matches = RetrieveDatasetsService._value_matches(rows, value)
+                # Un lugar se filtra en la columna que lo nombra («Sitio»), no en transcripciones o códigos que
+                # también lo contienen («Nombre Sitio Literal»): cada una lo escribe distinto y acota otras filas.
+                canonical = [match for match in matches if match.column in places]
+                matches = canonical or matches
                 if matches:
                     item.value_matches[value] = matches
 
@@ -397,6 +538,22 @@ class RetrieveDatasetsService:
                 )
             return kept
         return ranked
+
+    @staticmethod
+    def _omitted(candidates, ranked, coverage):
+        """Candidatos con la variable y los valores pedidos que no llegan al Planner: la respuesta los menciona
+        para no presentar como completa una cobertura parcial."""
+        kept = {item.dataset_id for item in ranked}
+        return [
+            OmittedCandidate(
+                dataset_id=item.dataset_id,
+                name=item.name,
+                source_name=item.provenance.source_name,
+                reason="beyond_limit" if coverage.has_dimensions(item) else "missing_dimension",
+            )
+            for item in candidates
+            if item.dataset_id not in kept and coverage.covers_records(item)
+        ]
 
     @staticmethod
     def _has_evidence(item):

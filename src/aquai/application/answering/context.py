@@ -1,6 +1,6 @@
 import json
 from collections import Counter
-from datetime import date
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from hashlib import sha256
 from itertools import count as counter
@@ -14,6 +14,7 @@ from aquai.application.answering.wording import (
     calculation_meaning,
     column_label,
     count_text,
+    dataset_label,
     date_text,
     dated,
     display_unit,
@@ -32,7 +33,11 @@ from aquai.application.answering.wording import (
 )
 from aquai.application.contracts.answering import ResponseContextRecord
 from aquai.application.execution import decode_rows, execution_records
+from aquai.application.planning.followUp import period_fields
+from aquai.application.planning.temporalText import period_bounds
+from aquai.application.matching import singular_words
 from aquai.application.Rules.language import ENGLISH_CUES, SPANISH_CUES, WORD
+from aquai.application.Rules.vocabulary import YEAR_COLUMN_NAMES
 
 _EQUALITY_OPERATORS = {"eq", "ieq", "in"}
 _RANGE_OPERATORS = {"lt", "le", "gt", "ge"}
@@ -87,8 +92,13 @@ class _ContextBuilder:
         temporal = {
             (item.dataset_id, item.column): item.day_first for item in plan.temporal_text_columns
         }
-        self._writer = _Writer(self._sources, self._steps, self._language, temporal)
+        periods = [
+            tuple(_iso_date(item[side]) if item.get(side) else None for side in ("start", "end"))
+            for item in plan.context.evidence.get("requested_periods", [])
+        ]
+        self._writer = _Writer(self._sources, self._steps, self._language, temporal, periods)
         self._records = execution_records(state)
+        self._period = state.routing.requested_period if state.routing else None
 
         self._catalog = []
         self._body = self._initial_body()
@@ -99,14 +109,46 @@ class _ContextBuilder:
         self._meanings = {}
 
     def build(self):
+        self._add_references()
+        if self._period:
+            self._add_period_sentences()
+            return self._finish()
+
         if self._multi_source:
             self._body["introduction"] = self._writer.introduction(self._files)
-
-        self._add_references()
         self._add_table_sentences()
         self._add_meanings()
 
         return self._finish()
+
+    def _add_period_sentences(self):
+        """«¿Y de qué año es?» se contesta con el período de cada resultado, sin repetir sus párrafos."""
+        periods = self._state.planning.temporal_text_columns
+        for evidence in self._validation.usable_evidence:
+            if evidence.kind != "table":
+                continue
+
+            summary = self._summaries.get(evidence.evidence_id)
+            if not evidence.is_requested_output:
+                self._catalog.remove(summary)  # Los pasos intermedios no tienen un período propio.
+                continue
+
+            step = self._steps[evidence.operation_id]
+            record = self._records[evidence.operation_id]
+            fields = {field.name: field for field in record.columns}
+            origin, _latest, ranking = _trace_origin(step, self._steps)
+            grains = {item.output_name: item.time_grain for item in origin.group_by}
+            dated = [
+                (fields[name], grains.get(name, "raw"))
+                for name in period_fields(step, self._steps, periods)
+            ]
+            rows = _top_ranked(decode_rows(record, record.columns), ranking, fields)
+            span = _date_span(origin)
+            if span is not None:
+                text = self._writer.period_span(rows, *span, self._period)
+            else:
+                text = self._writer.period_answer(rows, dated, self._period)
+            self._drop_summary(evidence, self._add(evidence, text, attach=True, required=True))
 
     def _initial_body(self):
         state = self._state
@@ -256,9 +298,12 @@ class _ContextBuilder:
         if not rows:
             return writer.empty(evidence), False
 
-        if latest and len(rows) <= self._max_preview_rows and len(numeric) == 1:
+        if latest and len(numeric) == 1:
+            # Muchos registros empatados en la fecha más reciente se resumen; nunca se omite que lo son.
             date_field = fields[latest.order_by[0].field.field]
-            return writer.latest(rows, numeric[0], date_field, fields, latest, chain)
+            return writer.latest(
+                rows, numeric[0], date_field, fields, latest, chain, self._max_preview_rows
+            )
 
         if ranking and not calculations and not grouping:
             ranked = writer.ranking(rows, ranking, fields, self._max_preview_rows, chain)
@@ -315,10 +360,11 @@ class _ContextBuilder:
 
 
 class _Writer:
-    def __init__(self, sources, steps, language, temporal):
+    def __init__(self, sources, steps, language, temporal, periods=()):
         self._sources = sources
         self._steps = steps
         self._temporal = temporal
+        self._periods = periods
         self.language = language
         self.es = language == "es"
         self.names = FieldNames(steps, self.column, language)
@@ -446,14 +492,23 @@ class _Writer:
         return f"{preposition} {self.files(evidence)}, {_lowercase_first(text)}"
 
     def files(self, evidence):
-        names = _unique(
-            file_stem(self._sources[key].provenance.source_name) for key in evidence.dataset_ids
-        )
+        names = _unique(self._file_name(key) for key in evidence.dataset_ids)
         single = len(names) == 1
         if self.es:
             return ("el archivo " if single else "los archivos ") + join_words(names, "es")
 
         return ("the file " if single else "the files ") + join_words(names, "en")
+
+    def _file_name(self, dataset_id):
+        """El archivo; con la hoja si otra tabla del mismo archivo también participa del resultado."""
+        dataset = self._sources[dataset_id]
+        source = dataset.provenance.source_name
+        siblings = [item for item in self._sources.values() if item.provenance.source_name == source]
+        if len(siblings) == 1:
+            return file_stem(source)
+
+        sheet = "hoja" if self.es else "sheet"
+        return f"{file_stem(source)} ({sheet} {dataset_label(dataset.name)})"
 
     def introduction(self, files):
         if self.es:
@@ -571,14 +626,126 @@ class _Writer:
 
         Que un registro tenga dato de la variable medida es obvio para el lector y no se repite."""
         parts = []
+        periods = self._date_periods(chain)
         for ancestor in reversed(chain):
             for predicate in ancestor.filters:
-                if not _goes_without_saying(predicate, shown):
+                if _goes_without_saying(predicate, shown):
+                    continue
+                period = periods.get(_source_key(predicate.field))
+                ref = predicate.field
+                field = _source_field(ancestor, ref) if ref.kind == "column" else None
+                if period is not None and field and self._period_bounds(predicate, field):
+                    parts.append(period)
+                else:
                     parts.append(self._restriction(predicate, ancestor))
 
         parts = _unique(parts)
 
         return (" " + ", ".join(parts)) if parts else ""
+
+    def _date_periods(self, chain):
+        """Las cotas de una misma fecha se dicen juntas, como período: «en 2021», «del 01/03/2021 al 15/04/2021»,
+        «desde 2020». También un año numérico («Año igual a 2021» → «en 2021») y los valores de una fecha guardada
+        como texto, que se nombran con el período pedido que los contiene («en 2013»)."""
+        bounds = {}
+        for ancestor in chain:
+            for predicate in ancestor.filters:
+                ref = predicate.field
+                field = _source_field(ancestor, ref) if ref.kind == "column" else None
+                interval = self._period_bounds(predicate, field) if field and predicate.values else None
+                if interval is None:
+                    continue
+
+                found = bounds.setdefault(_source_key(ref), [None, None])
+                found[0] = interval[0] if interval[0] is not None else found[0]
+                found[1] = interval[1] if interval[1] is not None else found[1]
+
+        return {key: self._date_period(low, high) for key, (low, high) in bounds.items()}
+
+    def _period_bounds(self, predicate, field):
+        """Primer y último día que admite un filtro sobre una fecha, un año o una fecha TEXT; None en un extremo
+        abierto. Una igualdad sobre una fecha DATE se dice como valor, no como período."""
+        kind = self._period_kind(field)
+        operator = predicate.operator
+        if kind is None or (kind == "date" and operator not in _RANGE_OPERATORS):
+            return None
+        if kind == "text":
+            order = self._temporal.get(_single_source(field))
+            spans = [period_bounds(value, order) for value in predicate.values]
+            if operator not in {"eq", "in"} or None in spans:
+                return None
+            return self._requested_span(min(span[0] for span in spans), max(span[1] for span in spans))
+
+        days = [self._period_days(value, kind) for value in predicate.values]
+        if None in days or (operator == "in" and not _contiguous_days(days)):
+            return None
+        first, last, day = min(item[0] for item in days), max(item[1] for item in days), timedelta(days=1)
+        bounds = {
+            "eq": (first, last),
+            "in": (first, last),
+            "ge": (first, None),
+            "gt": (last + day, None),
+            "le": (None, last),
+            "lt": (None, first - day),
+        }
+        return bounds.get(operator)
+
+    def _period_kind(self, field):
+        if field.sql_type in _DATE_TYPES:
+            return "date"
+
+        source = _single_source(field)
+        if field.sql_type == "TEXT" and source in self._temporal:
+            return "text"
+        label = self.column(*source) if source else None
+        if field.sql_type == "BIGINT" and label and singular_words(label) in YEAR_COLUMN_NAMES:
+            return "year"
+        return None
+
+    @staticmethod
+    def _period_days(value, kind):
+        if kind == "year":
+            return (date(value, 1, 1), date(value, 12, 31)) if type(value) is int else None
+
+        moment = _iso_date(value)
+        return (moment, moment) if moment else None
+
+    def _requested_span(self, low, high):
+        """El período pedido que contiene los valores TEXT filtrados; sin uno, no se dicen como período (dos valores
+        sueltos no son un intervalo)."""
+        for start, end in self._periods:
+            if (start is None or start <= low) and (end is None or high <= end):
+                return start, end
+        return None
+
+    def _date_period(self, low, high):
+        if high is None:
+            return ("desde " if self.es else "from ") + self._period_bound(low, first=True)
+        if low is None:
+            return ("hasta " if self.es else "until ") + self._period_bound(high, first=False)
+
+        if low == high:
+            return ("el " if self.es else "on ") + date_text(low, self.language)
+        whole_years = (low.month, low.day, high.month, high.day) == (1, 1, 12, 31)
+        if whole_years and low.year == high.year:
+            return ("en " if self.es else "in ") + str(low.year)
+        if whole_years:
+            return f"de {low.year} a {high.year}" if self.es else f"from {low.year} to {high.year}"
+
+        whole_month = low.day == 1 and (high + timedelta(days=1)).day == 1
+        if whole_month and (low.year, low.month) == (high.year, high.month):
+            return ("en " if self.es else "in ") + grain(low, "month", self.language)[0]
+
+        first, last = date_text(low, self.language), date_text(high, self.language)
+        return f"del {first} al {last}" if self.es else f"from {first} to {last}"
+
+    def _period_bound(self, day, first):
+        """Un extremo abierto: «desde 2020», «hasta marzo de 2021», «desde el 05/03/2021»."""
+        if (day.month, day.day) == ((1, 1) if first else (12, 31)):
+            return str(day.year)
+        if (day.day == 1) if first else ((day + timedelta(days=1)).day == 1):
+            return grain(day, "month", self.language)[0]
+        return ("el " if self.es else "") + date_text(day, self.language)
 
     def _restriction(self, predicate, ancestor):
         ref = predicate.field
@@ -690,7 +857,121 @@ class _Writer:
 
         return "igual a " if self.es else "equal to "
 
-    def latest(self, rows, field, date_field, fields, step, chain):
+    def period_answer(self, rows, dated, asked):
+        """Período de las filas de un resultado con la precisión pedida: 2022, marzo de 2022 o el 31/03/2022.
+
+        dated son pares (campo, agrupación temporal) de los campos con fechas o períodos verificados."""
+        moments = [
+            moment
+            for row in rows
+            for field, time_grain in dated
+            if (moment := self._moment(field, row[field.name], time_grain)) is not None
+        ]
+        if not moments:
+            if self.es:
+                return (
+                    "El resultado anterior no tiene una fecha asociada: "
+                    "se calculó sin separar los registros por fecha."
+                )
+            return "The previous result has no date: it was calculated without separating records by date."
+
+        labels = dict(
+            label
+            for start, end, precision in moments
+            for label in self._labels(start, end, precision, asked)
+        )
+        texts = [labels[key] for key in sorted(labels)]
+
+        return self._covered(texts, asked) + self._exact_day(rows, moments, asked) + "."
+
+    def _exact_day(self, rows, moments, asked):
+        """Si se preguntó el año o el mes y todo corresponde a un mismo día, se dice cuál."""
+        distinct = set(moments)
+        if asked == "day" or len(distinct) != 1:
+            return ""
+
+        start, end, precision = next(iter(distinct))
+        if precision != "day" or start != end:
+            return ""
+
+        day = date_text(start, self.language)
+        if self.es:
+            return f" ({'registro' if len(rows) == 1 else 'registros'} del {day})"
+
+        return f" ({'record' if len(rows) == 1 else 'records'} from {day})"
+
+    def period_span(self, rows, first, last, asked):
+        """Período de los registros con que se calculó un resultado: de su primera a su última fecha."""
+        starts = [_as_day(row[first]) for row in rows if row[first] is not None]
+        ends = [_as_day(row[last]) for row in rows if row[last] is not None]
+        if not starts or not ends:
+            return self.period_answer(rows, [], asked)
+
+        start, end = min(starts), max(ends)
+        days = self._day_span(start, end)
+        if asked == "day":
+            period = days
+        else:
+            # 2021 a 2022 (del 01/09/2021 al 31/03/2022); marzo de 2022 (del 01/03/2022 al 31/03/2022).
+            labels = dict.fromkeys(self._labels(day, day, "day", asked)[0][1] for day in (start, end))
+            joined = (" a " if self.es else " to ").join(labels)
+            period = f"de {joined} ({days})" if self.es else f"from {joined} ({days})"
+
+        if self.es:
+            return f"El resultado anterior se calculó con registros {period}."
+        return f"The previous result was calculated with records {period}."
+
+    def _day_span(self, start, end):
+        first, last = date_text(start, self.language), date_text(end, self.language)
+        if self.es:
+            return f"del {first}" if start == end else f"del {first} al {last}"
+
+        return f"on {first}" if start == end else f"from {first} to {last}"
+
+    def _moment(self, field, value, time_grain):
+        """Intervalo que nombra un valor: un día, el mes o el año agrupado, o un período guardado como texto."""
+        if value is None:
+            return None
+        if time_grain == "year" and isinstance(value, int):
+            return date(value, 1, 1), date(value, 12, 31), "year"
+        if isinstance(value, date):
+            precision = "month" if time_grain == "month" else "day"
+            return value, value, precision
+        if isinstance(value, str):
+            return period_bounds(value, self._temporal.get(_single_source(field)))
+
+        return None
+
+    def _labels(self, start, end, precision, asked):
+        """Etiquetas ordenables del intervalo con la precisión pedida, o la que tenga el dato si es menor."""
+        if asked == "year" or precision == "year":
+            return [((year,), str(year)) for year in range(start.year, end.year + 1)]
+        if asked == "month" or precision in {"month", "months"}:
+            return [
+                ((day.year, day.month), grain(day, "month", self.language)[0])
+                for day in (start, end)
+            ]
+
+        return [((start.year, start.month, start.day), date_text(start, self.language))]
+
+    def _covered(self, texts, asked):
+        subject = "El resultado anterior" if self.es else "The previous result"
+        if len(texts) > 4:
+            first, last = texts[0], texts[-1]
+            if not self.es:
+                return f"{subject} spans from {first} to {last}"
+            span = f"del {first} al {last}" if asked == "day" else f"de {first} a {last}"
+            return f"{subject} abarca {span}"
+
+        listed = join_words(texts, self.language)
+        if not self.es:
+            return f"{subject} corresponds to {listed}"
+        if asked == "day":
+            return f"{subject} corresponde " + ("al " if len(texts) == 1 else "a las fechas ") + listed
+
+        return f"{subject} corresponde a {listed}"
+
+    def latest(self, rows, field, date_field, fields, step, chain, inline_values):
         """Si la fecha tiene varios registros, la tabla muestra a qué corresponde cada valor."""
         measured = self.names.result(step.id, field.name, field)
         label = measured + self.qualifier(chain, _shown(fields))
@@ -702,7 +983,7 @@ class _Writer:
         if len(rows) == 1:
             return self._latest_value(rows[0][field.name], field, label, where, moment), False
 
-        return self._latest_records(rows, field, label, where, moment), True
+        return self._latest_records(rows, field, label, where, moment, inline_values), True
 
     def _shared_attributes(self, rows, fields, skip):
         shared = []
@@ -731,10 +1012,23 @@ class _Writer:
 
         return f"The most recent {label} measurement{where} was {measured}, {when}."
 
-    def _latest_records(self, rows, field, label, where, moment):
+    def _latest_records(self, rows, field, label, where, moment, inline_values):
         counts = Counter(row[field.name] for row in rows)
-        parts = [self._tally(field, value, times) for value, times in counts.items()]
         origin = dated(*moment, self.language)
+        if len(counts) > inline_values:
+            if self.es:
+                total = self.count(len(rows), "registro", "registros")
+                return (
+                    f"Los registros más recientes de {label}{where} son {origin}: "
+                    f"son {total} con valores distintos y podés verlos en la tabla."
+                )
+            total = self.count(len(rows), "record", "records")
+            return (
+                f"The most recent {label} records{where} are {origin}: "
+                f"{total} with different values, listed in the table."
+            )
+
+        parts = [self._tally(field, value, times) for value, times in counts.items()]
         if self.es:
             return (
                 f"Los registros más recientes de {label}{where} son {origin}: "
@@ -1186,6 +1480,12 @@ def _lists_places(predicate, label):
     )
 
 
+def _contiguous_days(days) -> bool:
+    """Años o días consecutivos («2019, 2020») forman un período; sueltos («2019, 2021»), no."""
+    ordered = sorted(days)
+    return all(after[0] == before[1] + timedelta(days=1) for before, after in zip(ordered, ordered[1:]))
+
+
 def _iso_date(value):
     try:
         return date.fromisoformat(str(value)[:10])
@@ -1210,6 +1510,37 @@ def _lineage(step, steps):
         visit.extend(steps[key] for key in ancestor.depends_on)
 
     return chain
+
+
+def _top_ranked(rows, ranking, fields):
+    """En un ranking por un valor medido («el valor más alto»), la fecha que se pregunta es la del extremo y sus
+    empates, no la de los demás puestos."""
+    order = ranking.order_by[0] if ranking is not None and ranking.order_by else None
+    name = _ref_name(order.field) if order is not None else None
+    field = fields.get(name)
+    if field is None or field.sql_type not in NUMERIC_TYPES or not rows:
+        return rows
+
+    return [row for row in rows if row[name] == rows[0][name]]
+
+
+def _as_day(value):
+    return value.date() if isinstance(value, datetime) else value
+
+
+def _date_span(origin):
+    """Campos de la primera y la última fecha de un aggregate que sólo calcula el mínimo y el máximo de fechas."""
+    if origin.operation != "aggregate" or origin.group_by or len(origin.calculations) != 2:
+        return None
+
+    names = {item.function: item.output_name for item in origin.calculations}
+    fields = {field.name: field for field in origin.output_fields}
+    if set(names) != {"min", "max"}:
+        return None
+    if any(fields[name].sql_type not in _DATE_TYPES for name in names.values()):
+        return None
+
+    return names["min"], names["max"]
 
 
 def _trace_origin(step, steps):
