@@ -88,6 +88,7 @@ _PUBLICATION_STEP = re.compile(r"output_steps?(?:_[a-z0-9]+)?")
 _MAX_STEP_ID_LENGTH = 63
 # Valores distintos que se leen de una columna TEXT al perfilar períodos (distinct_text_values devuelve uno más).
 _DISTINCT_TEXT_LIMIT = 500
+_GRAIN_NAMES = {"day": "día", "month": "mes", "year": "año"}
 _PERIOD_LITERAL = re.compile(r"(?:1[89]|2\d)\d{2}(?:-\d{1,2}(?:-\d{1,2}(?:[T ][\d:.]+)?)?)?")
 # Errores frecuentes del modelo y cómo corregirlos; el texto de la validación sólo describe el síntoma.
 _HINTS = {
@@ -230,6 +231,44 @@ def _column_types(catalog):
     }
 
 
+def _registers(dataset, observed, mentions, numeric) -> bool:
+    """El dataset tiene columnas de cada variable y dimensión pedidas y registros de cada valor pedido; si se pide
+    calcular una estadística, cada variable necesita una columna numérica o su proyección numérica."""
+    if observed is None:
+        return False
+
+    found = {
+        "variable": observed["variable_columns"],
+        "dimension": observed["requested_dimension_columns"],
+        "value": observed["values"],
+    }
+    if not all(found[item["kind"]].get(item["text"]) for item in mentions if item["kind"] in found):
+        return False
+    if not numeric:
+        return True
+
+    computable = {
+        name
+        for column in dataset.columns_metadata
+        if column.numeric_eligible
+        for name in (column.sql_name, column.derived_from)
+    }
+    return all(
+        computable & set(found["variable"][item["text"]])
+        for item in mentions
+        if item["kind"] == "variable"
+    )
+
+
+def _dated(dataset, evidence, text_periods) -> bool:
+    """El dataset tiene con qué acotar los períodos pedidos y, para agrupar por día, mes o año, una fecha real."""
+    kinds = set(period_columns([dataset], text_periods).values())
+    if evidence.get("requested_periods") and not kinds:
+        return False
+
+    return not evidence.get("requested_time_grain") or "date" in kinds
+
+
 class PlanQueryService:
     def __init__(self, provider: PlannerProvider, queries: SourceQueries) -> None:
         self._provider = provider
@@ -368,7 +407,7 @@ class PlanQueryService:
             if proposal is None:
                 return self._without_period(common, retrieval.warnings)
             return self._planning_result(
-                proposal, retrieval.unmatched_values, context, excluded, periods
+                proposal, retrieval.unmatched_values, context, excluded, periods, catalog
             )
 
         reusable = chart_required and not (own or source_mentions or asked_statistics or grain)
@@ -381,7 +420,7 @@ class PlanQueryService:
 
         context.evidence.pop("previous_attempt_feedback", None)
         return self._planning_result(
-            proposal, retrieval.unmatched_values, context, excluded, periods
+            proposal, retrieval.unmatched_values, context, excluded, periods, catalog
         )
 
     @staticmethod
@@ -468,7 +507,8 @@ class PlanQueryService:
             llm_status=None,
             reason="Los candidatos recuperados carecen de fechas DATE/TIMESTAMP o de períodos TEXT interpretables; no se elige un registro arbitrario.",
             missing_information=[
-                "Una columna de fecha o período interpretable para determinar la medición más reciente."
+                "Las fuentes revisadas no tienen una columna de fecha o período interpretable para determinar "
+                "la medición más reciente."
             ],
             warnings=list(retrieval_warnings),
         )
@@ -480,7 +520,7 @@ class PlanQueryService:
             status="insufficient_coverage",
             llm_status=None,
             reason="No hay candidatos disponibles para fundamentar una planificación.",
-            missing_information=["Datasets recuperados disponibles y vigentes."],
+            missing_information=["No encontré fuentes disponibles relacionadas con esta consulta."],
             warnings=[
                 *retrieval_warnings,
                 "El alcance es el conjunto recuperado; no se evaluó todo el catálogo.",
@@ -531,7 +571,8 @@ class PlanQueryService:
             reason="El resultado citado no publica fechas y sus datasets no tienen una única columna de fecha "
             "con la que leer su período.",
             missing_information=[
-                "Una columna de fecha que permita indicar el período del resultado anterior."
+                "El resultado anterior no publica fechas y sus datos no tienen una única columna de fecha con "
+                "la que indicar su período."
             ],
             warnings=list(retrieval_warnings),
         )
@@ -621,7 +662,7 @@ class PlanQueryService:
             warnings=list(retrieval_warnings),
         )
 
-    def _planning_result(self, proposal, unmatched_values, context, excluded, periods):
+    def _planning_result(self, proposal, unmatched_values, context, excluded, periods, catalog):
         decision, selected, operations, issues, resolutions = proposal.verified
         decisions = [issue.message for issue in self._user_decisions(issues)]
         defects = [issue.message for issue in self._plan_defects(issues)]
@@ -631,21 +672,29 @@ class PlanQueryService:
             )
         status = self._final_status(defects, decisions, decision)
 
+        reason = None
         absent = self._absent_values(issues, defects, unmatched_values)
         undated = self._undated_periods(issues, defects, selected, context, periods)
         if absent or undated:
             status, defects = "insufficient_coverage", []
-            missing = [
-                *(f"No hay registros de {value} en los datos consultados." for value in absent),
-                *(
-                    f"Los datos consultados no tienen fechas que permitan acotarlos {period_phrase(period)}."
-                    for period in undated
-                ),
-            ]
+            reason = "Los candidatos no registran los valores o las fechas que el plan necesitaba filtrar."
+            # Sólo un filtro del plan sobre un valor sin registros prueba su ausencia; un valor que el plan no filtró
+            # puede ser un recorte impreciso del Router («ese sitio»).
+            filtered = any(issue.code == "filter_value_not_found" for issue in issues)
+            missing = self._coverage_gaps(absent=absent if filtered else [], undated=undated)
+            decision = decision.model_copy(update={"missing_information": missing})
+        elif status == "insufficient_coverage":
+            # El modelo declaró la falta de cobertura y su texto no llega al usuario. Si un candidato registra todo lo
+            # pedido, su negativa es un fallo del plan; si no, sólo se agregan las fechas que faltan, que no dependen
+            # de cómo el Router recortó las menciones.
+            covered = self._covers_request(context, catalog, periods)
+            reason = self._claimed_coverage_reason(decision, covered)
+            status = "failed" if covered else "insufficient_coverage"
+            missing = [] if covered else self._undated_request(context, catalog, periods)
             decision = decision.model_copy(update={"missing_information": missing})
 
         warnings = self._result_warnings(excluded, periods, operations, decision, selected, issues)
-        reason = self._result_reason(defects, decisions, status, selected, operations)
+        reason = reason or self._result_reason(defects, decisions, status, selected, operations)
         plannable = status == "plannable"
         if plannable and proposal.attempts == 0:
             reason = (
@@ -709,6 +758,69 @@ class PlanQueryService:
             return []
 
         return list(context.evidence.get("requested_periods", []))
+
+    @staticmethod
+    def _covers_request(context, catalog, text_periods):
+        """Evidencia positiva de cobertura: un candidato revisado tiene columnas de las variables y dimensiones
+        pedidas, registros de los valores pedidos y fechas para acotar los períodos o agrupar por tiempo. Una
+        mención que no coincide no prueba una carencia: puede ser un recorte impreciso del Router."""
+        evidence = context.evidence
+        mentions = evidence.get("query_mentions", [])
+        if not any(item["kind"] in {"variable", "value"} for item in mentions):
+            return False
+
+        observed = {item["dataset_id"]: item for item in evidence.get("observed_evidence", [])}
+        numeric = any(
+            function not in _TEXT_CALCULATIONS for function in evidence.get("requested_statistics", [])
+        )
+        return any(
+            _registers(dataset, observed.get(str(dataset.dataset_id)), mentions, numeric)
+            and _dated(dataset, evidence, text_periods)
+            for dataset in catalog
+        )
+
+    @classmethod
+    def _undated_request(cls, context, catalog, text_periods):
+        """Fechas que ningún candidato revisado tiene para acotar los períodos pedidos o agrupar por tiempo."""
+        evidence = context.evidence
+        kinds = set(period_columns(catalog, text_periods).values())
+        undated = [] if kinds else evidence.get("requested_periods", [])
+        grain = evidence.get("requested_time_grain")
+        ungrouped = [_GRAIN_NAMES[grain]] if grain and "date" not in kinds else []
+        return cls._coverage_gaps(undated=undated, ungrouped=ungrouped)
+
+    @staticmethod
+    def _coverage_gaps(absent=(), undated=(), ungrouped=()):
+        """Carencias verificadas como enunciados para el usuario: ausencia de registros y falta de fechas."""
+        return [
+            *(f"No hay registros de {value} en los datos consultados." for value in absent),
+            *(
+                f"Los datos consultados no tienen una columna de fecha con la que acotarlos {period_phrase(period)}."
+                for period in undated
+            ),
+            *(
+                f"Los datos consultados no tienen una columna de fecha con la que agruparlos por {grain}."
+                for grain in ungrouped
+            ),
+        ]
+
+    @staticmethod
+    def _claimed_coverage_reason(decision, covered):
+        """Trazabilidad de la cobertura insuficiente que declaró el modelo; su texto no llega a la respuesta."""
+        claimed = (
+            f"Motivo del modelo: {decision.reason.rstrip('. ')}. Faltante según el modelo: "
+            + "; ".join(item.rstrip(". ") for item in decision.missing_information)
+            + "."
+        )
+        if covered:
+            return (
+                "El modelo declaró cobertura insuficiente, pero un candidato revisado registra las variables, los "
+                f"valores y las fechas pedidos: se trata como un plan fallido, no como falta de datos. {claimed}"
+            )
+        return (
+            "El modelo declaró cobertura insuficiente y la evidencia observada no muestra un candidato que registre "
+            f"todo lo pedido; la respuesta no repite su texto. {claimed}"
+        )
 
     @staticmethod
     def _result_warnings(excluded, periods, operations, decision, selected, issues):

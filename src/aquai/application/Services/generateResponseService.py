@@ -244,7 +244,7 @@ class GenerateResponseService:
         if validation.clarification_question:
             text += " " + validation.clarification_question
         elif validation.missing_information:
-            text += _missing_information_text(validation, language)
+            text += _missing_information_text(validation)
 
         return text
 
@@ -425,12 +425,6 @@ def _generation_error(context) -> ExecutionError:
     )
 
 
-def _missing_information_text(validation, language):
-    prefix = (
-        " Me faltó información sobre: "
-        if language == "es"
-        else " I was missing information about: "
-    )
-    items = "; ".join(item.rstrip(". ") for item in validation.missing_information)
-
-    return prefix + items + "."
+def _missing_information_text(validation):
+    # Cada carencia es un enunciado que el Planner verificó (registros, columnas o fechas), nunca texto del modelo.
+    return "".join(f" {item.strip()}" for item in validation.missing_information)
