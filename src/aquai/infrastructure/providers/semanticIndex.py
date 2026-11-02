@@ -52,17 +52,17 @@ class QdrantSemanticIndex:
         self,
         settings: TabularSettings,
         *,
+        embeddings: OllamaEmbeddingProvider,
         client: QdrantClient | None = None,
-        embeddings: OllamaEmbeddingProvider | None = None,
         queries: SourceQueries | None = None,
     ) -> None:
         self._settings = settings
         self._client = client or QdrantClient(
             url=settings.qdrant_url, timeout=math.ceil(settings.index_timeout_seconds)
         )
-        self._embeddings = embeddings or OllamaEmbeddingProvider(settings)
+        self._embeddings = embeddings
         self._queries = queries
-        self._embedding_model = model_identity(settings.embedding_model)
+        self._embedding_model = model_identity(embeddings.model)
         self._vector_name = "embedding_" + sha256(self._embedding_model.encode()).hexdigest()[:24]
 
     #
@@ -375,7 +375,7 @@ class QdrantSemanticIndex:
     # Agrega el prefijo de documento o de consulta que requiere el modelo nomic-embed-text.
     #
     def _embedding_text(self, text: str, *, query: bool) -> str:
-        model_name = self._settings.embedding_model.split(":", 1)[0]
+        model_name = self._embeddings.model.split(":", 1)[0]
         if model_name != "nomic-embed-text":
             return text
 

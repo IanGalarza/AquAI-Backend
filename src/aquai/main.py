@@ -7,8 +7,8 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from aquai.infrastructure.providers.conversations import ConversationRuntime
 from aquai.infrastructure.providers.llm.ollama import warm_up_models
+from aquai.infrastructure.providers.llm.settings import get_llm_settings
 from aquai.infrastructure.providers.sources import SourceRuntime, create_source_runtime
-from aquai.infrastructure.providers.tabular import get_tabular_settings
 from aquai.presentation.controllers.conversations import router as conversations_router
 from aquai.presentation.controllers.sources import router as sources_router
 from aquai.presentation.errors import register_exception_handlers
@@ -42,7 +42,7 @@ def create_app(
         app.state.sources = runtime
         await runtime.worker.start()
 
-        warm_up = None if sources else asyncio.create_task(warm_up_models(get_tabular_settings()))
+        warm_up = None if sources else asyncio.create_task(warm_up_models(get_llm_settings()))
 
         try:
             yield

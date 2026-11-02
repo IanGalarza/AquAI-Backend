@@ -11,6 +11,11 @@ from qdrant_client import QdrantClient, models
 
 from aquai.application.contracts.ingestion import PreparedTable
 from aquai.application.errors import LLMProviderError
+from aquai.infrastructure.config.llm import (
+    EmbeddingModelSettings,
+    OllamaSettings,
+    TabularModelSettings,
+)
 from aquai.infrastructure.config.tabular import TabularSettings
 from aquai.infrastructure.providers.llm.ollama import (
     OllamaEmbeddingProvider,
@@ -50,6 +55,7 @@ class SemanticProviderTests(unittest.IsolatedAsyncioTestCase):
     #
     async def test_semantic_contract_preserves_types_units_names_and_bounded_sample(self):
         settings = TabularSettings(_env_file=None, sample_rows=2)
+        agent = TabularModelSettings(_env_file=None)
         table = PreparedTable(
             name="Mediciones",
             source_locator={"file_type": "csv", "sheet": "Mediciones", "range": [1, 20, 1, 2]},
@@ -89,13 +95,18 @@ class SemanticProviderTests(unittest.IsolatedAsyncioTestCase):
             return httpx.Response(
                 200,
                 json={
-                    "model": settings.default_model,
+                    "model": agent.model,
                     "done": True,
                     "message": {"content": json.dumps(response)},
                 },
             )
 
-        provider = OllamaSemanticProvider(settings, transport=httpx.MockTransport(handle))
+        provider = OllamaSemanticProvider(
+            settings,
+            OllamaSettings(_env_file=None),
+            agent,
+            transport=httpx.MockTransport(handle),
+        )
         result = await provider.describe(table)
         self.assertEqual(table, before)
 
@@ -162,7 +173,7 @@ class SemanticProviderTests(unittest.IsolatedAsyncioTestCase):
     # Verifica que el endpoint de embeddings devuelve vectores reales y rechaza respuestas inválidas.
     #
     async def test_embedding_endpoint_returns_actual_vectors_and_rejects_bad_protocol(self):
-        settings = TabularSettings(_env_file=None)
+        chat_model = TabularModelSettings(_env_file=None).model
         requests = []
         body = {
             "model": "nomic-embed-text:latest",
@@ -173,7 +184,11 @@ class SemanticProviderTests(unittest.IsolatedAsyncioTestCase):
             requests.append(request)
             return httpx.Response(200, json=body)
 
-        provider = OllamaEmbeddingProvider(settings, transport=httpx.MockTransport(handle))
+        provider = OllamaEmbeddingProvider(
+            OllamaSettings(_env_file=None),
+            EmbeddingModelSettings(_env_file=None),
+            transport=httpx.MockTransport(handle),
+        )
         self.assertEqual(await provider.embed(["Uno", "Dos"]), body["embeddings"])
         self.assertEqual(str(requests[0].url), "http://localhost:11434/api/embed")
         self.assertEqual(
@@ -186,7 +201,7 @@ class SemanticProviderTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(await provider.embed([]), [])
         invalid = (
-            {"model": settings.default_model, "embeddings": [[0.1, 0.2]]},
+            {"model": chat_model, "embeddings": [[0.1, 0.2]]},
             {"model": "nomic-embed-text", "embeddings": []},
             {"model": "nomic-embed-text", "embeddings": [[True, 0.2]]},
             {"model": "nomic-embed-text", "embeddings": [[0, 0]]},
@@ -203,6 +218,7 @@ class SemanticIndexTests(unittest.IsolatedAsyncioTestCase):
     #
     def setUp(self):
         self.settings = TabularSettings(_env_file=None)
+        self.embedding = EmbeddingModelSettings(_env_file=None)
         self.client = QdrantClient(":memory:")
         self.requests = []
 
@@ -212,13 +228,13 @@ class SemanticIndexTests(unittest.IsolatedAsyncioTestCase):
             return httpx.Response(
                 200,
                 json={
-                    "model": self.settings.embedding_model,
+                    "model": self.embedding.model,
                     "embeddings": [[0.25, 0.75] for _ in payload["input"]],
                 },
             )
 
         self.embeddings = OllamaEmbeddingProvider(
-            self.settings, transport=httpx.MockTransport(handle)
+            OllamaSettings(_env_file=None), self.embedding, transport=httpx.MockTransport(handle)
         )
 
     #
@@ -302,7 +318,7 @@ class SemanticIndexTests(unittest.IsolatedAsyncioTestCase):
         for vector_name, dimension, message in (
             (
                 "embedding_"
-                + sha256(model_identity(self.settings.embedding_model).encode()).hexdigest()[:24],
+                + sha256(model_identity(self.embedding.model).encode()).hexdigest()[:24],
                 3,
                 "dimensión",
             ),

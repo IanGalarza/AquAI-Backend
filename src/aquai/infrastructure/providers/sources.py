@@ -77,21 +77,25 @@ def create_source_runtime() -> SourceRuntime:
         OllamaEmbeddingProvider,
         OllamaSemanticProvider,
     )
+    from aquai.infrastructure.providers.llm.settings import get_llm_settings
     from aquai.infrastructure.providers.semanticIndex import QdrantSemanticIndex
 
     initialize_application()
     context = get_db_context()
     settings = get_tabular_settings()
+    models = get_llm_settings()
     queries = SqlAlchemySourceQueries(context)
     index = QdrantSemanticIndex(
-        settings, embeddings=OllamaEmbeddingProvider(settings), queries=queries
+        settings,
+        embeddings=OllamaEmbeddingProvider(models.ollama, models.embedding),
+        queries=queries,
     )
 
     return build_source_runtime(
         SqlAlchemySourceCommands(context),
         queries,
         SimpleTabularProcessor(settings),
-        OllamaSemanticProvider(settings),
+        OllamaSemanticProvider(settings, models.ollama, models.tabular),
         index,
         max_upload_bytes=settings.max_upload_bytes,
     )

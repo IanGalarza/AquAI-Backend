@@ -22,18 +22,18 @@ class _StructuredConversationProvider:
     #
     # Guarda la configuración, el prompt y el contrato de salida, y calcula el presupuesto de contexto.
     #
-    def __init__(self, settings, prompt, output, *, output_tokens):
-        self._settings = settings
-        self._client = _OllamaClient(settings, None)
+    def __init__(self, ollama, agent, prompt, output):
+        self._agent = agent
+        self._client = _OllamaClient(ollama, None)
         self._prompt = prompt
         self._output = output
-        self._output_tokens = min(output_tokens, settings.llm_num_ctx // 4)
+        self._output_tokens = min(agent.max_output_tokens, agent.num_ctx // 4)
 
         overhead = len(prompt.encode()) + len(json.dumps(output.model_json_schema())) + 1024
         self.context_budget_bytes = max(
-            0, min(24_000, 2 * (settings.llm_num_ctx - self._output_tokens) - overhead)
+            0, min(agent.context_max_bytes, 2 * (agent.num_ctx - self._output_tokens) - overhead)
         )
-        self.model = settings.default_model
+        self.model = agent.model
 
     #
     # Envía el contexto a Ollama y devuelve la salida estructurada con sus metadatos.
@@ -48,11 +48,11 @@ class _StructuredConversationProvider:
             {
                 "model": self.model,
                 "stream": False,
-                "think": self._settings.llm_think,
+                "think": self._agent.think,
                 "format": schema or self._output.model_json_schema(),
                 "options": {
-                    "temperature": 0,
-                    "num_ctx": self._settings.llm_num_ctx,
+                    "temperature": self._agent.temperature,
+                    "num_ctx": self._agent.num_ctx,
                     "num_predict": self._output_tokens,
                 },
                 "messages": [
@@ -60,7 +60,7 @@ class _StructuredConversationProvider:
                     {"role": "user", "content": content},
                 ],
             },
-            self._settings.llm_timeout_seconds,
+            self._agent.timeout_seconds,
         )
         metadata = {
             "model": body.get("model", self.model),
@@ -76,7 +76,7 @@ class _StructuredConversationProvider:
     #
     def _message_content(self, body, metadata):
         message = body.get("message")
-        context_limit = self._settings.llm_num_ctx - self._output_tokens - 256
+        context_limit = self._agent.num_ctx - self._output_tokens - 256
         incomplete = (
             body.get("done") is not True
             or body.get("done_reason") == "length"
@@ -103,8 +103,8 @@ class OllamaRoutingProvider(_StructuredConversationProvider):
     #
     # Configura el proveedor con el prompt y el contrato del enrutamiento.
     #
-    def __init__(self, settings):
-        super().__init__(settings, ROUTER_PROMPT, RoutingDraft, output_tokens=768)
+    def __init__(self, ollama, agent):
+        super().__init__(ollama, agent, ROUTER_PROMPT, RoutingDraft)
 
     #
     # Interpreta la consulta con el historial y devuelve la decisión de enrutamiento.
@@ -137,8 +137,8 @@ class OllamaGeneralResponseProvider(_StructuredConversationProvider):
     #
     # Configura el proveedor con el prompt y el contrato de la respuesta general.
     #
-    def __init__(self, settings):
-        super().__init__(settings, GENERAL_PROMPT, GeneralDraft, output_tokens=1536)
+    def __init__(self, ollama, agent):
+        super().__init__(ollama, agent, GENERAL_PROMPT, GeneralDraft)
 
     #
     # Genera la respuesta general sin consultar datos y devuelve su borrador.

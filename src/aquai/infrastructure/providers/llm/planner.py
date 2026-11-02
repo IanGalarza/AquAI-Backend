@@ -9,7 +9,7 @@ from aquai.application.contracts.planning import (
 )
 from aquai.application.errors import LLMProviderError
 from aquai.application.prompts.planning import PLANNER_PROMPT
-from aquai.infrastructure.config.tabular import TabularSettings
+from aquai.infrastructure.config.llm import OllamaSettings, PlannerModelSettings
 from aquai.infrastructure.providers.llm.ollama import (
     _OllamaClient,
     exceeds_context,
@@ -77,12 +77,12 @@ class OllamaPlannerProvider:
     #
     # Guarda la configuración, prepara el esquema del plan y calcula el presupuesto de contexto.
     #
-    def __init__(self, settings: TabularSettings) -> None:
-        self._settings = settings
-        self._client = _OllamaClient(settings, None)
+    def __init__(self, ollama: OllamaSettings, agent: PlannerModelSettings) -> None:
+        self._agent = agent
+        self._client = _OllamaClient(ollama, None)
         self._output = TypeAdapter(PlannerOutput)
         self._schema = self._output.json_schema()
-        self._output_tokens = min(4096, settings.llm_num_ctx // 4)
+        self._output_tokens = min(agent.max_output_tokens, agent.num_ctx // 4)
 
         overhead = (
             len(PLANNER_PROMPT.encode("utf-8"))
@@ -90,7 +90,8 @@ class OllamaPlannerProvider:
             + 1024
         )
         self._budget = max(
-            0, min(96_000, 2 * (settings.llm_num_ctx - self._output_tokens) - overhead)
+            0,
+            min(agent.context_max_bytes, 2 * (agent.num_ctx - self._output_tokens) - overhead),
         )
 
     #
@@ -112,13 +113,13 @@ class OllamaPlannerProvider:
         body = await self._client.post(
             "/api/chat",
             {
-                "model": self._settings.default_model,
+                "model": self._agent.model,
                 "stream": False,
-                "think": self._settings.llm_think,
+                "think": self._agent.think,
                 "format": schema,
                 "options": {
-                    "temperature": 0,
-                    "num_ctx": self._settings.llm_num_ctx,
+                    "temperature": self._agent.temperature,
+                    "num_ctx": self._agent.num_ctx,
                     "num_predict": self._output_tokens,
                 },
                 "messages": [
@@ -126,7 +127,7 @@ class OllamaPlannerProvider:
                     {"role": "user", "content": content},
                 ],
             },
-            self._settings.llm_timeout_seconds,
+            self._agent.timeout_seconds,
         )
         decision = self._parse_decision(self._message_content(body))
 
@@ -165,7 +166,7 @@ class OllamaPlannerProvider:
         if incomplete:
             raise LLMProviderError("Ollama devolvió una planificación incompleta.")
 
-        context_limit = self._settings.llm_num_ctx - self._output_tokens - 256
+        context_limit = self._agent.num_ctx - self._output_tokens - 256
         if exceeds_context(body, context_limit):
             raise LLMProviderError(
                 "El contexto del Planner se aproxima al límite real del modelo; hay que acotar la consulta."

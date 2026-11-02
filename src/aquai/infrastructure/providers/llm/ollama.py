@@ -21,6 +21,13 @@ from aquai.application.prompts.tabular import (
     TABULAR_SEMANTIC_PROMPT,
     TABULAR_STRUCTURE_PROMPT,
 )
+from aquai.infrastructure.config.llm import (
+    AgentModelSettings,
+    EmbeddingModelSettings,
+    LLMSettings,
+    OllamaSettings,
+    TabularModelSettings,
+)
 from aquai.infrastructure.config.tabular import TabularSettings
 
 _inference_locks: WeakKeyDictionary = WeakKeyDictionary()
@@ -120,7 +127,7 @@ class _OllamaClient:
     # Guarda la configuración y el transporte HTTP del cliente de Ollama.
     #
     def __init__(
-        self, settings: TabularSettings, transport: httpx.AsyncBaseTransport | None
+        self, settings: OllamaSettings, transport: httpx.AsyncBaseTransport | None
     ) -> None:
         self._settings = settings
         self._transport = transport
@@ -142,10 +149,10 @@ class _OllamaClient:
     # Agrega al payload el tiempo de permanencia del modelo si está configurado.
     #
     def _with_keep_alive(self, payload: dict) -> dict:
-        if self._settings.llm_keep_alive is None:
+        if self._settings.keep_alive is None:
             return payload
 
-        return {**payload, "keep_alive": self._settings.llm_keep_alive}
+        return {**payload, "keep_alive": self._settings.keep_alive}
 
     #
     # Envía la petición HTTP a Ollama con cola de inferencia y traduce los errores a errores del proveedor.
@@ -154,9 +161,7 @@ class _OllamaClient:
         try:
             async with _inference_lock():
                 async with httpx.AsyncClient(timeout=timeout, transport=self._transport) as client:
-                    response = await client.post(
-                        f"{self._settings.ollama_base_url}{path}", json=payload
-                    )
+                    response = await client.post(f"{self._settings.base_url}{path}", json=payload)
                     response.raise_for_status()
         except httpx.TimeoutException as exc:
             raise LLMProviderError("Ollama superó el tiempo máximo de respuesta.") from exc
@@ -198,13 +203,19 @@ class _OllamaClient:
 
 class OllamaSemanticProvider:
     #
-    # Guarda la configuración y crea el cliente de Ollama del proveedor semántico.
+    # Guarda la configuración tabular y la del modelo, y crea el cliente de Ollama del proveedor.
     #
     def __init__(
-        self, settings: TabularSettings, *, transport: httpx.AsyncBaseTransport | None = None
+        self,
+        settings: TabularSettings,
+        ollama: OllamaSettings,
+        agent: TabularModelSettings,
+        *,
+        transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
         self._settings = settings
-        self._client = _OllamaClient(settings, transport)
+        self._agent = agent
+        self._client = _OllamaClient(ollama, transport)
 
     #
     # Pide a Ollama sugerencias de estructura para regiones candidatas y valida que no las alteren.
@@ -331,17 +342,17 @@ class OllamaSemanticProvider:
         body = await self._client.post(
             "/api/chat",
             {
-                "model": self._settings.default_model,
+                "model": self._agent.model,
                 "stream": False,
-                "think": self._settings.llm_think,
+                "think": self._agent.think,
                 "format": schema,
-                "options": {"temperature": 0, "num_ctx": self._settings.llm_num_ctx},
+                "options": {"temperature": self._agent.temperature, "num_ctx": self._agent.num_ctx},
                 "messages": [
                     {"role": "system", "content": prompt},
                     {"role": "user", "content": content},
                 ],
             },
-            self._settings.llm_timeout_seconds,
+            self._agent.timeout_seconds,
         )
 
         message = body.get("message")
@@ -415,13 +426,24 @@ class OllamaSemanticProvider:
 
 class OllamaEmbeddingProvider:
     #
-    # Guarda la configuración y crea el cliente de Ollama del proveedor de embeddings.
+    # Guarda la configuración del modelo y crea el cliente de Ollama del proveedor de embeddings.
     #
     def __init__(
-        self, settings: TabularSettings, *, transport: httpx.AsyncBaseTransport | None = None
+        self,
+        ollama: OllamaSettings,
+        agent: EmbeddingModelSettings,
+        *,
+        transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
-        self._settings = settings
-        self._client = _OllamaClient(settings, transport)
+        self._agent = agent
+        self._client = _OllamaClient(ollama, transport)
+
+    #
+    # Devuelve el nombre del modelo de embeddings configurado.
+    #
+    @property
+    def model(self) -> str:
+        return self._agent.model
 
     #
     # Calcula los embeddings de una lista de textos con Ollama y valida los vectores devueltos.
@@ -435,11 +457,11 @@ class OllamaEmbeddingProvider:
         body = await self._client.post(
             "/api/embed",
             {
-                "model": self._settings.embedding_model,
+                "model": self._agent.model,
                 "input": texts,
                 "truncate": False,
             },
-            self._settings.embedding_timeout_seconds,
+            self._agent.timeout_seconds,
         )
 
         vectors = body.get("embeddings")
@@ -470,24 +492,36 @@ class OllamaEmbeddingProvider:
 
 
 #
+# Devuelve un agente por cada combinación distinta de modelo y contexto, en orden de aparición.
+#
+def _distinct_chat_models(agents: tuple[AgentModelSettings, ...]) -> list[AgentModelSettings]:
+    distinct = {}
+    for agent in agents:
+        distinct.setdefault((model_identity(agent.model), agent.num_ctx), agent)
+
+    return list(distinct.values())
+
+
+#
 # Precarga los modelos de Ollama al iniciar para que la primera consulta no pague la carga.
 #
-async def warm_up_models(settings: TabularSettings) -> None:
-    client = _OllamaClient(settings, None)
+async def warm_up_models(settings: LLMSettings) -> None:
+    client = _OllamaClient(settings.ollama, None)
     try:
-        await client.post(
-            "/api/chat",
-            {
-                "model": settings.default_model,
-                "messages": [],
-                "options": {"num_ctx": settings.llm_num_ctx},
-            },
-            settings.llm_timeout_seconds,
-        )
+        for agent in _distinct_chat_models(settings.chat_agents):
+            await client.post(
+                "/api/chat",
+                {
+                    "model": agent.model,
+                    "messages": [],
+                    "options": {"num_ctx": agent.num_ctx},
+                },
+                agent.timeout_seconds,
+            )
         await client.post(
             "/api/embed",
-            {"model": settings.embedding_model, "input": ["warm-up"]},
-            settings.embedding_timeout_seconds,
+            {"model": settings.embedding.model, "input": ["warm-up"]},
+            settings.embedding.timeout_seconds,
         )
     except LLMProviderError as error:
         logging.getLogger(__name__).warning(

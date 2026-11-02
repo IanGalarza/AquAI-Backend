@@ -9,8 +9,7 @@ from aquai.application.contracts.answering import (
 )
 from aquai.application.errors import LLMProviderError
 from aquai.application.prompts.response import RESPONSE_PROMPT
-from aquai.infrastructure.config.answering import AnsweringSettings
-from aquai.infrastructure.config.tabular import TabularSettings
+from aquai.infrastructure.config.llm import OllamaSettings, ResponseModelSettings
 from aquai.infrastructure.providers.llm.ollama import (
     _OllamaClient,
     exceeds_context,
@@ -33,10 +32,10 @@ class OllamaResponseProvider:
     #
     # Guarda la configuración y calcula el presupuesto de contexto de la redacción.
     #
-    def __init__(self, settings: TabularSettings, answering_settings: AnsweringSettings):
-        self._settings = settings
-        self._client = _OllamaClient(settings, None)
-        self._output_tokens = min(2048, settings.llm_num_ctx // 4)
+    def __init__(self, ollama: OllamaSettings, agent: ResponseModelSettings):
+        self._agent = agent
+        self._client = _OllamaClient(ollama, None)
+        self._output_tokens = min(agent.max_output_tokens, agent.num_ctx // 4)
 
         overhead = (
             len(RESPONSE_PROMPT.encode("utf-8"))
@@ -45,10 +44,7 @@ class OllamaResponseProvider:
         )
         self._budget = max(
             0,
-            min(
-                answering_settings.context_max_bytes,
-                2 * (settings.llm_num_ctx - self._output_tokens) - overhead,
-            ),
+            min(agent.context_max_bytes, 2 * (agent.num_ctx - self._output_tokens) - overhead),
         )
 
     #
@@ -63,7 +59,7 @@ class OllamaResponseProvider:
     #
     @property
     def model(self) -> str:
-        return self._settings.default_model
+        return self._agent.model
 
     #
     # Pide a Ollama que redacte la respuesta a partir de la evidencia y devuelve el borrador.
@@ -79,11 +75,11 @@ class OllamaResponseProvider:
             {
                 "model": self.model,
                 "stream": False,
-                "think": self._settings.llm_think,
+                "think": self._agent.think,
                 "format": schema,
                 "options": {
-                    "temperature": 0,
-                    "num_ctx": self._settings.llm_num_ctx,
+                    "temperature": self._agent.temperature,
+                    "num_ctx": self._agent.num_ctx,
                     "num_predict": self._output_tokens,
                 },
                 "messages": [
@@ -91,7 +87,7 @@ class OllamaResponseProvider:
                     {"role": "user", "content": content},
                 ],
             },
-            self._settings.llm_timeout_seconds,
+            self._agent.timeout_seconds,
         )
         metadata = {
             "model": body.get("model", self.model),
@@ -123,7 +119,7 @@ class OllamaResponseProvider:
     #
     def _message_content(self, body: dict, metadata: dict) -> str:
         message = body.get("message")
-        context_limit = self._settings.llm_num_ctx - self._output_tokens - 256
+        context_limit = self._agent.num_ctx - self._output_tokens - 256
         incomplete = (
             body.get("done") is not True
             or body.get("done_reason") == "length"

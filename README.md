@@ -51,7 +51,8 @@ Editar `.env` con las credenciales y conexiones del entorno. `DATABASE_URL` debe
 coincidir con las variables `POSTGRES_*`. Los caracteres especiales del usuario
 y la contraseña deben codificarse en la URL; por ejemplo, `@` como `%40`.
 
-El archivo también permite configurar Ollama, Qdrant y los límites de carga.
+El archivo también permite configurar Ollama, Qdrant, los límites de carga y, en
+las variables `LLM_*`, el modelo, el contexto y los tokens de cada agente.
 
 ### 3. Iniciar PostgreSQL y Qdrant
 

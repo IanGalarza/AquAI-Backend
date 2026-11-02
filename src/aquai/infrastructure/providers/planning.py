@@ -16,10 +16,10 @@ from aquai.infrastructure.providers.llm.routing import (
     OllamaGeneralResponseProvider,
     OllamaRoutingProvider,
 )
+from aquai.infrastructure.providers.llm.settings import get_llm_settings
 from aquai.infrastructure.providers.pythonExecution import create_python_agent
 from aquai.infrastructure.providers.retrieval import create_dataset_retriever
 from aquai.infrastructure.providers.sqlExecution import create_sql_agent
-from aquai.infrastructure.providers.tabular import get_tabular_settings
 from aquai.infrastructure.queries.sources import SqlAlchemySourceQueries
 
 
@@ -27,11 +27,13 @@ from aquai.infrastructure.queries.sources import SqlAlchemySourceQueries
 # Construye el grafo de planificación de consultas con sus servicios y proveedores.
 #
 def create_query_planning_graph() -> CompiledStateGraph:
-    settings = get_tabular_settings()
+    models = get_llm_settings()
     sources = SqlAlchemySourceQueries(get_db_context())
-    planner = PlanQueryService(OllamaPlannerProvider(settings), sources)
-    router = RouteQueryService(OllamaRoutingProvider(settings), sources)
-    direct = GenerateDirectResponseService(OllamaGeneralResponseProvider(settings), sources)
+    planner = PlanQueryService(OllamaPlannerProvider(models.ollama, models.planner), sources)
+    router = RouteQueryService(OllamaRoutingProvider(models.ollama, models.router), sources)
+    direct = GenerateDirectResponseService(
+        OllamaGeneralResponseProvider(models.ollama, models.general), sources
+    )
 
     return build_query_planning_graph(
         create_dataset_retriever,
