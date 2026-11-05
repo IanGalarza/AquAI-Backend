@@ -27,7 +27,7 @@ DOI = re.compile(r"\b10\.\d{4,9}/[^\s\"<>,;]+(?:\s+\d{6,}\b)?", re.IGNORECASE)
 SUSPECT_MICRO_UNIT = re.compile(
     r"(?<![\w.])l(?:g|S|mol|m)\b|(?:(?<=\d )|(?<=\())[pP] ?[gm]\b|,ug\b"
 )
-UNMAPPED_CHARACTER = re.compile("[\\x00\\x01\\x03-\\x08\\x0b\\x0c\\x0e-\\x1f\\ufffd\\ue000-\\uf8ff]")
+UNMAPPED_CHARACTER = re.compile("[\\x00\\x01\\x03-\\x08\\x0b\\x0c\\x0e-\\x1f\\x7f-\\x9f\\ufffd\\ue000-\\uf8ff]")
 WORD = re.compile(r"[^\W\d_]+")
 WHITESPACE = re.compile(r"\s+")
 

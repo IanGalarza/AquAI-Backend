@@ -48,16 +48,22 @@ from aquai.infrastructure.processing.documents.structure import (
     release_unnamed_captions,
     restore_headings,
 )
+from aquai.infrastructure.processing.documents.fontEncodings import tex_symbol
 from aquai.infrastructure.processing.documents.symbols import (
     MICRO_SIGN,
     PageSymbols,
     SymbolWord,
+    _accents_on_letters,
     _agreed_symbol,
+    _coded_symbol,
+    _decoded,
+    _filled,
     _read_symbol,
     _replaced,
     _standard_symbol,
     _unit_marks,
     _unit_words,
+    _with_accent,
 )
 from aquai.infrastructure.processing.documents.tableCheck import (
     TableCheck,
@@ -653,6 +659,89 @@ class SymbolTests(unittest.TestCase):
         self.assertIsNone(_standard_symbol("NotoSansSymbols2", "m"))
 
     #
+    # Verifica que los códigos de las fuentes de TeX siguen su codificación publicada.
+    #
+    def test_tex_fonts_follow_their_published_encoding(self) -> None:
+        self.assertEqual(tex_symbol("ABCDEF+AdvP4C4E74", "\x0e"), "°")
+        self.assertEqual(tex_symbol("ABCDEF+AdvP4C4E74", "\ufffd"), "−")
+        self.assertEqual(tex_symbol("AdvMT_MI", "\x15"), "λ")
+        self.assertEqual(tex_symbol("CMEX10", "\x10"), "(")
+        self.assertEqual(tex_symbol("AdvP4C4E59", "\x13"), "\u0301")
+        self.assertIsNone(tex_symbol("AGaramond-Regular", "\x13"))
+
+    #
+    # Verifica que lo que el PDF declara como letras en estas fuentes son sus símbolos.
+    #
+    def test_tex_fonts_have_no_real_letters(self) -> None:
+        self.assertEqual(_standard_symbol("AdvP4C4E74", "¼"), "=")
+        self.assertEqual(_standard_symbol("CMSY10", "0"), "′")
+        self.assertEqual(_standard_symbol("AdvP4C4E51", ":"), ".")
+        self.assertEqual(_standard_symbol("AdvP4C4E46", "ð"), "∫")
+        self.assertEqual(_standard_symbol("SymbolMT", chr(0xF02B)), "+")
+
+    #
+    # Verifica que una fuente que ya declara bien sus signos no se reinterpreta.
+    #
+    def test_declared_signs_stay_as_they_are(self) -> None:
+        self.assertIsNone(_standard_symbol("TeX_CM_Maths_Symbols", "("))
+        self.assertIsNone(_standard_symbol("TeX_CM_Maths_Italic", "<"))
+
+    #
+    # Verifica que Docling manda sobre PDFium sólo si su carácter es legible.
+    #
+    def test_coded_symbol_prefers_readable_text(self) -> None:
+        self.assertEqual(_coded_symbol("Times", "é"), "é")
+        self.assertEqual(_coded_symbol("AdvP4C4E74", "\x0e"), "°")
+        self.assertEqual(_coded_symbol("AdvP4C4E74", "-"), "×")
+        self.assertIsNone(_coded_symbol("Times", "\x0e"))
+
+    #
+    # Verifica que un acento cae sobre la letra que le sigue, y que sin letra no queda suelto.
+    #
+    def test_accent_lands_on_the_next_letter(self) -> None:
+        self.assertEqual(_accents_on_letters(list("Qu\u0301ebec")), "Québec")
+        self.assertEqual(_with_accent("\u0301", " Ecole"), "École")
+        self.assertEqual(_with_accent("\u0301", " 12"), " 12")
+
+    #
+    # Verifica que un código solo nunca se confunde con otro código del mismo elemento.
+    #
+    def test_lone_code_needs_its_neighbors(self) -> None:
+        accent = word("\x01", 0, "Montr", "eal")
+
+        self.assertIsNone(_replaced("a 25 \x0e C", accent, "\u0301"))
+        self.assertEqual(_replaced("Montr\x13eal", accent, "\u0301"), "Montréal")
+
+    #
+    # Verifica que un código se decodifica sólo si una de las fuentes presentes lo explica.
+    #
+    def test_codes_follow_the_fonts_of_their_box(self) -> None:
+        by_code = {"F": {"\x13": "\u0301"}, "G": {"\x13": "⊇"}}
+
+        self.assertEqual(_decoded("Secci\x13on", {"F"}, by_code), ("Sección", 1))
+        self.assertEqual(_decoded("Secci\x13on", {"F", "G"}, by_code), ("Secci\x13on", 0))
+        self.assertEqual(_decoded("25 \x0e C", {"AdvP4C4E74"}, {}), ("25 ° C", 1))
+        self.assertEqual(_decoded("a ¼ b", {"AdvP4C4E74"}, {}), ("a = b", 1))
+        self.assertEqual(_decoded("a ¼ b", {"Times"}, {}), ("a ¼ b", 0))
+
+    #
+    # Verifica que el guion de fin de línea de PDFium se lee como guion al comparar con la página.
+    #
+    def test_line_hyphen_reads_as_a_hyphen(self) -> None:
+        glyph = Glyph("\x02", 0, 0, 1, 1, "Times")
+
+        self.assertEqual(PageSymbols().applied(1, [glyph])[0].text, "-")
+
+    #
+    # Verifica que lo perdido se toma de la capa del PDF sólo si sus vecinos lo ubican.
+    #
+    def test_lost_character_comes_from_the_text_layer(self) -> None:
+        self.assertEqual(_filled("cell mL\ufffd 1 in", "cellmL−1in"), ("cell mL− 1 in", 1))
+        self.assertEqual(_filled("A\ufffdairs", "Affairs"), ("Affairs", 1))
+        self.assertEqual(_filled("a\ufffdb", "a−b a+b"), ("a\ufffdb", 0))
+        self.assertEqual(_filled("x\ufffdy", "otra cosa"), ("x\ufffdy", 0))
+
+    #
     # Verifica que la lectura de la página resuelve el carácter si la palabra coincide.
     #
     def test_reading_resolves_the_symbol_of_a_matching_word(self) -> None:
@@ -697,7 +786,7 @@ class SymbolTests(unittest.TestCase):
     # Verifica que un carácter sin equivalente nunca se confunde con un valor legítimo.
     #
     def test_unmapped_character_never_matches_a_real_value(self) -> None:
-        self.assertEqual(_replaced("7", word("\ufffd", 0), "≤"), "7")
+        self.assertIsNone(_replaced("7", word("\ufffd", 0), "≤"))
         self.assertEqual(_replaced("valores 25 y 35", word("\x035", 0), "−5"), "valores 25 y 35")
         self.assertEqual(_replaced("pH \ufffd 7", word("\ufffd", 0), "≤"), "pH ≤ 7")
 
