@@ -98,13 +98,16 @@ class GenerateDirectResponseService:
         started = perf_counter()
         try:
             catalog = await asyncio.to_thread(self._catalog.catalog_overview)
+            documents = await asyncio.to_thread(self._catalog.document_overview)
         except Exception:
             return self._failure(
                 response, "catalog_unavailable", "No se pudo consultar el catálogo de fuentes."
             )
 
         bound_dataset_ids = [item.dataset_id for item in routing.dataset_bindings]
-        response.segments = catalog_segments(catalog, bound_dataset_ids, routing.language)
+        response.segments = catalog_segments(
+            catalog, bound_dataset_ids, routing.language, documents
+        )
         response.answer = answer_text(response.segments)
         response.limitations.append(
             "Inventario consultado en PostgreSQL durante esta respuesta; no se leyeron registros de los datasets."

@@ -101,6 +101,13 @@ class EmbeddingModelSettings(BaseSettings):
         return non_empty_name(value)
 
 
+class DocumentEmbeddingModelSettings(EmbeddingModelSettings):
+    model_config = SettingsConfigDict(env_prefix="LLM_DOCUMENT_EMBEDDING_")
+
+    model: str = Field(default="bge-m3", min_length=1, max_length=200)
+    timeout_seconds: float = Field(default=300, gt=0, allow_inf_nan=False)
+
+
 class LLMSettings(BaseModel):
     ollama: OllamaSettings = Field(default_factory=OllamaSettings)
     tabular: TabularModelSettings = Field(default_factory=TabularModelSettings)
@@ -109,6 +116,9 @@ class LLMSettings(BaseModel):
     planner: PlannerModelSettings = Field(default_factory=PlannerModelSettings)
     response: ResponseModelSettings = Field(default_factory=ResponseModelSettings)
     embedding: EmbeddingModelSettings = Field(default_factory=EmbeddingModelSettings)
+    document_embedding: DocumentEmbeddingModelSettings = Field(
+        default_factory=DocumentEmbeddingModelSettings
+    )
 
     #
     # Devuelve la configuración de los agentes que usan un modelo de chat.
@@ -122,8 +132,11 @@ class LLMSettings(BaseModel):
     #
     @model_validator(mode="after")
     def validate_separate_embedding_model(self) -> "LLMSettings":
-        embedding_model = self.embedding.model.removesuffix(":latest")
+        embedding_models = {
+            self.embedding.model.removesuffix(":latest"),
+            self.document_embedding.model.removesuffix(":latest"),
+        }
         chat_models = {agent.model.removesuffix(":latest") for agent in self.chat_agents}
-        if embedding_model in chat_models:
+        if embedding_models & chat_models:
             raise ValueError("Los agentes de chat y los embeddings requieren modelos diferentes.")
         return self

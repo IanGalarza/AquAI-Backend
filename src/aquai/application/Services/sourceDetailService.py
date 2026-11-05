@@ -2,17 +2,20 @@ import asyncio
 from uuid import UUID
 
 from aquai.application.dtos.responses.getSource import SourceDetailResponse
+from aquai.application.interfaces.documents import DocumentQueries
 from aquai.application.interfaces.sources import SourceQueries
+from aquai.application.Rules.documents import DOCUMENT_FILE_TYPES
 
 READY_STATUSES = {"ready", "ready_with_warnings"}
 
 
 class SourceDetailService:
     #
-    # Guarda las consultas de fuentes que usa el servicio.
+    # Guarda las consultas de fuentes y de documentos que usa el servicio.
     #
-    def __init__(self, queries: SourceQueries) -> None:
+    def __init__(self, queries: SourceQueries, documents: DocumentQueries | None = None) -> None:
         self._queries = queries
+        self._documents = documents
 
     #
     # Devuelve el detalle de una fuente indicando qué datasets son consultables.
@@ -30,5 +33,17 @@ class SourceDetailService:
             )
 
         source["queryable"] = any(dataset["queryable"] for dataset in source["datasets"])
+        if self._documents and source["file_type"] in DOCUMENT_FILE_TYPES:
+            source["document"] = await self._document_summary(source)
 
         return SourceDetailResponse.model_validate(source)
+
+    #
+    # Devuelve el resumen del documento con el motivo del último fallo de indexación.
+    #
+    async def _document_summary(self, source: dict) -> dict | None:
+        summary = await asyncio.to_thread(self._documents.summary, source["id"])
+        if summary is None:
+            return None
+
+        return {**summary, "index_error": source["processing_report"].get("semantic_index_error")}

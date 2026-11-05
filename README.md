@@ -1,7 +1,7 @@
 # AquAI Backend
 
-Backend de AquAI para cargar archivos CSV y XLSX, gestionar fuentes y almacenar
-sus conjuntos de datos. Ofrece una API HTTP con FastAPI y capacidades semánticas
+Backend de AquAI para cargar archivos CSV, XLSX, PDF y DOCX, gestionar fuentes y
+almacenar sus conjuntos de datos y documentos. Ofrece una API HTTP con FastAPI y capacidades semánticas
 mediante modelos locales.
 
 ## Arquitectura
@@ -72,6 +72,7 @@ Luego, instalar los modelos definidos en `.env`. Con la configuración predeterm
 ```powershell
 ollama pull qwen3.5:9b
 ollama pull nomic-embed-text
+ollama pull bge-m3
 ```
 
 ### 5. Aplicar las migraciones
@@ -97,10 +98,12 @@ operación y usar **Try it out** y **Execute**.
 
 | Método | Ruta | Descripción |
 |---|---|---|
-| POST | `/sources` | Carga un CSV o XLSX mediante `multipart/form-data`, con el campo `file`. Responde con HTTP 202 y el identificador de la fuente. |
+| POST | `/sources` | Carga un CSV, XLSX, PDF o DOCX mediante `multipart/form-data`, con el campo `file`. Responde con HTTP 202 y el identificador de la fuente. |
 | GET | `/sources` | Lista las fuentes con paginación y filtros. |
 | GET | `/sources/{id}` | Consulta el estado de una fuente y sus datasets, columnas y conteos. |
 | PATCH | `/sources/{id}` | Activa o desactiva una fuente. |
+| PUT | `/sources/{id}/file` | Reemplaza el archivo de un documento PDF o DOCX y lo vuelve a procesar. |
+| DELETE | `/sources/{id}` | Elimina un documento PDF o DOCX con su contenido e índice. |
 
 `GET /sources` acepta los parámetros opcionales `page` (predeterminado: 1),
 `page_size` (predeterminado: 20; máximo: 100), `name` y `processing_status`.

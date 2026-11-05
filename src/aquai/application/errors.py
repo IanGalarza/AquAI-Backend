@@ -1,4 +1,12 @@
-class TabularInputError(ValueError):
+class SourceInputError(ValueError):
+    pass
+
+
+class TabularInputError(SourceInputError):
+    pass
+
+
+class DocumentInputError(SourceInputError):
     pass
 
 

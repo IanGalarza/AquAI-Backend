@@ -30,6 +30,12 @@ from aquai.application.useCases.ConversationOperation.Queries.listConversationsH
 from aquai.application.useCases.SourceOperation.Commands.activateSourceHandler import (
     ActivateSourceHandler,
 )
+from aquai.application.useCases.SourceOperation.Commands.deleteSourceHandler import (
+    DeleteSourceHandler,
+)
+from aquai.application.useCases.SourceOperation.Commands.replaceSourceFileHandler import (
+    ReplaceSourceFileHandler,
+)
 from aquai.application.useCases.SourceOperation.Commands.uploadSourceHandler import (
     UploadSourceHandler,
 )
@@ -48,6 +54,7 @@ from aquai.infrastructure.providers.sources import SourceRuntime
 SINGLE_FILE_FIELD_ERROR = (
     "La carga admite únicamente un archivo en el campo file, sin parámetros adicionales."
 )
+DOCUMENTS_UNAVAILABLE_ERROR = "La gestión de documentos no está disponible."
 
 
 #
@@ -90,10 +97,38 @@ def get_activate_source_handler(request: Request) -> ActivateSourceHandler:
     return _get_source_runtime(request).activate
 
 
+#
+# Devuelve el manejador que elimina fuentes documentales o responde 503 si no está disponible.
+#
+def get_delete_source_handler(request: Request) -> DeleteSourceHandler:
+    handler = _get_source_runtime(request).delete
+
+    if handler is None:
+        raise HTTPException(status_code=503, detail=DOCUMENTS_UNAVAILABLE_ERROR)
+
+    return handler
+
+
+#
+# Devuelve el manejador que reemplaza archivos o responde 503 si no está disponible.
+#
+def get_replace_source_file_handler(request: Request) -> ReplaceSourceFileHandler:
+    handler = _get_source_runtime(request).replace_file
+
+    if handler is None:
+        raise HTTPException(status_code=503, detail=DOCUMENTS_UNAVAILABLE_ERROR)
+
+    return handler
+
+
 UploadSourceDependency = Annotated[UploadSourceHandler, Depends(get_upload_source_handler)]
 ListSourcesDependency = Annotated[ListSourcesHandler, Depends(get_list_sources_handler)]
 GetSourceDependency = Annotated[GetSourceHandler, Depends(get_source_handler)]
 ActivateSourceDependency = Annotated[ActivateSourceHandler, Depends(get_activate_source_handler)]
+DeleteSourceDependency = Annotated[DeleteSourceHandler, Depends(get_delete_source_handler)]
+ReplaceSourceFileDependency = Annotated[
+    ReplaceSourceFileHandler, Depends(get_replace_source_file_handler)
+]
 
 
 #
@@ -101,7 +136,7 @@ ActivateSourceDependency = Annotated[ActivateSourceHandler, Depends(get_activate
 #
 async def read_source_file(
     request: Request,
-    file: Annotated[UploadFile, File(description="Archivo original CSV o XLSX.")],
+    file: Annotated[UploadFile, File(description="Archivo original CSV, XLSX, PDF o DOCX.")],
     handler: UploadSourceDependency,
 ) -> AsyncIterator[UploadSourceRequest]:
     form = await request.form()

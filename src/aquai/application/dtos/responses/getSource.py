@@ -103,6 +103,22 @@ class DatasetDetail(BaseModel):
 
 
 #
+# Resumen del contenido extraído de una fuente documental.
+#
+class DocumentSummary(BaseModel):
+    id: UUID
+    title: str | None
+    language: str | None
+    page_count: int | None = Field(ge=1)
+    duplicate_of_source_id: UUID | None
+    section_count: int = Field(ge=0)
+    chunk_count: int = Field(ge=0)
+    table_count: int = Field(ge=0)
+    figure_count: int = Field(ge=0)
+    index_error: str | None = None
+
+
+#
 # Respuesta con el detalle completo de una fuente y sus datasets.
 #
 class SourceDetailResponse(SourceStateResponse):
@@ -116,3 +132,4 @@ class SourceDetailResponse(SourceStateResponse):
     processing_report: ProcessingReport
     datasets: list[DatasetDetail]
     queryable: bool
+    document: DocumentSummary | None = None

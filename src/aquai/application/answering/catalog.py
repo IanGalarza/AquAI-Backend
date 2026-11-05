@@ -22,19 +22,21 @@ _ENGLISH_STATES = (
 
 
 #
-# Construye los segmentos de respuesta que describen las fuentes y tablas del catálogo.
+# Construye los segmentos de respuesta que describen las fuentes, tablas y documentos cargados.
 #
-def catalog_segments(catalog, focus_dataset_ids=(), language="es") -> list[AnswerSegment]:
+def catalog_segments(
+    catalog, focus_dataset_ids=(), language="es", documents=()
+) -> list[AnswerSegment]:
     focus = set(focus_dataset_ids)
     datasets = [dataset for source in catalog for dataset in source["datasets"]]
     available = [dataset for dataset in datasets if dataset["available"]]
 
-    if not catalog:
+    if not catalog and not documents:
         return [AnswerSegment(text=_no_sources(language))]
     if focus:
         return _focused_segments(catalog, focus, language)
 
-    return _overview_segments(catalog, datasets, available, language)
+    return _overview_segments(catalog, datasets, available, language, documents)
 
 
 #
@@ -44,12 +46,12 @@ def _no_sources(language):
     if language == "es":
         return (
             "Todavía no hay fuentes cargadas en AquAI. "
-            "Podés subir archivos CSV o XLSX desde el panel de fuentes."
+            "Podés subir archivos CSV, XLSX, PDF o DOCX desde el panel de fuentes."
         )
 
     return (
         "There are no sources loaded in AquAI yet. "
-        "You can upload CSV or XLSX files from the sources panel."
+        "You can upload CSV, XLSX, PDF or DOCX files from the sources panel."
     )
 
 
@@ -90,33 +92,84 @@ def _table_segment(source, dataset, label, language):
 #
 # Construye el resumen general de las fuentes cargadas y su cierre.
 #
-def _overview_segments(catalog, datasets, available, language):
-    header = _inventory(catalog, datasets, available, language)
+def _overview_segments(catalog, datasets, available, language, documents):
+    header = _inventory(catalog, datasets, available, language, documents)
     notes = _state_notes(catalog, language)
     if notes:
         header += " " + sentence(join_words(notes, language)) + "."
 
     items = [_source_item(source, language) for source in catalog]
+    segments = [AnswerSegment(text=header, items=items)]
+    if documents:
+        segments.append(_documents_segment(documents, language))
+    if catalog:
+        segments.append(AnswerSegment(text=_closing(language, documents)))
 
-    return [AnswerSegment(text=header, items=items), AnswerSegment(text=_closing(language))]
+    return segments
 
 
 #
-# Devuelve la frase con el total de fuentes y tablas disponibles para consultar.
+# Construye la lista de documentos, aclarando que todavía no se consultan desde el chat.
 #
-def _inventory(catalog, datasets, available, language):
+def _documents_segment(documents, language):
+    if language == "es":
+        text = "Documentos PDF y DOCX, que todavía no se pueden consultar desde el chat:"
+    else:
+        text = "PDF and DOCX documents, which cannot be queried from the chat yet:"
+
+    items = [f"{document['name']}{_source_state(document, language)}" for document in documents]
+
+    return AnswerSegment(text=text, items=items)
+
+
+#
+# Devuelve la frase con el total de fuentes, tablas disponibles y documentos.
+#
+def _inventory(catalog, datasets, available, language, documents=()):
     partial = len(available) != len(datasets)
     if language == "es":
         sources = count_text(len(catalog), "fuente cargada", "fuentes cargadas")
         tables = count_text(len(available), "tabla disponible", "tablas disponibles")
         prepared = f", de {len(datasets)} preparadas" if partial else ""
+        if documents:
+            return _spanish_mixed_inventory(catalog, documents, tables, prepared)
         return f"Tenés {sources} con {tables} para consultar{prepared}."
 
     sources = count_text(len(catalog), "loaded source", "loaded sources", "en")
     tables = count_text(len(available), "queryable table", "queryable tables", "en")
     prepared = f" out of {len(datasets)} prepared" if partial else ""
+    if documents:
+        return _english_mixed_inventory(catalog, documents, tables, prepared)
 
     return f"You have {sources} with {tables}{prepared}."
+
+
+#
+# Devuelve la frase en español con el total de fuentes, separando planillas y documentos.
+#
+def _spanish_mixed_inventory(catalog, documents, tables, prepared):
+    total = count_text(len(catalog) + len(documents), "fuente cargada", "fuentes cargadas")
+    texts = count_text(len(documents), "documento", "documentos")
+    if not catalog:
+        return f"Tenés {total}: {texts}."
+
+    sheets = count_text(len(catalog), "planilla", "planillas")
+
+    return f"Tenés {total}: {sheets} con {tables} para consultar{prepared} y {texts}."
+
+
+#
+# Devuelve la frase en inglés con el total de fuentes, separando planillas y documentos.
+#
+def _english_mixed_inventory(catalog, documents, tables, prepared):
+    total = count_text(len(catalog) + len(documents), "loaded source", "loaded sources", "en")
+    texts = count_text(len(documents), "document", "documents", "en")
+    if not catalog:
+        return f"You have {total}: {texts}."
+
+    sheets = count_text(len(catalog), "spreadsheet", "spreadsheets", "en")
+
+    return f"You have {total}: {sheets} with {tables}{prepared} and {texts}."
 
 
 #
@@ -179,13 +232,13 @@ def _source_state(source, language):
 #
 # Devuelve la invitación final a preguntar por las variables o pedir cálculos.
 #
-def _closing(language):
+def _closing(language, documents=()):
     if language == "es":
-        return (
-            "Podés preguntarme por las variables de una fuente o pedirme cálculos sobre sus datos."
-        )
+        target = "planilla" if documents else "fuente"
+        return f"Podés preguntarme por las variables de una {target} o pedirme cálculos sobre sus datos."
 
-    return "You can ask about the variables in a source or request calculations on its data."
+    target = "spreadsheet" if documents else "source"
+    return f"You can ask about the variables in a {target} or request calculations on its data."
 
 
 #

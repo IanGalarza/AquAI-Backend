@@ -12,8 +12,10 @@ from aquai.application.dtos.responses.uploadSource import SourceAcceptedResponse
 from aquai.domain.enums.sourceStatus import ProcessingStatus
 from aquai.presentation.dependencies import (
     ActivateSourceDependency,
+    DeleteSourceDependency,
     GetSourceDependency,
     ListSourcesDependency,
+    ReplaceSourceFileDependency,
     SourceFileDependency,
     UploadSourceDependency,
 )
@@ -23,16 +25,16 @@ router = APIRouter(prefix="/sources", tags=["Fuentes"])
 
 
 #
-# Carga un archivo CSV o XLSX como fuente (POST /sources).
+# Carga un archivo CSV, XLSX, PDF o DOCX como fuente (POST /sources).
 #
 @router.post(
     "",
     status_code=202,
     response_model=SourceAcceptedResponse,
-    summary="Cargar CSV/XLSX",
+    summary="Cargar CSV, XLSX, PDF o DOCX",
     responses=ERROR_RESPONSES,
-    description="Guarda el original y prepara tablas SQL en segundo plano. "
-    "La descripción y el índice semántico tienen estados independientes.",
+    description="Guarda el original y lo procesa en segundo plano: tablas SQL para planillas, "
+    "fragmentos indexados para documentos. El índice semántico tiene un estado independiente.",
 )
 async def upload_source(
     file: SourceFileDependency, handler: UploadSourceDependency
@@ -93,3 +95,35 @@ async def activate_source(
     id: UUID, request: ActivateSourceRequest, handler: ActivateSourceDependency
 ) -> SourceActivationResponse:
     return await handler.handle(id, request.is_active)
+
+
+#
+# Reemplaza el archivo de una fuente documental y la vuelve a procesar (PUT /sources/{id}/file).
+#
+@router.put(
+    "/{id}/file",
+    status_code=202,
+    response_model=SourceAcceptedResponse,
+    summary="Reemplazar el archivo de un documento",
+    responses=ERROR_RESPONSES,
+    description="Sólo para PDF y DOCX. El contenido extraído anterior se elimina y el nuevo "
+    "original se procesa en segundo plano. Las planillas conservan su original.",
+)
+async def replace_source_file(
+    id: UUID, file: SourceFileDependency, handler: ReplaceSourceFileDependency
+) -> SourceAcceptedResponse:
+    return await handler.handle(id, file)
+
+
+#
+# Elimina una fuente documental con su contenido y sus puntos del índice (DELETE /sources/{id}).
+#
+@router.delete(
+    "/{id}",
+    status_code=204,
+    summary="Eliminar un documento",
+    responses=ERROR_RESPONSES,
+    description="Sólo para PDF y DOCX. Las planillas no se eliminan por esta vía.",
+)
+async def delete_source(id: UUID, handler: DeleteSourceDependency) -> None:
+    await handler.handle(id)

@@ -40,7 +40,8 @@ def create_app(
     async def lifespan(app: FastAPI):
         runtime = sources or create_source_runtime()
         app.state.sources = runtime
-        await runtime.worker.start()
+        for worker in runtime.workers:
+            await worker.start()
 
         warm_up = None if sources else asyncio.create_task(warm_up_models(get_llm_settings()))
 
@@ -49,7 +50,8 @@ def create_app(
         finally:
             if warm_up is not None:
                 warm_up.cancel()
-            await runtime.worker.stop()
+            for worker in runtime.workers:
+                await worker.stop()
 
     def max_upload_bytes() -> int | None:
         return app.state.sources.upload.max_upload_bytes if app.state.sources else None

@@ -1,9 +1,11 @@
+import re
 from collections.abc import Callable
 
 from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 MULTIPART_ENVELOPE_BYTES = 65536
+SOURCE_FILE_PATH = re.compile(r"/sources/[^/]+/file")
 
 
 class SourceUploadSizeLimit:
@@ -53,14 +55,17 @@ class SourceUploadSizeLimit:
 
 
 #
-# Indica si la solicitud es una carga de fuente (POST /sources).
+# Indica si la solicitud carga un archivo (POST /sources o PUT /sources/{id}/file).
 #
 def _is_source_upload(scope: Scope) -> bool:
-    return (
-        scope["type"] == "http"
-        and scope["method"] == "POST"
-        and scope["path"].rstrip("/") == "/sources"
-    )
+    if scope["type"] != "http":
+        return False
+
+    path = scope["path"].rstrip("/")
+    is_new_source = scope["method"] == "POST" and path == "/sources"
+    is_replacement = scope["method"] == "PUT" and SOURCE_FILE_PATH.fullmatch(path) is not None
+
+    return is_new_source or is_replacement
 
 
 #

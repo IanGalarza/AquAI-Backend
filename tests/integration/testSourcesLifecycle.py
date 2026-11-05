@@ -384,5 +384,9 @@ class SourceLifecycleTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(client.get("/sources/" + str(UUID(int=0))).status_code, 404)
             paths = app.openapi()["paths"]
-            self.assertEqual(set(paths), {"/sources", "/sources/{id}"})
-            self.assertEqual(set(paths["/sources/{id}"]), {"get", "patch"})
+            self.assertEqual(
+                {path for path in paths if path.startswith("/sources")},
+                {"/sources", "/sources/{id}", "/sources/{id}/file"},
+            )
+            self.assertEqual(set(paths["/sources/{id}"]), {"get", "patch", "delete"})
+            self.assertEqual(set(paths["/sources/{id}/file"]), {"put"})

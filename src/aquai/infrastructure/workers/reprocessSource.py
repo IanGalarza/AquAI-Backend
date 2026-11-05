@@ -1,4 +1,4 @@
-"""Reprocesa un original conservando IDs y protegiendo las referencias existentes."""
+"""Reprocesa un original: las planillas conservan sus IDs; los documentos regeneran sus fragmentos."""
 
 import argparse
 import asyncio
@@ -6,6 +6,7 @@ from uuid import UUID
 
 from aquai.infrastructure.providers.database import get_db_context
 from aquai.infrastructure.providers.sources import create_source_runtime
+from aquai.infrastructure.queries.sources import SqlAlchemySourceQueries
 
 
 #
@@ -18,7 +19,8 @@ def main() -> None:
     runtime = create_source_runtime()
 
     try:
-        asyncio.run(runtime.worker.reprocess(args.source_id))
+        source = SqlAlchemySourceQueries(get_db_context()).get(args.source_id)
+        asyncio.run(runtime.worker_for(source["file_type"]).reprocess(args.source_id))
     except (ValueError, RuntimeError) as error:
         parser.exit(1, f"{error}\n")
     finally:

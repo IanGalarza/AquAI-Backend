@@ -265,6 +265,10 @@ class SimplePersistenceTests(TestCase):
             {
                 "Source",
                 "Dataset",
+                "Document",
+                "DocumentChunk",
+                "DocumentElement",
+                "DocumentSection",
                 "Conversation",
                 "Message",
                 "MessageSource",
@@ -282,9 +286,9 @@ class SimplePersistenceTests(TestCase):
             dialect_name="postgresql",
             opts={"as_sql": True, "output_buffer": output},
         )
-        migration = import_module("aquai.infrastructure.migrations.versions.initialCreate")
         with Operations.context(migration_context):
-            migration.upgrade()
+            for name in ("initialCreate", "documentPipeline"):
+                import_module(f"aquai.infrastructure.migrations.versions.{name}").upgrade()
         statements = dict(re.findall(r'CREATE TABLE "(\w+)" \((.*?)\);', output.getvalue(), re.S))
         self.assertEqual(set(statements), set(metadata.tables))
         for name, table in metadata.tables.items():

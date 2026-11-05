@@ -26,6 +26,7 @@ from aquai.application.contracts.retrieval import DatasetProvenance, VerifiedDat
 from aquai.application.contracts.routing import CatalogDataset
 from aquai.application.dtos.requests.listSources import SourceSort
 from aquai.application.errors import SourceNotFoundError
+from aquai.application.Rules.documents import DOCUMENT_FILE_TYPES, TABULAR_FILE_TYPES
 from aquai.domain.enums.sourceStatus import ProcessingStatus
 from aquai.domain.models import Dataset, Source
 from aquai.infrastructure.persistence.dbContext import DbContext
@@ -121,16 +122,20 @@ class SqlAlchemySourceQueries:
     # Devuelve el catálogo de fuentes y datasets con sus columnas, sin leer registros.
     #
     def catalog_overview(self) -> list[dict[str, Any]]:
-        sources_statement = select(
-            Source.id,
-            Source.name,
-            Source.original_filename,
-            Source.file_type,
-            Source.is_active,
-            Source.processing_status,
-            Source.semantic_index_status,
-            Source.created_at,
-        ).order_by(Source.created_at, Source.id)
+        sources_statement = (
+            select(
+                Source.id,
+                Source.name,
+                Source.original_filename,
+                Source.file_type,
+                Source.is_active,
+                Source.processing_status,
+                Source.semantic_index_status,
+                Source.created_at,
+            )
+            .where(Source.file_type.in_(TABULAR_FILE_TYPES))
+            .order_by(Source.created_at, Source.id)
+        )
         datasets_statement = select(
             Dataset.id,
             Dataset.source_id,
@@ -154,6 +159,21 @@ class SqlAlchemySourceQueries:
             _overview_source(source, datasets_by_source.get(source["id"], [])) for source in sources
         ]
         return deepcopy(overview)
+
+    #
+    # Devuelve los documentos cargados con su estado, sin leer su contenido.
+    #
+    def document_overview(self) -> list[dict[str, Any]]:
+        statement = (
+            select(Source.name, Source.is_active, Source.processing_status)
+            .where(Source.file_type.in_(DOCUMENT_FILE_TYPES))
+            .order_by(Source.created_at, Source.id)
+        )
+
+        with self._context.session() as session:
+            rows = session.execute(statement).mappings().all()
+
+        return [dict(row) for row in rows]
 
     #
     # Provee la sesión de verificación inyectada o abre una nueva del contexto.

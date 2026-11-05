@@ -265,11 +265,11 @@ class TableReader:
     # Valida nombre, extensión, tamaño y estructura del archivo y devuelve el nombre seguro.
     #
     def validate(self, filename: str, content: bytes) -> str:
-        filename = self._safe_filename(filename)
+        filename = self.safe_filename(filename)
         suffix = PurePath(filename).suffix.lower()
 
         if suffix not in {".csv", ".xlsx"}:
-            raise TabularInputError("Sólo se admiten archivos CSV y XLSX.")
+            raise TabularInputError("Sólo se admiten archivos CSV, XLSX, PDF y DOCX.")
 
         if not content:
             raise TabularInputError("El archivo está vacío.")
@@ -302,7 +302,7 @@ class TableReader:
     # Valida el nombre de archivo y devuelve solo su nombre base.
     #
     @staticmethod
-    def _safe_filename(filename: str) -> str:
+    def safe_filename(filename: str) -> str:
         has_valid_name = (
             isinstance(filename, str)
             and bool(filename.strip())

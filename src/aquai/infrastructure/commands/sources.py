@@ -1,8 +1,9 @@
 import json
 import re
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from copy import deepcopy
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from hashlib import sha256
 from threading import Lock
@@ -30,6 +31,7 @@ from sqlalchemy.orm import Session
 
 from aquai.application.contracts.ingestion import PreparedTable
 from aquai.application.errors import SourceNotFoundError
+from aquai.application.Rules.documents import TABULAR_FILE_TYPES
 from aquai.domain.enums.sourceStatus import ProcessingStatus, SemanticIndexStatus
 from aquai.domain.models import Dataset, MessageSource, Source
 from aquai.infrastructure.persistence.dbContext import DbContext
@@ -258,6 +260,16 @@ def _has_queryable_dataset(session: Session, source_id: UUID) -> bool:
     return dataset_id is not None
 
 
+@dataclass(frozen=True)
+class SourceScope:
+    file_types: tuple[str, ...]
+    worker_key: int
+    has_content: Callable[[Session, UUID], bool]
+
+
+TABULAR_SCOPE = SourceScope(TABULAR_FILE_TYPES, _WORKER_KEY, _has_queryable_dataset)
+
+
 #
 # Inserta las filas por lotes y verifica la cantidad total.
 #
@@ -340,24 +352,25 @@ def _sqlite_worker_lock(engine: Engine) -> Iterator[bool]:
 # Obtiene el lock consultivo de worker en PostgreSQL e indica si lo consiguió.
 #
 @contextmanager
-def _advisory_worker_lock(engine: Engine) -> Iterator[bool]:
+def _advisory_worker_lock(engine: Engine, key: int) -> Iterator[bool]:
     with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as connection:
         acquired = bool(
-            connection.scalar(text("SELECT pg_try_advisory_lock(:key)"), {"key": _WORKER_KEY})
+            connection.scalar(text("SELECT pg_try_advisory_lock(:key)"), {"key": key})
         )
         try:
             yield acquired
         finally:
             if acquired:
-                connection.execute(text("SELECT pg_advisory_unlock(:key)"), {"key": _WORKER_KEY})
+                connection.execute(text("SELECT pg_advisory_unlock(:key)"), {"key": key})
 
 
 class SqlAlchemySourceCommands:
     #
-    # Guarda el contexto de base de datos que usa el repositorio.
+    # Guarda el contexto de base de datos y el alcance de fuentes que atiende el worker.
     #
-    def __init__(self, context: DbContext) -> None:
+    def __init__(self, context: DbContext, *, scope: SourceScope = TABULAR_SCOPE) -> None:
         self._context = context
+        self._scope = scope
 
     #
     # Abre una sesión de escritura con commit, serializada en SQLite.
@@ -389,7 +402,7 @@ class SqlAlchemySourceCommands:
 
         if engine.dialect.name != "postgresql":
             raise RuntimeError("El worker requiere PostgreSQL.")
-        with _advisory_worker_lock(engine) as acquired:
+        with _advisory_worker_lock(engine, self._scope.worker_key) as acquired:
             yield acquired
 
     #
@@ -437,7 +450,10 @@ class SqlAlchemySourceCommands:
         with self._write_session() as session:
             source = session.scalar(
                 select(Source)
-                .where(Source.processing_status == ProcessingStatus.UPLOADED)
+                .where(
+                    Source.processing_status == ProcessingStatus.UPLOADED,
+                    Source.file_type.in_(self._scope.file_types),
+                )
                 .order_by(Source.created_at, Source.id)
                 .limit(1)
                 .with_for_update(skip_locked=True)
@@ -458,7 +474,8 @@ class SqlAlchemySourceCommands:
                 select(Source)
                 .where(
                     (Source.processing_status == ProcessingStatus.PROCESSING)
-                    | (Source.semantic_index_status == SemanticIndexStatus.PROCESSING)
+                    | (Source.semantic_index_status == SemanticIndexStatus.PROCESSING),
+                    Source.file_type.in_(self._scope.file_types),
                 )
                 .with_for_update()
             ).all()
@@ -473,11 +490,10 @@ class SqlAlchemySourceCommands:
     #
     # Restablece el estado de una fuente cuyo procesamiento fue interrumpido.
     #
-    @staticmethod
-    def _recover_processing(session: Session, source: Source) -> None:
-        has_datasets = _has_queryable_dataset(session, source.id)
+    def _recover_processing(self, session: Session, source: Source) -> None:
+        has_content = self._scope.has_content(session, source.id)
         source.processing_status = (
-            ProcessingStatus.READY_WITH_WARNINGS if has_datasets else ProcessingStatus.UPLOADED
+            ProcessingStatus.READY_WITH_WARNINGS if has_content else ProcessingStatus.UPLOADED
         )
         source.processing_report = _report_with_warnings(
             source.processing_report, ["Se recuperó un procesamiento interrumpido."]
@@ -686,6 +702,7 @@ class SqlAlchemySourceCommands:
                     Source.processing_status.in_(
                         (ProcessingStatus.READY, ProcessingStatus.READY_WITH_WARNINGS)
                     ),
+                    Source.file_type.in_(self._scope.file_types),
                 )
                 .order_by(Source.created_at, Source.id)
                 .limit(1)
@@ -726,8 +743,8 @@ class SqlAlchemySourceCommands:
             report["errors"] = [*report.get("errors", []), failure][-20:]
             source.processing_report = report
 
-            has_datasets = _has_queryable_dataset(session, source_id)
-            source.processing_status = _failure_status(has_datasets, code)
+            has_content = self._scope.has_content(session, source_id)
+            source.processing_status = _failure_status(has_content, code)
             if (
                 code == "interrupted"
                 and source.semantic_index_status == SemanticIndexStatus.PROCESSING

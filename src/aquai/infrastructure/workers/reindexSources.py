@@ -3,6 +3,7 @@
 import argparse
 from uuid import UUID
 
+from aquai.application.Rules.documents import DOCUMENT_FILE_TYPES
 from aquai.bootstrap import initialize_application
 from aquai.infrastructure.commands.sources import SqlAlchemySourceCommands
 from aquai.infrastructure.providers.database import get_db_context
@@ -22,8 +23,9 @@ def main():
 
     context = get_db_context()
     state = SqlAlchemySourceQueries(context).get(args.source_id)
-    if not state["datasets"] or state["processing_status"] not in READY_STATUSES:
-        parser.error("La fuente no tiene datasets confirmados para indexar.")
+    has_content = state["datasets"] or state["file_type"] in DOCUMENT_FILE_TYPES
+    if not has_content or state["processing_status"] not in READY_STATUSES:
+        parser.error("La fuente no tiene contenido confirmado para indexar.")
 
     SqlAlchemySourceCommands(context).request_reindex(args.source_id)
     print("Índice pendiente; iniciar el backend para que su worker complete la reconstrucción.")

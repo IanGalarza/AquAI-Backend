@@ -3,7 +3,7 @@ import logging
 from contextlib import asynccontextmanager
 from uuid import UUID
 
-from aquai.application.errors import TabularInputError
+from aquai.application.errors import SourceInputError
 from aquai.application.interfaces.sources import SourceCommands
 from aquai.application.Services.processSourceService import ProcessSourceService
 from aquai.application.utils.background import complete_write
@@ -186,7 +186,7 @@ class SourceWorker:
                 "Procesamiento interrumpido; el original y los datos confirmados se conservan.",
             )
             raise
-        except TabularInputError as error:
+        except SourceInputError as error:
             await complete_write(
                 self._commands.record_failure,
                 source_id,

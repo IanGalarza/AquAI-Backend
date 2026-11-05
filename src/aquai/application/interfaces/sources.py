@@ -23,6 +23,11 @@ class SourceQueries(Protocol):
     def catalog_overview(self) -> list[dict]: ...
 
     #
+    # Devuelve los documentos cargados, que el chat lista pero todavía no consulta.
+    #
+    def document_overview(self) -> list[dict]: ...
+
+    #
     # Devuelve los valores de una columna de un dataset que coinciden con un texto.
     #
     def matching_column_values(

@@ -23,6 +23,14 @@ dependencies = [
     "pydantic-settings",
     "httpx",
     "python-multipart",
+    "docling>=2.146,<2.147",
+    "docling-core>=2.106,<3",
+    "rapidocr>=3.10,<3.11",
+    "semchunk",
+    "transformers",
+    "numpy",
+    "onnxruntime>=1.24,<2",
+    "pypdfium2>=5,<6",
 ]
 
 [tool.setuptools.packages.find]
