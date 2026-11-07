@@ -201,6 +201,11 @@ class MessageView(BaseModel):
     updated_at: datetime | None
     sources: list[MessageSourceView] = Field(default_factory=list)
     presentation: MessagePresentation | None = None
+    lease_expired: bool = Field(
+        default=False,
+        description="La respuesta seguía en curso pero su reserva ya había vencido al leerla, "
+        "según el reloj del servidor: nadie la está ejecutando.",
+    )
 
 
 #
@@ -283,3 +288,41 @@ class AssistantRecord:
 class SendMessageOutcome:
     message: MessageView
     outcome: Literal["completed", "generation_failed", "execution_failed", "timed_out"]
+
+
+TurnStage = Literal[
+    "interpreting",
+    "retrieving",
+    "referencing",
+    "planning",
+    "analyzing",
+    "validating",
+    "documents",
+    "writing",
+]
+
+
+#
+# Evento inicial de un turno transmitido: mensajes reservados y momento en que empezó.
+#
+class TurnStartedEvent(BaseModel):
+    conversation_id: UUID
+    user_message_id: UUID
+    assistant_message_id: UUID
+    started_at: datetime
+
+
+#
+# Evento de una etapa del análisis que comienza, con el tiempo transcurrido desde el inicio del turno.
+#
+class TurnStageEvent(BaseModel):
+    stage: TurnStage
+    elapsed_ms: int
+
+
+#
+# Evento final de un turno: su resultado y el mensaje guardado del asistente, salvo si se canceló.
+#
+class TurnDoneEvent(BaseModel):
+    outcome: Literal["completed", "generation_failed", "execution_failed", "timed_out", "cancelled"]
+    message: MessageView | None = None

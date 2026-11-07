@@ -25,6 +25,23 @@ from aquai.application.Services.validateEvidenceService import ValidateEvidenceS
 
 _logger = logging.getLogger(__name__)
 
+#
+# Etapa que ve el usuario mientras se ejecuta cada nodo del grafo.
+#
+NODE_STAGES = {
+    "router": "interpreting",
+    "retriever": "retrieving",
+    "reference_resolver": "referencing",
+    "planner": "planning",
+    "sql_agent": "analyzing",
+    "python_agent": "analyzing",
+    "validator": "validating",
+    "document_retriever": "documents",
+    "response_generator": "writing",
+    "document_response": "writing",
+    "direct_response": "writing",
+}
+
 
 #
 # Devuelve el estado con la pregunta contextualizada para el análisis.

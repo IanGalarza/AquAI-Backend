@@ -61,3 +61,7 @@ class ConversationsUnavailableError(RuntimeError):
 
 class ConversationStorageError(RuntimeError):
     pass
+
+
+class GenerationNotFoundError(LookupError):
+    pass

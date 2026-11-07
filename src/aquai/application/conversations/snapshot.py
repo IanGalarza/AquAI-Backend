@@ -92,6 +92,12 @@ def _bytes(value):
     return len(content.encode("utf-8"))
 
 
+INTERRUPTED_GENERATION = (
+    "La consulta se interrumpió antes de terminar, por ejemplo porque el servidor se reinició. "
+    "La pregunta quedó guardada y podés volver a enviarla."
+)
+
+
 #
 # Construye el registro del asistente para un turno fallido o cancelado.
 #

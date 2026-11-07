@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Protocol
 from uuid import UUID
 
@@ -8,7 +9,10 @@ from aquai.application.contracts.conversations import (
     AssistantRecord,
     MessageView,
     TurnReservation,
+    TurnStage,
 )
+
+TurnProgress = Callable[[TurnStage], None]
 
 
 class ConversationQueries(Protocol):
@@ -60,6 +64,11 @@ class ConversationCommands(Protocol):
     ) -> TurnReservation: ...
 
     #
+    # Extiende la reserva de un turno en curso; devuelve False si el turno ya se cerró.
+    #
+    def renew_turn(self, turn: TurnReservation) -> bool: ...
+
+    #
     # Guarda la respuesta del asistente y cierra el turno reservado.
     #
     def finish_turn(self, turn: TurnReservation, record: AssistantRecord) -> MessageView: ...
@@ -67,6 +76,9 @@ class ConversationCommands(Protocol):
 
 class ConversationQueryRunner(Protocol):
     #
-    # Ejecuta el flujo de análisis para una pregunta y devuelve el estado con la respuesta.
+    # Ejecuta el flujo de análisis para una pregunta y devuelve el estado con la respuesta;
+    # informa cada etapa que comienza a quien siga el progreso.
     #
-    async def run(self, query: QueryResponseInput) -> QueryResponseState: ...
+    async def run(
+        self, query: QueryResponseInput, progress: TurnProgress | None = None
+    ) -> QueryResponseState: ...

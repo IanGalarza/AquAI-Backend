@@ -1,11 +1,18 @@
 from collections.abc import AsyncIterator
+from threading import Lock
 from typing import Annotated
+from uuid import UUID
 
 from fastapi import Depends, File, HTTPException, Request, UploadFile
 from starlette.datastructures import UploadFile as StarletteUploadFile
 
+from aquai.application.contracts.conversations import SendMessageRequest
 from aquai.application.dtos.requests.uploadSource import UploadSourceRequest
 from aquai.application.errors import FileTooLargeError
+from aquai.application.Services.streamTurnService import TurnEvents
+from aquai.application.useCases.ConversationOperation.Commands.cancelGenerationHandler import (
+    CancelGenerationHandler,
+)
 from aquai.application.useCases.ConversationOperation.Commands.createConversationHandler import (
     CreateConversationHandler,
 )
@@ -17,6 +24,12 @@ from aquai.application.useCases.ConversationOperation.Commands.renameConversatio
 )
 from aquai.application.useCases.ConversationOperation.Commands.sendMessageHandler import (
     SendMessageHandler,
+)
+from aquai.application.useCases.ConversationOperation.Commands.streamMessageHandler import (
+    StreamMessageHandler,
+)
+from aquai.application.useCases.ConversationOperation.Queries.followGenerationHandler import (
+    FollowGenerationHandler,
 )
 from aquai.application.useCases.ConversationOperation.Queries.getConversationHandler import (
     GetConversationHandler,
@@ -55,6 +68,7 @@ SINGLE_FILE_FIELD_ERROR = (
     "La carga admite únicamente un archivo en el campo file, sin parámetros adicionales."
 )
 DOCUMENTS_UNAVAILABLE_ERROR = "La gestión de documentos no está disponible."
+_RUNTIME_LOCK = Lock()
 
 
 #
@@ -164,14 +178,19 @@ SourceFileDependency = Annotated[UploadSourceRequest, Depends(read_source_file)]
 
 
 #
-# Devuelve el runtime de conversaciones y lo crea si aún no existe.
+# Devuelve el runtime de conversaciones y lo crea una sola vez aunque lleguen solicitudes simultáneas,
+# porque guarda en memoria las respuestas en curso que se siguen y cancelan.
 #
 def _get_conversation_runtime(request: Request) -> ConversationRuntime:
     runtime = getattr(request.app.state, "conversations", None)
+    if runtime is not None:
+        return runtime
 
-    if runtime is None:
-        runtime = create_conversation_runtime()
-        request.app.state.conversations = runtime
+    with _RUNTIME_LOCK:
+        runtime = getattr(request.app.state, "conversations", None)
+        if runtime is None:
+            runtime = create_conversation_runtime()
+            request.app.state.conversations = runtime
 
     return runtime
 
@@ -205,6 +224,27 @@ def get_send_message_handler(request: Request) -> SendMessageHandler:
 
 
 #
+# Devuelve el manejador que envía mensajes y transmite sus turnos.
+#
+def get_stream_message_handler(request: Request) -> StreamMessageHandler:
+    return _get_conversation_runtime(request).stream
+
+
+#
+# Devuelve el manejador que sigue las respuestas en curso.
+#
+def get_follow_generation_handler(request: Request) -> FollowGenerationHandler:
+    return _get_conversation_runtime(request).follow
+
+
+#
+# Devuelve el manejador que cancela las respuestas en curso.
+#
+def get_cancel_generation_handler(request: Request) -> CancelGenerationHandler:
+    return _get_conversation_runtime(request).cancel
+
+
+#
 # Devuelve el manejador que lista conversaciones.
 #
 def get_list_conversations_handler(request: Request) -> ListConversationsHandler:
@@ -235,8 +275,38 @@ DeleteConversationDependency = Annotated[
     DeleteConversationHandler, Depends(get_delete_conversation_handler)
 ]
 SendMessageDependency = Annotated[SendMessageHandler, Depends(get_send_message_handler)]
+StreamMessageDependency = Annotated[StreamMessageHandler, Depends(get_stream_message_handler)]
+FollowGenerationDependency = Annotated[
+    FollowGenerationHandler, Depends(get_follow_generation_handler)
+]
+CancelGenerationDependency = Annotated[
+    CancelGenerationHandler, Depends(get_cancel_generation_handler)
+]
 ListConversationsDependency = Annotated[
     ListConversationsHandler, Depends(get_list_conversations_handler)
 ]
 GetConversationDependency = Annotated[GetConversationHandler, Depends(get_conversation_handler)]
 GetMessagesDependency = Annotated[GetMessagesHandler, Depends(get_messages_handler)]
+
+
+#
+# Reserva el turno de la pregunta y devuelve sus eventos antes de abrir el flujo SSE,
+# para que un rechazo responda con su código HTTP.
+#
+async def start_message_stream(
+    id: UUID, request: SendMessageRequest, handler: StreamMessageDependency
+) -> TurnEvents:
+    return await handler.handle(id, request)
+
+
+#
+# Devuelve los eventos de una respuesta en curso antes de abrir el flujo SSE, o responde 404.
+#
+async def follow_message_stream(
+    id: UUID, message_id: UUID, handler: FollowGenerationDependency
+) -> TurnEvents:
+    return await handler.handle(id, message_id)
+
+
+MessageStreamDependency = Annotated[TurnEvents, Depends(start_message_stream)]
+GenerationStreamDependency = Annotated[TurnEvents, Depends(follow_message_stream)]

@@ -119,3 +119,28 @@ Para activar una fuente, enviar este cuerpo JSON a `PATCH /sources/{id}`:
 
 Usar `false` para desactivarla. Los esquemas de las solicitudes y respuestas
 están disponibles en Swagger UI.
+
+### Conversaciones
+
+| Método | Ruta | Descripción |
+|---|---|---|
+| POST | `/conversations/{id}/messages` | Envía una pregunta y responde con el mensaje guardado del asistente cuando termina. |
+| POST | `/conversations/{id}/messages/stream` | Envía una pregunta y transmite el turno por Server-Sent Events. |
+| GET | `/conversations/{id}/messages/{message_id}/events` | Vuelve a seguir una respuesta en curso, por ejemplo tras recargar la página. |
+| POST | `/conversations/{id}/messages/{message_id}/cancel` | Cancela una respuesta en curso; el turno queda guardado como cancelado, salvo que la respuesta ya se estuviera guardando. |
+
+El flujo SSE emite `turn` (mensajes reservados), `stage` (etapa real del análisis
+que comienza: `interpreting`, `retrieving`, `referencing`, `planning`, `analyzing`,
+`validating`, `documents` o `writing`), `done` (resultado y mensaje guardado, con
+el mismo contenido validado que devuelve el endpoint sin streaming; si se canceló no
+trae mensaje y el cliente debe leer el estado guardado) y `error`. El
+turno se responde en segundo plano: si se corta la conexión, la respuesta se sigue
+generando y se guarda una sola vez. El seguimiento vive en la memoria del proceso,
+así que requiere ejecutar uvicorn con un solo worker.
+
+Cada respuesta en curso reserva su conversación por `CONVERSATIONS_GENERATION_LEASE_SECONDS`
+(45 s por defecto, mínimo 30) y renueva esa reserva cada tercio del plazo mientras se ejecuta,
+sin superar el timeout de la generación más 60 s. Si el backend se reinicia o se corta durante
+una respuesta, la reserva vence en ese plazo: el chat muestra la respuesta como interrumpida, la
+conversación vuelve a aceptar preguntas y, al enviar la siguiente, el turno anterior queda
+registrado como interrumpido.

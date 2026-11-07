@@ -2,6 +2,11 @@ from dataclasses import dataclass
 from functools import lru_cache
 
 from aquai.application.conversations.snapshot import ConversationSnapshotBuilder
+from aquai.application.Services.answerTurnService import AnswerTurnService
+from aquai.application.Services.streamTurnService import StreamTurnService
+from aquai.application.useCases.ConversationOperation.Commands.cancelGenerationHandler import (
+    CancelGenerationHandler,
+)
 from aquai.application.useCases.ConversationOperation.Commands.createConversationHandler import (
     CreateConversationHandler,
 )
@@ -13,6 +18,12 @@ from aquai.application.useCases.ConversationOperation.Commands.renameConversatio
 )
 from aquai.application.useCases.ConversationOperation.Commands.sendMessageHandler import (
     SendMessageHandler,
+)
+from aquai.application.useCases.ConversationOperation.Commands.streamMessageHandler import (
+    StreamMessageHandler,
+)
+from aquai.application.useCases.ConversationOperation.Queries.followGenerationHandler import (
+    FollowGenerationHandler,
 )
 from aquai.application.useCases.ConversationOperation.Queries.getConversationHandler import (
     GetConversationHandler,
@@ -37,6 +48,9 @@ class ConversationRuntime:
     rename: RenameConversationHandler
     delete: DeleteConversationHandler
     send: SendMessageHandler
+    stream: StreamMessageHandler
+    follow: FollowGenerationHandler
+    cancel: CancelGenerationHandler
     list: ListConversationsHandler
     get: GetConversationHandler
     messages: GetMessagesHandler
@@ -66,18 +80,24 @@ def create_conversation_runtime() -> ConversationRuntime:
         max_table_bytes=settings.max_table_bytes,
         max_source_details_bytes=settings.max_source_details_bytes,
     )
+    turns = AnswerTurnService(
+        commands,
+        queries,
+        LangGraphConversationRunner(),
+        snapshots,
+        timeout_seconds=settings.generation_timeout_seconds,
+        lease_seconds=settings.generation_lease_seconds,
+    )
+    streams = StreamTurnService()
 
     return ConversationRuntime(
         create=CreateConversationHandler(commands),
         rename=RenameConversationHandler(commands),
         delete=DeleteConversationHandler(commands),
-        send=SendMessageHandler(
-            commands,
-            queries,
-            LangGraphConversationRunner(),
-            snapshots,
-            timeout_seconds=settings.generation_timeout_seconds,
-        ),
+        send=SendMessageHandler(turns),
+        stream=StreamMessageHandler(turns, streams),
+        follow=FollowGenerationHandler(streams),
+        cancel=CancelGenerationHandler(streams),
         list=ListConversationsHandler(queries),
         get=GetConversationHandler(queries),
         messages=GetMessagesHandler(queries),

@@ -3,6 +3,7 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy import delete, func, select
 
 from aquai.application.contracts.conversations import TurnReservation
+from aquai.application.conversations.snapshot import INTERRUPTED_GENERATION
 from aquai.application.errors import (
     ConversationConflictError,
     ConversationNotFoundError,
@@ -51,7 +52,14 @@ def _leased(message, now):
 
 
 #
-# Marca como fallidas las generaciones vencidas y rechaza si hay una vigente.
+# Devuelve el vencimiento de la reserva de una generación; quien la ejecuta la renueva mientras sigue viva.
+#
+def _lease_deadline(now, settings):
+    return now + timedelta(seconds=settings.generation_lease_seconds)
+
+
+#
+# Marca como interrumpidas las generaciones cuya reserva venció y rechaza si hay una vigente.
 #
 def _fail_expired_generations(session, conversation_id, names, now):
     for message in _generations(session, conversation_id, names):
@@ -59,10 +67,11 @@ def _fail_expired_generations(session, conversation_id, names, now):
             raise ConversationConflictError("La conversación ya tiene una respuesta en generación.")
         message.status_id = names["failed"]
         message.updated_at = now
-        message.content = "La generación anterior se interrumpió y no pudo completarse."
+        message.content = INTERRUPTED_GENERATION
         message.content_data = {
             "schema_version": 1,
             "kind": "generation_failure",
+            "user_message_id": message.content_data.get("user_message_id"),
             "error": {"code": "interrupted_generation", "message": message.content},
         }
 
@@ -211,7 +220,7 @@ class SqlAlchemyConversationCommands:
 
             last = _last_sequence_number(session, conversation_id)
             user = _user_message(conversation_id, last + 1, content, language, names, now)
-            deadline = now + timedelta(seconds=self._settings.generation_timeout_seconds + 60)
+            deadline = _lease_deadline(now, self._settings)
             assistant = _assistant_placeholder(
                 conversation_id, last + 2, user, names, now, deadline
             )
@@ -232,6 +241,27 @@ class SqlAlchemyConversationCommands:
                 content,
                 user_sequence_number=user.sequence_number,
             )
+
+    #
+    # Extiende la reserva de un turno que sigue en curso, sin pasar del plazo máximo de la generación;
+    # devuelve False si el turno ya se cerró.
+    #
+    def renew_turn(self, turn):
+        with conversation_session(self._context, self._settings) as session:
+            _locked_conversation(session, turn.conversation_id)
+            names = message_statuses(session)
+            message = session.get(Message, turn.assistant_message_id)
+            if not _accepts_result(message, turn, names):
+                return False
+
+            now = datetime.now(timezone.utc)
+            limit = message.created_at + timedelta(seconds=self._settings.generation_timeout_seconds + 60)
+            deadline = min(_lease_deadline(now, self._settings), limit)
+            message.content_data = {**message.content_data, "lease_expires_at": deadline.isoformat()}
+            message.updated_at = now
+            session.commit()
+
+            return True
 
     #
     # Cierra un turno guardando la respuesta del asistente y sus fuentes.

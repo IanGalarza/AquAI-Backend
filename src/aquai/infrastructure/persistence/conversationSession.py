@@ -1,4 +1,5 @@
 from contextlib import contextmanager
+from datetime import datetime, timezone
 
 from sqlalchemy import func, select
 
@@ -72,7 +73,7 @@ def conversation_view(item):
 
 
 #
-# Construye la vista de un mensaje con su estado, sus fuentes y su presentación.
+# Construye la vista de un mensaje con su estado, sus fuentes, su presentación y si su reserva venció.
 #
 def message_view(item, statuses, sources=()):
     view = {
@@ -80,7 +81,19 @@ def message_view(item, statuses, sources=()):
         "status": {"id": item.status_id, "name": statuses[item.status_id]},
         "sources": [_source_view(source) for source in sources],
     }
-    return MessageView.model_validate({**view, "presentation": present_message(view)})
+    return MessageView.model_validate(
+        {**view, "presentation": present_message(view), "lease_expired": _lease_expired(view)}
+    )
+
+
+#
+# Indica si una respuesta todavía en curso tiene la reserva vencida según el reloj del servidor.
+#
+def _lease_expired(view):
+    deadline = view["content_data"].get("lease_expires_at")
+    running = view["role"] == "assistant" and view["status"]["name"] in {"pending", "processing"}
+
+    return running and deadline is not None and datetime.fromisoformat(deadline) <= datetime.now(timezone.utc)
 
 
 #

@@ -2,6 +2,7 @@ from collections.abc import Awaitable, Callable
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel
 from sqlalchemy.exc import SQLAlchemyError
 
 from aquai.application.errors import (
@@ -9,6 +10,7 @@ from aquai.application.errors import (
     ConversationNotFoundError,
     ConversationsUnavailableError,
     FileTooLargeError,
+    GenerationNotFoundError,
     SourceConflictError,
     SourceInputError,
     SourceNotFoundError,
@@ -32,7 +34,18 @@ _ERROR_STATUS_CODES = {
     ConversationNotFoundError: 404,
     ConversationConflictError: 409,
     ConversationsUnavailableError: 503,
+    GenerationNotFoundError: 404,
 }
+_UNAVAILABLE_DETAIL = "La persistencia no está disponible."
+_UNEXPECTED_DETAIL = "No se pudo completar la consulta."
+
+
+#
+# Evento SSE de un turno que no pudo cerrarse, con el código HTTP equivalente y un detalle legible.
+#
+class TurnErrorEvent(BaseModel):
+    status: int
+    detail: str
 
 
 #
@@ -53,8 +66,20 @@ def register_exception_handlers(app: FastAPI) -> None:
         app.add_exception_handler(error_type, _error_handler(status_code))
 
     async def database_unavailable(_request: Request, _error: Exception) -> JSONResponse:
-        return JSONResponse(
-            status_code=503, content={"detail": "La persistencia no está disponible."}
-        )
+        return JSONResponse(status_code=503, content={"detail": _UNAVAILABLE_DETAIL})
 
     app.add_exception_handler(SQLAlchemyError, database_unavailable)
+
+
+#
+# Traduce el error que impidió cerrar un turno transmitido al código HTTP que tendría como respuesta.
+#
+def turn_error_event(error: Exception) -> TurnErrorEvent:
+    if isinstance(error, SQLAlchemyError):
+        return TurnErrorEvent(status=503, detail=_UNAVAILABLE_DETAIL)
+
+    known = (code for kind, code in _ERROR_STATUS_CODES.items() if isinstance(error, kind))
+    status_code = next(known, 500)
+    detail = _UNEXPECTED_DETAIL if status_code == 500 else str(error)
+
+    return TurnErrorEvent(status=status_code, detail=detail)

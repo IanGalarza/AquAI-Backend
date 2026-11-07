@@ -5,6 +5,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class ConversationSettings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_prefix="CONVERSATIONS_", extra="ignore")
     generation_timeout_seconds: float = Field(default=1500, ge=1, le=3600)
+    generation_lease_seconds: float = Field(default=45, ge=30, le=600)
     max_message_bytes: int = Field(default=2097152, ge=16384, le=10485760)
     max_table_rows: int = Field(default=100, ge=0, le=1000)
     max_table_bytes: int = Field(default=262144, ge=1024, le=1048576)
