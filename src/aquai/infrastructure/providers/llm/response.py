@@ -8,13 +8,17 @@ from aquai.application.contracts.answering import (
     ResponseReply,
 )
 from aquai.application.errors import LLMProviderError
-from aquai.application.prompts.response import RESPONSE_PROMPT
+from aquai.application.prompts.response import LANGUAGE_ORDERS, RESPONSE_PROMPT
 from aquai.infrastructure.config.llm import OllamaSettings, ResponseModelSettings
 from aquai.infrastructure.providers.llm.ollama import (
     _OllamaClient,
     exceeds_context,
     prompt_tokens,
 )
+
+
+_MAX_SEGMENTS = 5
+_MIN_INTERPRETED_SEGMENTS = 2
 
 
 class ResponseGenerationError(LLMProviderError):
@@ -69,7 +73,7 @@ class OllamaResponseProvider:
         if len(content.encode("utf-8")) > self._budget:
             raise LLMProviderError("La evidencia excede el contexto de redacción permitido.")
 
-        schema = self._draft_schema(context.evidence["sentence_catalog"])
+        schema = self._draft_schema(context.evidence)
         body = await self._client.post(
             "/api/chat",
             {
@@ -83,7 +87,10 @@ class OllamaResponseProvider:
                     "num_predict": self._output_tokens,
                 },
                 "messages": [
-                    {"role": "system", "content": RESPONSE_PROMPT},
+                    {
+                        "role": "system",
+                        "content": f"{RESPONSE_PROMPT}\n{LANGUAGE_ORDERS[context.evidence['language']]}",
+                    },
                     {"role": "user", "content": content},
                 ],
             },
@@ -99,19 +106,24 @@ class OllamaResponseProvider:
         return ResponseReply(draft=draft, **metadata)
 
     #
-    # Construye el esquema del borrador limitado a las oraciones y evidencias del catálogo.
+    # Construye el esquema del borrador limitado a la evidencia y a las funciones disponibles.
     #
     @staticmethod
-    def _draft_schema(sentences: list) -> dict:
+    def _draft_schema(evidence: dict) -> dict:
         schema = ResponseDraft.model_json_schema()
-        sentence_list = schema["properties"]["sentences"]
-        sentence_list["minItems"] = len(sentences)
-        sentence_list["maxItems"] = len(sentences)
+        segment = schema["$defs"]["DraftSegment"]["properties"]
+        facts = [item["id"] for item in evidence.get("facts", [])]
+        documents = [item["id"] for item in evidence.get("documents", [])]
 
-        draft_sentence = schema["$defs"]["DraftSentence"]["properties"]
-        draft_sentence["sentence_id"]["enum"] = [item["sentence_id"] for item in sentences]
-        draft_sentence["evidence_ids"]["items"]["enum"] = _unique_evidence_ids(sentences)
-        draft_sentence["evidence_ids"]["maxItems"] = 1
+        _limit_ids(segment["fact_ids"], facts)
+        _limit_ids(segment["document_ids"], documents)
+        segment["role"]["enum"] = _roles(facts, documents, evidence.get("ambiguities"))
+        schema["$defs"]["DraftSegment"]["required"] = list(segment)
+        if documents and not facts:
+            segment["document_ids"]["minItems"] = 1
+        if documents and facts:
+            schema["properties"]["segments"]["minItems"] = _MIN_INTERPRETED_SEGMENTS
+        schema["properties"]["segments"]["maxItems"] = _MAX_SEGMENTS
         return schema
 
     #
@@ -148,11 +160,25 @@ class OllamaResponseProvider:
 
 
 #
-# Devuelve los identificadores de evidencia sin repetir de las oraciones del catálogo.
+# Restringe una lista de identificadores a los valores autorizados.
 #
-def _unique_evidence_ids(sentences: list) -> list:
-    evidence_ids = []
-    for item in sentences:
-        evidence_ids.extend(item["evidence_ids"])
+def _limit_ids(field: dict, allowed: list) -> None:
+    if allowed:
+        field["items"]["enum"] = allowed
+    else:
+        field["maxItems"] = 0
 
-    return list(dict.fromkeys(evidence_ids))
+
+#
+# Devuelve las funciones de párrafo que la evidencia disponible permite usar.
+#
+def _roles(facts: list, documents: list, ambiguities) -> list:
+    roles = ["result"] if facts else []
+    if documents:
+        roles.append("documented")
+    if documents and facts:
+        roles.append("relation")
+    if documents and ambiguities:
+        roles.append("hypothesis")
+
+    return roles

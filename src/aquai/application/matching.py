@@ -4,6 +4,7 @@ import unicodedata
 from datetime import date, timedelta
 from typing import NamedTuple
 
+from aquai.application.Rules.units import UNIT_RATIO_WORD
 from aquai.application.Rules.variables import (
     CHEMICAL_FORMULAS,
     DERIVED_SUM,
@@ -37,7 +38,12 @@ from aquai.application.Rules.vocabulary import (
     STATISTIC_WORDS,
     SURROUNDING_PUNCTUATION,
 )
-from aquai.application.units import unit_key, unitless_name
+from aquai.application.Rules.evidence import (
+    DOCUMENT_AUTHOR_NAMES,
+    DOCUMENT_YEAR,
+    REFERENCE_REQUEST_CLAUSE,
+)
+from aquai.application.units import comparable_unit, unit_key, unitless_name
 
 _LETTER_DIGIT_BOUNDARY = re.compile(r"(?<=\d)(?=[^\W\d_])|(?<=[^\W\d_])(?=\d)")
 _SEPARATORS = re.compile(r"[\W_]+")
@@ -228,6 +234,27 @@ def _exact_variable(phrase: str) -> str | None:
 
 
 #
+# Devuelve los grupos de variables de calidad de agua que nombra un texto.
+#
+def named_variable_groups(text: str) -> set[int]:
+    words = singular_words(text)
+
+    return {
+        index
+        for index, group in enumerate(_SYNONYM_GROUPS)
+        for term in group
+        if any(tuple(words[start : start + len(term)]) == term for start in range(len(words)))
+    }
+
+
+#
+# Indica si la variable es un nutriente que se expresa respecto de una especie química.
+#
+def requires_chemical_basis(phrase: str) -> bool:
+    return _exact_variable(phrase) in CHEMICAL_FORMULAS
+
+
+#
 # Indica si el encabezado nombra con su fórmula química el nutriente pedido.
 #
 def formula_named(name: str, phrase: str) -> bool:
@@ -249,6 +276,35 @@ def symbol_named(name: str, unit: str | None, phrase: str) -> bool:
 
     symbols, units = UNIT_CONFIRMED_SYMBOLS[variable]
     return normalize_text(unitless_name(name)) in symbols and unit_key(unit) in units
+
+
+#
+# Devuelve la variable que la frase pide en la unidad de una columna, sin esa unidad.
+#
+def variable_in_unit(phrase: str, name: str, unit: str | None) -> str | None:
+    if not unit:
+        return None
+
+    measured = comparable_unit(name, unit)
+    words = phrase.split()
+    for index in range(1, len(words)):
+        asked = _without_final_connectors(words[:index])
+        stated = UNIT_RATIO_WORD.sub("/", " ".join(words[index:]))
+        if comparable_unit(asked, stated.strip(SURROUNDING_PUNCTUATION)) == measured:
+            return variable_name(asked)
+
+    return None
+
+
+#
+# Une las palabras dadas sin los conectores con que terminan.
+#
+def _without_final_connectors(words) -> str:
+    kept = list(words)
+    while kept and normalize_text(kept[-1]) in _CONNECTORS:
+        kept.pop()
+
+    return " ".join(kept)
 
 
 #
@@ -624,3 +680,43 @@ def starts_with_phrase(text: str, phrases) -> bool:
 #
 def contains_any_phrase(text: str, phrases) -> bool:
     return any(contains_phrase(text, phrase) for phrase in phrases)
+
+
+#
+# Devuelve los documentos que la pregunta nombra por autor, sigla, año o título completo.
+#
+def named_documents(question: str, documents) -> list[dict]:
+    available = [item for item in documents if item.get("document_id") and item.get("is_active", True)]
+    named = [item for item in available if _names_document(question, item)]
+    years = set(DOCUMENT_YEAR.findall(question))
+    if not years:
+        return named
+
+    return [item for item in named if not _document_years(item) or _document_years(item) & years]
+
+
+#
+# Indica si la pregunta nombra un documento por su autor, su sigla o su título.
+#
+def _names_document(question: str, document) -> bool:
+    title = document.get("title") or ""
+    if len(title.split()) >= 4 and contains_phrase(question, title):
+        return True
+
+    names = [name for pattern in DOCUMENT_AUTHOR_NAMES for name in pattern.findall(document["name"])]
+
+    return any(contains_phrase(question, name) for name in names if len(name) >= 3)
+
+
+#
+# Devuelve los años que figuran en el nombre de un documento.
+#
+def _document_years(document) -> set[str]:
+    return set(DOCUMENT_YEAR.findall(document["name"]))
+
+
+#
+# Quita el pedido de una línea de referencia: es una presentación documental, no una operación.
+#
+def without_reference_request(question: str) -> str:
+    return REFERENCE_REQUEST_CLAUSE.sub("", question).strip() or question

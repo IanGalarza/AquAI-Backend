@@ -4,6 +4,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, ValidationError
 
+from aquai.application.answering.drafting import pages_text
 from aquai.application.answering.naming import FieldNames
 from aquai.application.answering.presentation import format_unit
 from aquai.application.answering.segments import segments_from_text
@@ -19,6 +20,7 @@ from aquai.application.answering.wording import (
 from aquai.application.contracts.answering import AnswerSegment
 from aquai.application.contracts.conversations import (
     ChartView,
+    ChartReferenceLine,
     CitationVariable,
     CitationView,
     ColumnView,
@@ -180,11 +182,33 @@ class _Evidence(_Stored):
     dataset_ids: list[UUID] = Field(default_factory=list)
 
 
+class _Document(_Stored):
+    evidence_id: str
+    source_id: UUID
+    file_name: str
+    title: str | None = None
+    page_start: int | None = None
+    page_end: int | None = None
+    section: list[str] = Field(default_factory=list)
+    excerpt: str = ""
+    doubts: list[str] = Field(default_factory=list)
+
+
+class _Line(_Stored):
+    operation_id: str
+    evidence_id: str
+    axis: str = "y"
+    value: float
+    label: str
+
+
 class _Response(_Stored):
     answer: str
     language: str = "es"
     segments: list[AnswerSegment] = Field(default_factory=list)
     sources: list[_Source] = Field(default_factory=list)
+    document_references: list[_Document] = Field(default_factory=list)
+    reference_lines: list[_Line] = Field(default_factory=list)
     operation_references: list[_Evidence] = Field(default_factory=list)
     results: list[_Table] = Field(default_factory=list)
     visualizations: list[_Chart] = Field(default_factory=list)
@@ -246,6 +270,7 @@ class _Presenter:
         self._names = FieldNames(self._steps, self._column, self._language)
         self._citations = self._build_citations()
         self._datasets = {item.dataset_id: item.id for item in self._citations}
+        self._documents = self._document_citations()
         self._evidence = {
             ref.evidence_id: self._cite(ref.dataset_ids)
             for ref in self._response.operation_references
@@ -308,8 +333,12 @@ class _Presenter:
     #
     def _column(self, dataset_id, sql_name):
         column = self._columns.get((dataset_id, sql_name))
+        if column is None:
+            return None
 
-        return column_label(column["original_name"], column.get("unit")) if column else None
+        named = self._columns.get((dataset_id, column.get("derived_from")), column)
+
+        return column_label(named["original_name"], named.get("unit"))
 
     #
     # Construye los segmentos de una respuesta anterior al formato estructurado.
@@ -345,12 +374,14 @@ class _Presenter:
         cited = (
             following is None
             or following.evidence_ids != segment.evidence_ids
+            or following.document_ids != segment.document_ids
             or segment.attachment
         )
         operation = self._operations.get(segment.attachment)
 
         return SegmentView(
             kind=segment.kind,
+            role=segment.role,
             text=segment.text,
             items=segment.items,
             citations=self._segment_citations(segment) if cited else [],
@@ -365,6 +396,9 @@ class _Presenter:
         citations = []
         for key in segment.evidence_ids:
             citations.extend(self._evidence.get(key, []))
+        citations.extend(
+            self._documents[key] for key in segment.document_ids if key in self._documents
+        )
 
         return list(dict.fromkeys(citations))
 
@@ -383,6 +417,18 @@ class _Presenter:
             citations.append(self._citation(source, f"c{len(citations) + 1}", refs))
 
         return citations
+
+    #
+    # Agrega las citas de los fragmentos y devuelve su identificador por evidencia.
+    #
+    def _document_citations(self):
+        found = {}
+        for reference in self._response.document_references:
+            citation_id = f"c{len(self._citations) + 1}"
+            self._citations.append(_document_citation(reference, citation_id))
+            found[reference.evidence_id] = citation_id
+
+        return found
 
     #
     # Construye la cita de una fuente con su archivo, hoja, filas y variables.
@@ -504,7 +550,25 @@ class _Presenter:
             x_title=self._axis_title(chart.x_axis),
             y_title=self._axis_title(chart.y_axis),
             legend_title=legend,
+            reference_lines=self._reference_lines(chart.operation_id),
         )
+
+    #
+    # Devuelve las líneas de referencia verificadas de un gráfico.
+    #
+    def _reference_lines(self, operation_id):
+        return [
+            ChartReferenceLine(
+                axis=item.axis,
+                value=item.value,
+                label=item.label,
+                citations=[
+                    self._documents[item.evidence_id]
+                ] if item.evidence_id in self._documents else [],
+            )
+            for item in self._response.reference_lines
+            if item.operation_id == operation_id
+        ]
 
     #
     # Devuelve el título de un eje con su unidad formateada.
@@ -520,6 +584,24 @@ class _Presenter:
             return label.replace(raw, format_unit(raw))
 
         return f"{label} ({unit})" if unit else label
+
+
+#
+# Construye la cita de un fragmento con su documento, páginas, sección y cita textual.
+#
+def _document_citation(reference, citation_id):
+    return CitationView(
+        id=citation_id,
+        kind="document",
+        source_id=reference.source_id,
+        file_name=reference.file_name,
+        file_type=reference.file_name.rsplit(".", 1)[-1].lower(),
+        title=reference.title,
+        pages=pages_text(reference.page_start, reference.page_end) or None,
+        section=" > ".join(reference.section[-2:]) or None,
+        excerpt=reference.excerpt or None,
+        doubtful=bool(reference.doubts),
+    )
 
 
 #

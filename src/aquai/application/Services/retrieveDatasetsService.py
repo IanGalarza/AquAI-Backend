@@ -22,6 +22,7 @@ from aquai.application.matching import (
     singular_words,
     symbol_named,
     variable_core,
+    variable_in_unit,
     variable_variants,
     without_medium,
 )
@@ -61,9 +62,7 @@ def _variable_columns_found(dataset, text):
     named = [
         column
         for column in dataset.columns_metadata
-        if any(_column_named(column, variant) for variant in variants)
-        or formula_named(column.original_name, base)
-        or symbol_named(column.original_name, column.unit, base)
+        if _identifies_variable(column, base, variants) or _measured_as_asked(column, text)
     ]
     discarded = {
         column.sql_name: reason
@@ -83,17 +82,42 @@ def _variable_columns_found(dataset, text):
 
 
 #
+# Indica si la columna corresponde a la variable por su nombre, su fórmula química o su símbolo.
+#
+def _identifies_variable(column, base, variants):
+    return (
+        any(_variable_named(column, variant) for variant in variants)
+        or formula_named(column.original_name, base)
+        or symbol_named(column.original_name, column.unit, base)
+    )
+
+
+#
+# Indica si la columna es de la variable pedida y mide en la unidad que nombra la mención.
+#
+def _measured_as_asked(column, text):
+    asked = variable_in_unit(text, column.original_name, column.unit)
+    if not asked:
+        return False
+
+    base = without_medium(asked)
+    return _identifies_variable(column, base, variable_variants(base))
+
+
+#
 # Indica cómo se reconoció una columna que no lleva el nombre pedido.
 #
 def _match_reason(column, text):
     base = without_medium(text)
-    if _column_named(column, base):
+    if _variable_named(column, base):
         return None
-    if any(_column_named(column, variant) for variant in variable_variants(base)):
+    if any(_variable_named(column, variant) for variant in variable_variants(base)):
         return "reconocidas por un nombre equivalente"
     if formula_named(column.original_name, base):
         return "reconocidas por su fórmula química"
-    return "reconocidas por su símbolo y su unidad"
+    if symbol_named(column.original_name, column.unit, base):
+        return "reconocidas por su símbolo y su unidad"
+    return "reconocidas por la unidad pedida"
 
 
 #
@@ -133,6 +157,29 @@ def _column_named(column, text):
     return contains_phrase(column.original_name, text, plural_insensitive=True) or contains_phrase(
         column.sql_name, text, plural_insensitive=True
     )
+
+
+#
+# Indica si la columna lleva el nombre de la variable; un conector interno de la mención no lo impide.
+#
+def _variable_named(column, text):
+    if _column_named(column, text):
+        return True
+    if not _has_inner_connector(text):
+        return False
+
+    asked = " ".join(_content_words(text))
+    return any(
+        contains_phrase(" ".join(_content_words(name)), asked)
+        for name in (column.original_name, column.sql_name)
+    )
+
+
+#
+# Indica si hay un conector entre las palabras de un texto.
+#
+def _has_inner_connector(text):
+    return any(word in MENTION_CONNECTORS for word in normalize_text(text).split()[1:-1])
 
 
 #

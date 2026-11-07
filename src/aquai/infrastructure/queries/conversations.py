@@ -136,6 +136,7 @@ def _context_statement(conversation_id, before_sequence, completed, limit):
             data["response"]["routing"]["source_mentions"].label("named_sources"),
             data["response"]["routing"]["inherits_named_sources"].label("inherited_named_sources"),
             data["response"]["segments"].label("segments"),
+            data["response"]["document_references"].label("documents"),
             data["response"]["historical_message_ids"].label("replayed_ids"),
             data["operations"].label("operations"),
             data["validated_at"].label("verified_at"),

@@ -11,21 +11,26 @@ from aquai.application.contracts.retrieval import VerifiedDataset
 from aquai.application.matching import (
     contains_any_phrase,
     contains_phrase,
+    normalize_text,
     numeric_comparisons,
     period_ranges,
     period_text,
 )
 from aquai.application.Rules.vocabulary import (
     CHART_WORDS,
-    EXTREME_CUES,
+    COUNT_BOUNDS,
     FULL_ORDER_CUES,
+    HIGHEST_CUES,
+    LOWEST_CUES,
     NUMBER_WORDS,
     OBSERVATION_NOUNS_EN,
     OBSERVATION_NOUNS_ES,
     RECENT_INTERVAL_NOUNS,
     RECENT_WORDS,
     REQUESTED_STATISTICS,
+    SUPERLATIVE_WORDS,
 )
+from aquai.application.units import unitless_name
 
 _COLUMN_FIELDS = (
     "sql_name",
@@ -46,6 +51,7 @@ _CATALOG_SCOPE = "Sólo candidatos recuperados y revalidados en PostgreSQL; no e
 _MAX_STORED_VALUES = 30
 _MAX_DESCRIPTION_LENGTH = 160
 _MAX_MEANING_LENGTH = 100
+_COUNT_STATISTICS = {"count", "count_distinct"}
 
 
 _NUMBER_WORDS = "|".join(word for words in NUMBER_WORDS.values() for word in words)
@@ -58,6 +64,8 @@ _LATEST = re.compile(
     rf"(?!(?:{RECENT_INTERVAL_NOUNS}|{_NUMBER_WORDS})\b)(?!\d)\w",
     re.IGNORECASE,
 )
+_SUPERLATIVE = re.compile(SUPERLATIVE_WORDS)
+_COUNT_BOUND = re.compile(COUNT_BOUNDS)
 
 
 #
@@ -71,8 +79,48 @@ def latest_requested(question: str) -> bool:
 # Indica si la pregunta pide el valor extremo de una variable y no todos sus registros ordenados.
 #
 def extreme_requested(question: str) -> bool:
-    return contains_any_phrase(question, EXTREME_CUES) and not contains_any_phrase(
-        question, FULL_ORDER_CUES
+    return bool(extreme_orders(question))
+
+
+#
+# Devuelve los órdenes que pide un extremo: desc para el mayor y asc para el menor.
+#
+def extreme_orders(question: str) -> set[str]:
+    if contains_any_phrase(question, FULL_ORDER_CUES):
+        return set()
+
+    text = _COUNT_BOUND.sub(" ", normalize_text(question))
+    superlatives = {match.group(1) for match in _SUPERLATIVE.finditer(text)}
+    asked = {
+        "desc": "mayor" in superlatives or contains_any_phrase(text, HIGHEST_CUES),
+        "asc": "menor" in superlatives or contains_any_phrase(text, LOWEST_CUES),
+    }
+
+    return {order for order, found in asked.items() if found}
+
+
+#
+# Devuelve los órdenes del extremo pedido, sin contar las palabras que integran un nombre: Merismopedia minima.
+#
+def asked_extremes(question: str, names) -> set[str]:
+    text = normalize_text(question)
+    for name in names:
+        if extreme_requested(name):
+            text = text.replace(normalize_text(unitless_name(name)), " ")
+
+    return extreme_orders(text)
+
+
+#
+# Indica si lo pedido exige comparar la variable como número: una estadística, un extremo o un orden rechazado.
+#
+def numeric_comparison(evidence) -> bool:
+    statistics = set(evidence.get("requested_statistics", [])) - _COUNT_STATISTICS
+
+    return (
+        bool(statistics)
+        or evidence.get("text_comparison_rejected", False)
+        or extreme_requested(evidence.get("question", ""))
     )
 
 

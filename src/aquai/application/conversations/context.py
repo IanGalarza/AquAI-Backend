@@ -31,6 +31,8 @@ _SCOPE_KINDS = {"variable", "value", "dimension", "date"}
 _MAX_RECALLED = 2
 _MAX_CARRIED_REQUESTS = 3
 _MAX_CARRIED_PENDING = 4
+_MAX_DOCUMENTS = 12
+_MAX_ROUTER_DOCUMENT_TEXT = 400
 
 
 #
@@ -74,7 +76,7 @@ def _history_message(row):
         role=row["role"],
         text=_visible_text(row),
         text_complete=row["text_complete"],
-        scientific=bool(row["sources"] or row["operations"]),
+        scientific=bool(row["sources"] or row["operations"] or row.get("documents")),
     )
     if row["role"] != "assistant":
         return message
@@ -87,6 +89,7 @@ def _history_message(row):
     message.scope = _scope_mentions(row.get("mentions") or [])
     message.replay_of = _replayed_message(row)
     message.named_sources = bool(row.get("named_sources")) or bool(row.get("inherited_named_sources"))
+    message.documents = _cited_documents(row.get("documents") or [])
 
     if _is_verified_answer(row):
         analysis = _verified_analysis(row)
@@ -157,6 +160,13 @@ def _source_columns(associations):
         ]
 
     return columns
+
+
+#
+# Devuelve las referencias de los fragmentos que citó un mensaje.
+#
+def _cited_documents(references):
+    return [item for item in references[:_MAX_DOCUMENTS] if isinstance(item, dict)]
 
 
 #
@@ -337,6 +347,10 @@ def _routing_item(message):
     if message.analysis is not None:
         item["text"] = "Respuesta analítica; utilizar sus metadatos estructurados."
         item["analysis"] = _analysis_summary(message)
+    if message.documents:
+        item["documents"] = _document_summary(message)
+        if message.analysis is None:
+            item["text"] = message.text[:_MAX_ROUTER_DOCUMENT_TEXT]
 
     return item
 
@@ -353,6 +367,13 @@ def _analysis_summary(message):
         "operations": list(dict.fromkeys(str(item.get("operation")) for item in analysis.operations)),
         "status": analysis.status,
     }
+
+
+#
+# Devuelve los nombres de los documentos que citó un mensaje.
+#
+def _document_summary(message):
+    return list(dict.fromkeys(str(item.get("file_name")) for item in message.documents))
 
 
 #

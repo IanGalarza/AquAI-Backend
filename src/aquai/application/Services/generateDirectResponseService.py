@@ -8,6 +8,7 @@ from aquai.application.answering.catalog import catalog_segments
 from aquai.application.answering.segments import answer_text, segments_from_text
 from aquai.application.contracts.answering import (
     AnswerSegment,
+    DocumentReference,
     GenerationRecord,
     QueryResponse,
     ResponseOperationReference,
@@ -23,6 +24,7 @@ _CODE = re.compile(
     re.IGNORECASE | re.MULTILINE,
 )
 _SEGMENTS = TypeAdapter(list[AnswerSegment])
+_REFERENCES = TypeAdapter(list[DocumentReference])
 
 
 class GenerateDirectResponseService:
@@ -126,6 +128,7 @@ class GenerateDirectResponseService:
         response.response_type = "historical"
         response.historical_message_ids = [message.message_id]
         response.sources = [SourceReference.model_validate(item) for item in analysis.sources]
+        response.document_references = _REFERENCES.validate_python(message.documents)
         response.operation_references = [
             ResponseOperationReference.model_validate(item)
             for item in analysis.operation_references
@@ -275,7 +278,7 @@ def _result_paragraphs(segments):
     cited = [
         segment.model_copy(update={"attachment": None})
         for segment in segments
-        if segment.kind == "paragraph" and segment.evidence_ids
+        if segment.kind == "paragraph" and (segment.evidence_ids or segment.document_ids)
     ]
     return cited or segments
 

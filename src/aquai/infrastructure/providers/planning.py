@@ -11,6 +11,7 @@ from aquai.infrastructure.providers.answering import (
     create_response_generator,
 )
 from aquai.infrastructure.providers.database import get_db_context
+from aquai.infrastructure.providers.documents import create_document_services
 from aquai.infrastructure.providers.llm.planner import OllamaPlannerProvider
 from aquai.infrastructure.providers.llm.routing import (
     OllamaGeneralResponseProvider,
@@ -44,4 +45,5 @@ def create_query_planning_graph() -> CompiledStateGraph:
         create_response_generator(),
         router,
         direct,
+        create_document_services,
     )

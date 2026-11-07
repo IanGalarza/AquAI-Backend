@@ -109,13 +109,13 @@ def _overview_segments(catalog, datasets, available, language, documents):
 
 
 #
-# Construye la lista de documentos, aclarando que todavía no se consultan desde el chat.
+# Construye la lista de documentos que se consultan desde el chat.
 #
 def _documents_segment(documents, language):
     if language == "es":
-        text = "Documentos PDF y DOCX, que todavía no se pueden consultar desde el chat:"
+        text = "Documentos PDF y DOCX, que uso para responder e interpretar resultados:"
     else:
-        text = "PDF and DOCX documents, which cannot be queried from the chat yet:"
+        text = "PDF and DOCX documents, which I use to answer and interpret results:"
 
     items = [f"{document['name']}{_source_state(document, language)}" for document in documents]
 

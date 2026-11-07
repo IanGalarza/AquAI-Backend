@@ -18,6 +18,7 @@ from aquai.application.matching import (
     contains_any_phrase,
     contains_phrase,
     mentioned_count,
+    named_documents,
     normalize_name,
     normalize_text,
     numeric_comparisons,
@@ -26,9 +27,17 @@ from aquai.application.matching import (
     qualifies_variable,
     starts_with_phrase,
     variable_core,
+    without_reference_request,
 )
 from aquai.application.planning.context import chart_requested, requested_statistics
 from aquai.application.planning.followUp import requested_period, requested_time_grain
+from aquai.application.Rules.evidence import (
+    CITATION_QUESTION,
+    DOCUMENT_ANAPHORA,
+    LAST_RESULT,
+    REFERENTIAL_QUESTION,
+    REPEAT_REQUEST,
+)
 from aquai.application.Rules.vocabulary import (
     ADDITIVE_CUES,
     CATEGORY_CUES,
@@ -46,6 +55,7 @@ from aquai.application.Rules.vocabulary import (
 )
 
 _logger = logging.getLogger(__name__)
+_MAX_REFERENTIAL_WORDS = 10
 _NUMERIC_KINDS = {"value", "limit", "threshold"}
 _SCOPE_KINDS = {"value", "dimension", "threshold", "date"}
 _CONSERVED_KINDS = {"variable", "value", "dimension", "date"}
@@ -108,6 +118,7 @@ class RouteQueryService:
     async def route(self, state):
         started = perf_counter()
         catalog = await self._read_catalog()
+        documents = await self._read_documents()
         context, digest, size, omitted = routing_context(
             state.question,
             state.conversation_history,
@@ -117,7 +128,7 @@ class RouteQueryService:
         result = self._uninterpreted_result(state, context, digest, size, omitted)
 
         try:
-            return await self._interpret(state, context, catalog, result)
+            return await self._interpret(state, context, catalog, documents, result)
         except ValueError as error:
             return self._clarify(result, str(error))
         except LLMProviderError as error:
@@ -135,6 +146,16 @@ class RouteQueryService:
             return await asyncio.to_thread(self._sources.catalog_overview)
         except Exception as error:
             _logger.warning("No se pudo leer el catálogo para el Router: %s", type(error).__name__)
+            return []
+
+    #
+    # Lee los documentos consultables y devuelve una lista vacía si no están disponibles.
+    #
+    async def _read_documents(self):
+        try:
+            return await asyncio.to_thread(self._sources.document_overview)
+        except Exception as error:
+            _logger.warning("No se pudo leer los documentos: %s", type(error).__name__)
             return []
 
     #
@@ -158,7 +179,7 @@ class RouteQueryService:
     #
     # Interpreta la consulta con el modelo y la resuelve contra el historial y el contexto.
     #
-    async def _interpret(self, state, context, catalog, result):
+    async def _interpret(self, state, context, catalog, documents, result):
         reply = await self._provider.interpret(context)
         decision = reply.decision
         self._apply_reply(result, reply, state.response_language)
@@ -181,26 +202,136 @@ class RouteQueryService:
         ):
             route = "data"
 
+        route = self._documentary_route(route, asked, state.question, documents)
         anchor = self._anchor(state.conversation_history, allowed)
+        followed = self._documented_reply(last, asked, state.question, route, decision)
         subject = self._period_subject(state.question, asked, messages, anchor, route, decision)
-        if subject is not None:
+        if self._asks_citations(state.question, last):
+            route = "document"
+            result.asks_citations = True
+            messages = self._with_context([last], provided)
+        elif self._repeats_last(route, asked, decision, anchor, state.question, messages, last):
+            route = "historical"
+            messages = self._with_context([anchor], provided)
+        elif followed is not None:
+            route = "document"
+            messages = self._with_context([followed], provided)
+        elif subject is not None:
             route = "data"
             result.requested_period = requested_period(state.question)
             messages = self._with_context([subject], provided)
         elif anchor is not None and self._fragment(decision, route, asked, state.question):
             route = "data"
             messages = self._with_context([anchor], provided)
+        elif self._refers_to_last(route, messages, state.question, last):
+            messages = self._with_context([last], provided)
         elif self._needs_implicit_reference(decision, route, asked, messages):
-            if anchor is not None:
-                messages = self._with_context([anchor], provided)
+            target = last if route == "document" and self._cites_evidence(last) else anchor
+            if target is not None:
+                messages = self._with_context([target], provided)
             elif decision.context_required and route == "data" and not decision.data_mentions:
                 return self._clarify(result, "¿A qué resultado o consulta anterior te referís?")
 
-        self._record_mentions(result, decision, state.question, messages)
+        self._record_mentions(result, decision, without_reference_request(state.question), messages)
         if route == "needs_clarification":
             return self._model_clarification(result, decision, route, messages, state.question)
 
+        if route == "document":
+            return self._document_result(state, result, messages, documents)
+
         return await self._resolve_route(state, catalog, result, decision, route, messages)
+
+    #
+    # Corrige la ruta de una pregunta científica o que nombra un documento.
+    #
+    @staticmethod
+    def _documentary_route(route, asked, question, documents):
+        measured = contains_any_phrase(question, MEASURED_STATISTICS)
+        if route == "general" and any(item.kind == "variable" for item in asked):
+            return "document"
+        if route in {"general", "catalog", "data"} and not measured and not chart_requested(question):
+            return "document" if named_documents(question, documents) else route
+
+        return route
+
+    #
+    # Devuelve la respuesta documental que continúa un fragmento («¿Y la turbiedad?»), si la hay.
+    #
+    @staticmethod
+    def _documented_reply(last, asked, question, route, decision):
+        documental = last is not None and last.documents and last.analysis is None
+        fragment = RouteQueryService._elliptical(question, asked) and all(
+            item.kind == "variable" for item in asked
+        )
+        measured = contains_any_phrase(question, MEASURED_STATISTICS)
+        follows = route != "data" or decision.context_required
+
+        return last if documental and fragment and follows and not measured else None
+
+    #
+    # Indica si la pregunta pide de dónde salió la última respuesta, que citó documentos.
+    #
+    @staticmethod
+    def _asks_citations(question, last):
+        return last is not None and bool(last.documents) and CITATION_QUESTION.search(question)
+
+    #
+    # Indica si se pide repetir un resultado sin nombrar cuál: es el último análisis.
+    #
+    @staticmethod
+    def _repeats_last(route, asked, decision, anchor, question, messages, last):
+        unnamed = not asked and not decision.source_mentions
+        repeats = route == "historical" or REPEAT_REQUEST.search(question) is not None
+        latest = anchor is not None and anchor.analysis is not None and anchor is last
+        cited = any(item.analysis is not None for item in messages)
+        names_last = LAST_RESULT.search(question) is not None
+
+        return repeats and unnamed and latest and (names_last or not cited)
+
+    #
+    # Indica si una pregunta documental breve remite a la última respuesta («¿Eso es normal?»).
+    #
+    @staticmethod
+    def _refers_to_last(route, messages, question, last):
+        refers = REFERENTIAL_QUESTION.search(question) is not None
+        brief = len(question.split()) <= _MAX_REFERENTIAL_WORDS
+
+        return (
+            route == "document"
+            and not messages
+            and refers
+            and brief
+            and RouteQueryService._cites_evidence(last)
+        )
+
+    #
+    # Indica si un mensaje del asistente tiene resultados o documentos que el seguimiento retoma.
+    #
+    @staticmethod
+    def _cites_evidence(message):
+        return message is not None and (message.analysis is not None or bool(message.documents))
+
+    #
+    # Prepara la ruta documental: conserva el contexto citado y los documentos a los que se refiere.
+    #
+    def _document_result(self, state, result, messages, documents):
+        result.route = "document"
+        result.request_history = self._requests(messages, state.question)
+        result.document_ids = self._referred_documents(state.question, messages, documents)
+
+        return result
+
+    #
+    # Devuelve los documentos que la pregunta nombra o a los que remite con «ese paper».
+    #
+    @staticmethod
+    def _referred_documents(question, messages, documents):
+        named = [item["document_id"] for item in named_documents(question, documents)]
+        if named or DOCUMENT_ANAPHORA.search(question) is None:
+            return named
+
+        cited = [item["document_id"] for message in messages for item in message.documents]
+        return list(dict.fromkeys(UUID(str(item)) for item in cited if item))
 
     #
     # Resuelve la ruta decidida: fuentes nombradas, valores guardados y resultado de cada ruta.
@@ -351,8 +482,10 @@ class RouteQueryService:
         )
         if own or about_source or chart_requested(question) or requested_period(question) is None:
             return None
-
         cited = [item for item in messages if item.analysis is not None]
+        if route == "document" and (any(item.documents for item in messages) or not cited):
+            return None
+
         if len(cited) == 1:
             return cited[0]
 
@@ -633,7 +766,9 @@ class RouteQueryService:
             messages = self._without_context(result)
 
         question, requests = contextual_question(
-            state.question, messages, redefined=self._redefines(result, state.question)
+            without_reference_request(state.question),
+            messages,
+            redefined=self._redefines(result, state.question),
         )
         self._record_tentative_value(result, state.question, messages, resolved)
         if len(question) > 6000 or len(requests) > 8:

@@ -100,16 +100,22 @@ class CitationView(BaseModel):
     """Fuente legible de una afirmación: archivo, hoja, filas de datos y variables utilizadas."""
 
     id: str
+    kind: Literal["dataset", "document"] = "dataset"
     source_id: UUID
-    dataset_id: UUID
-    version: int
+    dataset_id: UUID | None = None
+    version: int | None = None
     file_name: str
     file_type: str
-    sheet: str | None
-    dataset: str
+    sheet: str | None = None
+    dataset: str = ""
     first_row: int | None = None
     last_row: int | None = None
     variables: list[CitationVariable] = Field(default_factory=list)
+    title: str | None = None
+    pages: str | None = None
+    section: str | None = None
+    excerpt: str | None = None
+    doubtful: bool = False
 
 
 #
@@ -117,6 +123,7 @@ class CitationView(BaseModel):
 #
 class SegmentView(BaseModel):
     kind: Literal["paragraph", "note"] = "paragraph"
+    role: Literal["result", "documented", "relation", "hypothesis"] | None = None
     text: str
     items: list[str] = Field(default_factory=list)
     citations: list[str] = Field(default_factory=list)
@@ -148,12 +155,20 @@ class TableView(BaseModel):
 #
 # Respuesta con un gráfico, sus citas y sus títulos legibles.
 #
+class ChartReferenceLine(BaseModel):
+    axis: Literal["x", "y"] = "y"
+    value: float
+    label: str
+    citations: list[str] = Field(default_factory=list)
+
+
 class ChartView(BaseModel):
     operation_id: str
     citations: list[str] = Field(default_factory=list)
     x_title: str | None = None
     y_title: str | None = None
     legend_title: str | None = None
+    reference_lines: list[ChartReferenceLine] = Field(default_factory=list)
 
 
 #
@@ -251,7 +266,7 @@ class TurnReservation:
 @dataclass(frozen=True)
 class SourceAssociation:
     source_id: UUID
-    dataset_id: UUID
+    dataset_id: UUID | None
     reference_order: int
     details: dict
 

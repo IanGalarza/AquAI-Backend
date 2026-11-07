@@ -3,6 +3,7 @@ from functools import lru_cache
 from aquai.application.Services.generateResponseService import GenerateResponseService
 from aquai.application.Services.validateEvidenceService import ValidateEvidenceService
 from aquai.infrastructure.config.answering import AnsweringSettings
+from aquai.infrastructure.providers.llm.ollama import OllamaEmbeddingProvider
 from aquai.infrastructure.providers.llm.response import OllamaResponseProvider
 from aquai.infrastructure.providers.llm.settings import get_llm_settings
 
@@ -30,5 +31,6 @@ def create_response_generator():
 
     return GenerateResponseService(
         OllamaResponseProvider(models.ollama, models.response),
+        embeddings=OllamaEmbeddingProvider(models.ollama, models.document_embedding),
         max_preview_rows=get_answering_settings().max_preview_rows,
     )

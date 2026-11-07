@@ -26,6 +26,7 @@ from aquai.infrastructure.queries.planCompiler import (
     compile_step,
 )
 from aquai.infrastructure.queries.sources import SqlAlchemySourceQueries
+from aquai.infrastructure.queries.textProjections import with_text_projections
 
 _row_adapter = TypeAdapter(dict[str, ResultValue], config=ConfigDict(allow_inf_nan=False))
 
@@ -203,13 +204,14 @@ class _PlanExecution:
                 raise PlannerValidationError(
                     "La tabla autorizada no es una tabla física del schema configurado."
                 )
-            tables[dataset.dataset_id] = Table(
+            table = Table(
                 dataset.physical_table_name,
                 MetaData(),
                 schema=schema,
                 autoload_with=connection,
                 resolve_fks=False,
             )
+            tables[dataset.dataset_id] = with_text_projections(table, dataset)
         return tables
 
     #

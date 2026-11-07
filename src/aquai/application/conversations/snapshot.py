@@ -41,6 +41,17 @@ _OMITTED_CHART_FIELDS = {
     "input_rows",
     "excluded_rows",
 }
+_FRAGMENT_FIELDS = {
+    "evidence_id",
+    "chunk_id",
+    "position",
+    "kind",
+    "page_start",
+    "page_end",
+    "section",
+    "element_label",
+    "doubts",
+}
 _SOURCE_COLUMN_FIELDS = {
     "sql_name",
     "original_name",
@@ -60,6 +71,7 @@ _DIRECT_RESPONSE_TYPES = {
     "historical": "historical",
     "needs_clarification": "clarification",
     "failed": "general",
+    "document": "document",
 }
 
 
@@ -121,6 +133,7 @@ class ConversationSnapshotBuilder:
         _check_turn(state, turn, reused)
         allowed = {item.evidence_id: item for item in validation.usable_evidence}
         _check_references(response, validation, allowed)
+        _check_documents(state, response)
 
         stored = _stored_response(response)
         warnings = self._store_tables(state, response.results, allowed, stored)
@@ -135,6 +148,7 @@ class ConversationSnapshotBuilder:
         self._fit(snapshot, stored, operations, warnings, response.language)
 
         associations = self._associations(state, response)
+        associations += self._document_associations(response, len(associations))
 
         return AssistantRecord(
             content=stored.answer,
@@ -225,13 +239,14 @@ class ConversationSnapshotBuilder:
         historical = routing.route == "historical"
         if historical:
             associations = self._historical_associations(response, routing, history)
+            associations += self._document_associations(response, len(associations))
         else:
             _check_without_references(response)
-            associations = []
+            _check_documents(state, response)
+            associations = self._document_associations(response, 0)
 
-        data = response.model_dump(exclude={"generation", "results"})
-        generation = StoredGeneration(**response.generation.model_dump(exclude={"context"}))
-        stored = StoredQueryResponse(**data, generation=generation, results=[])
+        stored = _stored_response(response)
+        generation = stored.generation
         operations = (
             history[routing.history_message_ids[0]].analysis.operations if historical else []
         )
@@ -256,6 +271,38 @@ class ConversationSnapshotBuilder:
             ),
             status_name="failed" if generation.status == "failed" else "completed",
         )
+
+    #
+    # Devuelve una asociación por documento citado, con los fragmentos que la respaldan.
+    #
+    def _document_associations(self, response, offset):
+        grouped = {}
+        for item in response.document_references:
+            grouped.setdefault(item.source_id, []).append(item)
+
+        return [
+            SourceAssociation(source_id, None, offset + index, self._document_details(items))
+            for index, (source_id, items) in enumerate(grouped.items(), 1)
+        ]
+
+    #
+    # Construye los detalles de un documento citado y de sus fragmentos.
+    #
+    def _document_details(self, items):
+        first = items[0]
+        details = {
+            "schema_version": 1,
+            "kind": "document",
+            "document_id": str(first.document_id),
+            "file_name": first.file_name,
+            "title": first.title,
+            "content_hash": first.content_hash,
+            "fragments": [item.model_dump(mode="json", include=_FRAGMENT_FIELDS) for item in items],
+        }
+        if _bytes(details) > self._max_source_details_bytes:
+            raise ConversationStorageError("La referencia documental excede su límite.")
+
+        return details
 
     #
     # Valida que una respuesta histórica reproduzca el mensaje citado y devuelve sus fuentes asociadas.
@@ -450,6 +497,27 @@ def _check_references(response, validation, allowed):
         item = allowed.get(reference.evidence_id)
         if item is None or _reference_identity(reference) != _reference_identity(item):
             raise ConversationStorageError("La respuesta contiene referencias no autorizadas.")
+
+
+#
+# Verifica que cada cita documental corresponda a un fragmento recuperado en este turno.
+#
+def _check_documents(state, response):
+    retrieval = state.document_retrieval
+    recovered = {item.chunk_id for item in retrieval.fragments} if retrieval else set()
+    recovered |= {
+        str(item.get("chunk_id"))
+        for message in state.conversation_history
+        for item in message.documents
+    }
+    known = {item.evidence_id for item in response.document_references}
+    for reference in response.document_references:
+        if reference.chunk_id not in recovered and str(reference.chunk_id) not in recovered:
+            raise ConversationStorageError("La respuesta cita un fragmento que no se recuperó.")
+
+    for segment in response.segments:
+        if not set(segment.document_ids) <= known:
+            raise ConversationStorageError("Un párrafo cita un documento sin referencia.")
 
 
 #

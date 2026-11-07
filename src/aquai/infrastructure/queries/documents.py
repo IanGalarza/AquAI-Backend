@@ -3,7 +3,8 @@ from uuid import UUID
 
 from sqlalchemy import func, select
 
-from aquai.domain.enums.documentContent import DocumentElementKind
+from aquai.application.Rules.documents import chunk_doubts
+from aquai.domain.enums.documentContent import DocumentChunkKind, DocumentElementKind
 from aquai.domain.enums.sourceStatus import ProcessingStatus
 from aquai.domain.models import (
     Document,
@@ -15,6 +16,7 @@ from aquai.domain.models import (
 from aquai.infrastructure.persistence.dbContext import DbContext
 
 _READY_STATUSES = (ProcessingStatus.READY, ProcessingStatus.READY_WITH_WARNINGS)
+_SEARCHABLE_KINDS = (DocumentChunkKind.TEXT, DocumentChunkKind.TABLE, DocumentChunkKind.FIGURE)
 
 
 class SqlAlchemyDocumentQueries:
@@ -119,6 +121,7 @@ class SqlAlchemyDocumentQueries:
                 DocumentChunk.document_id,
                 DocumentChunk.position,
                 DocumentChunk.kind,
+                DocumentChunk.token_count,
                 DocumentChunk.text,
                 DocumentChunk.page_start,
                 DocumentChunk.page_end,
@@ -128,8 +131,10 @@ class SqlAlchemyDocumentQueries:
                 DocumentSection.path.label("section_path"),
                 DocumentElement.label.label("element_label"),
                 DocumentElement.caption.label("element_caption"),
+                DocumentElement.position.label("element_position"),
                 Document.title,
                 Document.language,
+                Document.details,
                 Source.id.label("source_id"),
                 Source.name.label("source_name"),
                 Source.original_filename,
@@ -150,4 +155,72 @@ class SqlAlchemyDocumentQueries:
         with self._context.session() as session:
             rows = session.execute(statement).mappings().all()
 
-        return {row["chunk_id"]: dict(row) for row in rows}
+        return {row["chunk_id"]: _verified_chunk(row) for row in rows}
+
+    #
+    # Devuelve una huella del contenido consultable, que cambia al cargar o desactivar fuentes.
+    #
+    def searchable_version(self) -> tuple:
+        statement = (
+            select(
+                func.count(DocumentChunk.id),
+                func.max(DocumentChunk.created_at),
+                func.max(Source.updated_at),
+            )
+            .join(Document, Document.id == DocumentChunk.document_id)
+            .join(Source, Source.id == Document.source_id)
+            .where(*_consultable())
+        )
+
+        with self._context.session() as session:
+            return tuple(session.execute(statement).one())
+
+    #
+    # Devuelve el texto buscable de los fragmentos vigentes, con su sección y leyenda.
+    #
+    def searchable_chunks(self) -> list[dict[str, Any]]:
+        statement = (
+            select(
+                DocumentChunk.id.label("chunk_id"),
+                DocumentChunk.document_id,
+                DocumentChunk.text,
+                DocumentSection.path.label("section_path"),
+                DocumentElement.caption.label("element_caption"),
+            )
+            .join(Document, Document.id == DocumentChunk.document_id)
+            .join(Source, Source.id == Document.source_id)
+            .outerjoin(DocumentSection, DocumentSection.id == DocumentChunk.section_id)
+            .outerjoin(DocumentElement, DocumentElement.id == DocumentChunk.element_id)
+            .where(*_consultable())
+        )
+
+        with self._context.session() as session:
+            return [dict(row) for row in session.execute(statement).mappings()]
+
+
+#
+# Devuelve las condiciones de un fragmento consultable de una fuente vigente.
+#
+def _consultable() -> tuple:
+    return (
+        DocumentChunk.kind.in_(_SEARCHABLE_KINDS),
+        Source.is_active.is_(True),
+        Source.processing_status.in_(_READY_STATUSES),
+    )
+
+
+#
+# Devuelve un fragmento verificado con sus advertencias de extracción, sin el detalle del documento.
+#
+def _verified_chunk(row) -> dict[str, Any]:
+    chunk = dict(row)
+    details = chunk.pop("details") or {}
+    chunk["doubts"] = chunk_doubts(
+        details,
+        element_position=chunk["element_position"],
+        page_start=chunk["page_start"],
+        page_end=chunk["page_end"],
+        text=chunk["text"],
+    )
+
+    return chunk

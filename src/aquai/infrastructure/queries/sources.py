@@ -28,8 +28,9 @@ from aquai.application.dtos.requests.listSources import SourceSort
 from aquai.application.errors import SourceNotFoundError
 from aquai.application.Rules.documents import DOCUMENT_FILE_TYPES, TABULAR_FILE_TYPES
 from aquai.domain.enums.sourceStatus import ProcessingStatus
-from aquai.domain.models import Dataset, Source
+from aquai.domain.models import Dataset, Document, Source
 from aquai.infrastructure.persistence.dbContext import DbContext
+from aquai.infrastructure.queries.textProjections import projection_warning, text_projections
 
 _READY_STATUSES = (ProcessingStatus.READY, ProcessingStatus.READY_WITH_WARNINGS)
 _ACCENTED = "áàäâãéèëêíìïîóòöôõúùüûñç"
@@ -165,7 +166,14 @@ class SqlAlchemySourceQueries:
     #
     def document_overview(self) -> list[dict[str, Any]]:
         statement = (
-            select(Source.name, Source.is_active, Source.processing_status)
+            select(
+                Source.name,
+                Source.is_active,
+                Source.processing_status,
+                Document.id.label("document_id"),
+                Document.title,
+            )
+            .outerjoin(Document, Document.source_id == Source.id)
             .where(Source.file_type.in_(DOCUMENT_FILE_TYPES))
             .order_by(Source.created_at, Source.id)
         )
@@ -399,7 +407,7 @@ class SqlAlchemySourceQueries:
             for row in rows:
                 if not self._physical_dataset_available(session, row[0]):
                     continue
-                verified.append(_verified_dataset(*row))
+                verified.append(_verified_dataset(*row, text_projections(session, row[0])))
             return verified
 
     #
@@ -668,6 +676,7 @@ def _verified_dataset(
     processing_status: str,
     semantic_index_status: str,
     processing_report: dict,
+    projections: list[dict],
 ) -> VerifiedDataset:
     return VerifiedDataset(
         dataset_id=dataset.id,
@@ -678,7 +687,7 @@ def _verified_dataset(
         physical_table_name=dataset.physical_table_name,
         verified_version=dataset.version,
         row_count=dataset.row_count,
-        columns_metadata=deepcopy(dataset.columns_metadata),
+        columns_metadata=[*deepcopy(dataset.columns_metadata), *projections],
         provenance=DatasetProvenance(
             source_name=source_name,
             original_filename=original_filename,
@@ -689,7 +698,13 @@ def _verified_dataset(
             semantic_index_status=semantic_index_status,
         ),
         warnings=list(
-            dict.fromkeys(dataset.quality_warnings + processing_report.get("warnings", []))
+            dict.fromkeys(
+                [
+                    *dataset.quality_warnings,
+                    *processing_report.get("warnings", []),
+                    *map(projection_warning, projections),
+                ]
+            )
         ),
     )
 

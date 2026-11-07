@@ -20,3 +20,10 @@ class ResponseProvider(Protocol):
     # Genera la respuesta al usuario a partir del contexto de evidencia validada.
     #
     async def generate(self, context: ResponseContextRecord) -> ResponseReply: ...
+
+
+class TextEmbeddings(Protocol):
+    #
+    # Devuelve el vector semántico de cada texto.
+    #
+    async def embed(self, texts: list[str]) -> list[list[float]]: ...

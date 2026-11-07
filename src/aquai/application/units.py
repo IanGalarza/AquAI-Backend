@@ -9,6 +9,7 @@ from aquai.application.Rules.units import (
     MAX_UNIT_LENGTH,
     MISDECODED_SYMBOLS,
     NAME_BASIS,
+    ORGANISM_COUNTS,
     RATIO_UNIT,
     SIMPLE_UNIT,
     STACKED_HEADER_SEPARATOR,
@@ -20,6 +21,9 @@ from aquai.application.Rules.units import (
 from aquai.application.Rules.variables import NAME_SEPARATORS, PH_ALIASES
 
 _INVERSE_POWER = re.compile(r"\s+(\S+?)\^?-(\d)$")
+_SPACED_POWER = re.compile(r"\s*-\s*(\d)$")
+_GLUED_POWER = re.compile(r"(?<=[gGsS])(?=(?:[Ll]|c?m)-\d$)")
+_POWER_SIGNS = str.maketrans("⁰¹²³⁴⁵⁶⁷⁸⁹⁻−–", "0123456789---")
 _WORD = re.compile(r"[^\W\d_]+")
 
 
@@ -89,7 +93,9 @@ def repaired_symbols(unit: str) -> str:
 #
 def unit_key(unit: str) -> str:
     without_basis = UNIT_BASIS.sub(lambda match: match.group("unit") or "", repaired_symbols(unit))
-    text = unicodedata.normalize("NFKD", without_basis.strip())
+    text = _SPACED_POWER.sub(r"-\1", without_basis.translate(_POWER_SIGNS).strip())
+    text = _GLUED_POWER.sub(" ", text)
+    text = unicodedata.normalize("NFKD", text)
     text = "".join(char for char in text if not unicodedata.combining(char))
     text = "".join(_INVERSE_POWER.sub(_division, text).split()).casefold()
     text = _WORD.sub(lambda match: UNIT_WORDS.get(match.group(), match.group()), text)
@@ -99,12 +105,19 @@ def unit_key(unit: str) -> str:
 
 
 #
+# Indica si una unidad cuenta organismos: dice qué se contó, aunque el nombre de la columna no lo diga.
+#
+def counts_organisms(unit: str | None) -> bool:
+    return bool(unit) and unit_key(unit).split("/")[0] in ORGANISM_COUNTS
+
+
+#
 # Devuelve la especie química en que se expresa una concentración, si se declara.
 #
 def concentration_basis(name: str, unit: str | None) -> str | None:
     found = UNIT_BASIS.search(repaired_symbols(unit or ""))
     if found:
-        return found.group("lead") or found.group("tail")
+        return found.group("lead") or found.group("element") or found.group("tail")
 
     found = NAME_BASIS.search(name)
     if found:

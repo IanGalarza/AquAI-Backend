@@ -4,7 +4,9 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue
 
-QueryRoute = Literal["general", "catalog", "data", "historical", "needs_clarification", "failed"]
+QueryRoute = Literal[
+    "general", "catalog", "data", "document", "historical", "needs_clarification", "failed"
+]
 
 
 class HistoricalAnalysis(BaseModel):
@@ -45,11 +47,12 @@ class HistoryMessage(BaseModel):
     recalled: bool = False
     segments: list[dict[str, JsonValue]] = Field(default_factory=list)
     source_columns: dict[str, list[dict[str, JsonValue]]] = Field(default_factory=dict)
+    documents: list[dict[str, JsonValue]] = Field(default_factory=list)
 
 
 class RoutingDraft(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
-    route: Literal["general", "catalog", "data", "historical", "needs_clarification"]
+    route: Literal["general", "catalog", "data", "document", "historical", "needs_clarification"]
     language: Literal["es", "en"]
     context_required: bool
     history_message_ids: list[UUID] = Field(max_length=4)
@@ -98,6 +101,8 @@ class RoutingResult(BaseModel):
     history_message_ids: list[UUID] = Field(default_factory=list)
     request_history: list[str] = Field(default_factory=list)
     dataset_bindings: list[DatasetBinding] = Field(default_factory=list)
+    document_ids: list[UUID] = Field(default_factory=list)
+    asks_citations: bool = False
     source_mentions: list[str] = Field(default_factory=list)
     data_mentions: list[DataMention | str] = Field(default_factory=list)
     conserved_mentions: list[DataMention] = Field(default_factory=list)

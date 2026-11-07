@@ -11,7 +11,7 @@ VARIABLE_SYNONYMS = (
     ("saturacion de oxigeno", "sat de oxigeno", "oxygen saturation"),
     ("clorofila", "chlorophyll", "chl"),
     ("feofitina", "pheophytin", "phaeophytin"),
-    ("cianobacteria", "cyanobacteria"),
+    ("cianobacteria", "cyanobacteria", "cyanobacterial"),
     ("fitoplancton", "phytoplankton"),
     ("microcistina", "microcystina", "microcystin"),
     ("nitrato", "nitrate"),

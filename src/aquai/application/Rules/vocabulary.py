@@ -424,24 +424,32 @@ CHART_TYPE_WORDS = {
     "histogram": ("histograma", "histogram"),
 }
 
-EXTREME_CUES = (
+HIGHEST_CUES = (
     "maximo",
     "maxima",
-    "minimo",
-    "minima",
     "mas alto",
     "mas alta",
-    "mas bajo",
-    "mas baja",
     "mas elevado",
     "mas elevada",
     "mayor valor",
-    "menor valor",
     "highest",
-    "lowest",
+    "largest",
+    "greatest",
+    "biggest",
     "maximum",
+)
+LOWEST_CUES = (
+    "minimo",
+    "minima",
+    "mas bajo",
+    "mas baja",
+    "menor valor",
+    "lowest",
+    "smallest",
     "minimum",
 )
+SUPERLATIVE_WORDS = r"\b(mayor|menor)(?:es)?\b(?!\s+(?:a|al|que|o|parte|de\s+\d+)\b)"
+COUNT_BOUNDS = r"\b(?:un|como|a)\s+(?:maximo|minimo|maximum|minimum)\s+(?:de\s+|of\s+)?\d+"
 FULL_ORDER_CUES = (
     "de mayor a menor",
     "de menor a mayor",

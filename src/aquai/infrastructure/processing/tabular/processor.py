@@ -729,7 +729,7 @@ def _column_metadata(
 #
 # Genera un nombre SQL libre para la columna de proyección numérica de una columna de texto.
 #
-def _projection_name(sql_name: str, columns: list[dict]) -> str:
+def projection_name(sql_name: str, columns: list[dict]) -> str:
     base = sql_name[:53] + "_numeric"
     taken = {column["sql_name"] for column in columns}
     name, suffix = base, 2
@@ -744,7 +744,7 @@ def _projection_name(sql_name: str, columns: list[dict]) -> str:
 #
 # Construye los metadatos de la columna de proyección numérica derivada de una de texto.
 #
-def _projection_column(metadata: dict, name: str, values: list, excluded: int) -> dict:
+def projection_column(metadata: dict, name: str, values: list, excluded: int) -> dict:
     return {
         **metadata,
         "original_name": metadata["original_name"] + " (representación numérica)",
@@ -1338,8 +1338,8 @@ class SimpleTabularProcessor:
                 continue
 
             values, excluded = projection
-            name = _projection_name(metadata["sql_name"], columns)
-            columns.append(_projection_column(metadata, name, values, excluded))
+            name = projection_name(metadata["sql_name"], columns)
+            columns.append(projection_column(metadata, name, values, excluded))
             converted.append(values)
             table_warnings.append(
                 f"{metadata['original_name']}: representación numérica auxiliar; {excluded} valores no convertibles conservados en el texto original y excluidos de cálculos."

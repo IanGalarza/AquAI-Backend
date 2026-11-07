@@ -80,6 +80,13 @@ class ResponseModelSettings(AgentModelSettings):
     context_max_bytes: int = Field(default=24000, ge=2048, le=96000)
 
 
+class EvidenceModelSettings(AgentModelSettings):
+    model_config = SettingsConfigDict(env_prefix="LLM_EVIDENCE_")
+
+    max_output_tokens: int = Field(default=1024, ge=1)
+    context_max_bytes: int = Field(default=24000, ge=2048, le=96000)
+
+
 class EmbeddingModelSettings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -115,6 +122,7 @@ class LLMSettings(BaseModel):
     general: GeneralModelSettings = Field(default_factory=GeneralModelSettings)
     planner: PlannerModelSettings = Field(default_factory=PlannerModelSettings)
     response: ResponseModelSettings = Field(default_factory=ResponseModelSettings)
+    evidence: EvidenceModelSettings = Field(default_factory=EvidenceModelSettings)
     embedding: EmbeddingModelSettings = Field(default_factory=EmbeddingModelSettings)
     document_embedding: DocumentEmbeddingModelSettings = Field(
         default_factory=DocumentEmbeddingModelSettings
@@ -125,7 +133,14 @@ class LLMSettings(BaseModel):
     #
     @property
     def chat_agents(self) -> tuple[AgentModelSettings, ...]:
-        return (self.tabular, self.router, self.general, self.planner, self.response)
+        return (
+            self.tabular,
+            self.router,
+            self.general,
+            self.planner,
+            self.response,
+            self.evidence,
+        )
 
     #
     # Valida que ningún agente de chat use el modelo de embeddings.

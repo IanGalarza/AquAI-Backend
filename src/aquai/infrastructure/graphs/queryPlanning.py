@@ -7,8 +7,10 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 
 from aquai.application.contracts.answering import QueryResponseInput, QueryResponseState
+from aquai.application.contracts.retrieval import DocumentRetrievalResult
 from aquai.application.conversations.context import cited_analysis
 from aquai.application.execution import summarize_execution
+from aquai.application.Services.contrastReferencesService import ContrastReferencesService
 from aquai.application.Services.executePythonPlanService import ExecutePythonPlanService
 from aquai.application.Services.executeSqlPlanService import ExecuteSqlPlanService
 from aquai.application.Services.generateDirectResponseService import (
@@ -17,6 +19,7 @@ from aquai.application.Services.generateDirectResponseService import (
 from aquai.application.Services.generateResponseService import GenerateResponseService
 from aquai.application.Services.planQueryService import PlanQueryService
 from aquai.application.Services.retrieveDatasetsService import RetrieveDatasetsService
+from aquai.application.Services.retrieveDocumentsService import RetrieveDocumentsService
 from aquai.application.Services.routeQueryService import RouteQueryService
 from aquai.application.Services.validateEvidenceService import ValidateEvidenceService
 
@@ -33,10 +36,20 @@ def analytical_state(state: QueryResponseState) -> QueryResponseState:
 
 
 #
-# Elige el siguiente nodo tras el enrutado: recuperación de datos o respuesta directa.
+# Elige el siguiente nodo tras el enrutado: datos, documentos o respuesta directa.
 #
 def next_after_routing(state: QueryResponseState):
-    return "retriever" if state.routing.route == "data" else "direct_response"
+    if state.routing.route == "data":
+        return "retriever"
+
+    return "document_retriever" if state.routing.route == "document" else "direct_response"
+
+
+#
+# Elige la respuesta tras buscar documentos: la analítica o la puramente documental.
+#
+def next_after_documents(state: QueryResponseState):
+    return "response_generator" if state.routing.route == "data" else "document_response"
 
 
 #
@@ -85,8 +98,12 @@ def build_query_planning_graph(
     response_generator: GenerateResponseService,
     router: RouteQueryService,
     direct_response: GenerateDirectResponseService,
+    document_services_factory: Callable[
+        [], tuple[RetrieveDocumentsService, ContrastReferencesService]
+    ],
 ) -> CompiledStateGraph:
     retriever = None
+    document_services = None
     retrieval_lock = asyncio.Lock()
 
     async def route(state: QueryResponseState):
@@ -131,6 +148,31 @@ def build_query_planning_graph(
             "retrieval": result,
             **_cleared_analysis(),
             "stage_durations_ms": _stage_durations(state, "retriever", started),
+        }
+
+    async def retrieve_documents(state: QueryResponseState):
+        nonlocal document_services
+        started = perf_counter()
+        analytical = state.routing.route == "data"
+        try:
+            async with retrieval_lock:
+                if document_services is None:
+                    document_services = await asyncio.to_thread(document_services_factory)
+
+            documents, references = document_services
+            result = await documents.retrieve(state)
+            current = state.model_copy(update={"document_retrieval": result})
+            contrast = await references.contrast(current) if analytical else None
+        except Exception as error:
+            _logger.warning("Falló la evidencia documental: %s", type(error).__name__)
+            purpose = "enrichment" if analytical else "question"
+            result = DocumentRetrievalResult(purpose=purpose, status="unavailable")
+            contrast = None
+
+        return {
+            "document_retrieval": result,
+            "document_contrast": contrast,
+            "stage_durations_ms": _stage_durations(state, "documents", started),
         }
 
     async def plan(state: QueryResponseState):
@@ -202,6 +244,14 @@ def build_query_planning_graph(
 
         return {"response": response}
 
+    async def respond_from_documents(state: QueryResponseState):
+        response = await response_generator.generate_documental(state)
+        _logger.info(
+            "Turno route=document status=%s etapas_ms=%s", response.status, response.timings_ms
+        )
+
+        return {"response": response}
+
     builder = StateGraph(QueryResponseState, input_schema=QueryResponseInput)
     builder.add_node("router", route)
     builder.add_node("direct_response", respond_directly)
@@ -210,7 +260,9 @@ def build_query_planning_graph(
     builder.add_node("sql_agent", execute_sql)
     builder.add_node("python_agent", execute_python)
     builder.add_node("validator", validate)
+    builder.add_node("document_retriever", retrieve_documents)
     builder.add_node("response_generator", respond)
+    builder.add_node("document_response", respond_from_documents)
     _add_edges(builder)
 
     return builder.compile()
@@ -224,7 +276,11 @@ def _add_edges(builder: StateGraph) -> None:
     builder.add_conditional_edges(
         "router",
         next_after_routing,
-        {"retriever": "retriever", "direct_response": "direct_response"},
+        {
+            "retriever": "retriever",
+            "document_retriever": "document_retriever",
+            "direct_response": "direct_response",
+        },
     )
     builder.add_edge("direct_response", END)
     builder.add_edge("retriever", "planner")
@@ -239,8 +295,14 @@ def _add_edges(builder: StateGraph) -> None:
         {"python_agent": "python_agent", "validator": "validator"},
     )
     builder.add_edge("python_agent", "validator")
-    builder.add_edge("validator", "response_generator")
+    builder.add_edge("validator", "document_retriever")
+    builder.add_conditional_edges(
+        "document_retriever",
+        next_after_documents,
+        {"response_generator": "response_generator", "document_response": "document_response"},
+    )
     builder.add_edge("response_generator", END)
+    builder.add_edge("document_response", END)
 
 
 #

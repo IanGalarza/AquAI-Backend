@@ -5,7 +5,7 @@ from html import escape
 from aquai.application.units import repaired_symbols
 
 _SUPERSCRIPTS = str.maketrans("0123456789", "⁰¹²³⁴⁵⁶⁷⁸⁹")
-_NEGATIVE_EXPONENT = re.compile(r"(?<=[A-Za-zµμ])-(\d{1,2})(?![\d.,])")
+_NEGATIVE_EXPONENT = re.compile(r"(?<=[A-Za-zµμ])\s?[-−–]\s?(\d{1,2})(?![\d.,])")
 
 
 #

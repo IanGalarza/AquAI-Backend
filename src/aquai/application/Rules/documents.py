@@ -29,6 +29,7 @@ SUSPECT_MICRO_UNIT = re.compile(
 )
 UNMAPPED_CHARACTER = re.compile("[\\x00\\x01\\x03-\\x08\\x0b\\x0c\\x0e-\\x1f\\x7f-\\x9f\\ufffd\\ue000-\\uf8ff]")
 WORD = re.compile(r"[^\W\d_]+")
+TABLE_DOUBTS = ("uncertain", "rebuilt", "read_by_ocr", "unverifiable")
 WHITESPACE = re.compile(r"\s+")
 
 _ELEMENT_FAMILIES = {
@@ -110,11 +111,57 @@ def detect_language(text: str) -> str | None:
     if len(words) < 30:
         return None
 
-    scores = {
-        language: sum(word in cues for word in words) for language, cues in _LANGUAGE_CUES.items()
-    }
+    scores = language_scores(text[:40000])
     language, score = max(scores.items(), key=lambda item: item[1])
     return language if score >= 0.1 * len(words) else None
+
+
+#
+# Cuenta las palabras funcionales de cada idioma en un texto.
+#
+def language_scores(text: str) -> dict[str, int]:
+    words = [word.lower() for word in WORD.findall(text)]
+
+    return {
+        language: sum(word in cues for word in words) for language, cues in _LANGUAGE_CUES.items()
+    }
+
+
+#
+# Devuelve las advertencias de extracción que alcanzan a un fragmento.
+#
+def chunk_doubts(details, *, element_position, page_start, page_end, text) -> list[str]:
+    quality = details.get("quality") or {}
+    ocr = details.get("ocr") or {}
+    doubts = _table_doubts(quality.get("tables") or {}, element_position)
+    pages = set(range(page_start, (page_end or page_start) + 1)) if page_start else set()
+
+    if pages & set(ocr.get("pages_with_prior_ocr") or []):
+        doubts.append("prior_ocr_page")
+    if pages & set(ocr.get("pages_without_text") or []):
+        doubts.append("ocr_read_page")
+    if pages & set((quality.get("symbols") or {}).get("unresolved_pages") or []):
+        doubts.append("unresolved_symbols")
+    if UNMAPPED_CHARACTER.search(text):
+        doubts.append("unmapped_characters")
+    if SUSPECT_MICRO_UNIT.search(text):
+        doubts.append("suspect_micro_unit")
+
+    return doubts
+
+
+#
+# Devuelve las marcas de revisión de la tabla de la que proviene un fragmento.
+#
+def _table_doubts(tables, element_position) -> list[str]:
+    if element_position is None:
+        return []
+
+    return [
+        f"table_{name}"
+        for name in TABLE_DOUBTS
+        if any(item.get("element") == element_position for item in tables.get(name) or [])
+    ]
 
 
 #

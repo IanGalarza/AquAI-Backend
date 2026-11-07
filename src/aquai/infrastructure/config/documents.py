@@ -29,6 +29,11 @@ class DocumentSettings(BaseSettings):
     qdrant_collection: str = Field(default="aquai_documents", min_length=1, max_length=200)
     index_timeout_seconds: float = Field(default=60, gt=0, allow_inf_nan=False)
     index_batch_size: int = Field(default=32, gt=0, le=256)
+    search_limit: int = Field(default=40, gt=0, le=100)
+    search_candidates: int = Field(default=15, gt=0, le=20)
+    search_candidate_chars: int = Field(default=700, ge=200, le=2000)
+    search_fragments: int = Field(default=6, gt=0, le=12)
+    search_fragments_per_document: int = Field(default=3, gt=0, le=12)
 
     #
     # Valida que la URL de Qdrant sea HTTP sin parámetros ni fragmentos.

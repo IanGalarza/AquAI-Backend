@@ -175,8 +175,6 @@ class _ContextBuilder:
             "question": state.question,
             "language": self._language,
             "status": validation.status,
-            "conversation_context": [item.model_dump() for item in state.conversation_context],
-            "history_is_not_evidence": True,
             "number_presentation": {
                 "max_decimal_places": 2,
                 "small_value_significant_digits": 2,
@@ -370,10 +368,11 @@ class _ContextBuilder:
                 self._meanings.setdefault(meaning, evidence)
 
     #
-    # Agrega los detalles de columnas numéricas derivadas y de filas excluidas.
+    # Agrega los detalles de filas excluidas y, una sola vez, los de columnas numéricas derivadas.
     #
     def _add_details(self, evidence, record, origin, fields):
-        projections = self._writer.projections(record)
+        written = {entry["direct"] for entry in self._catalog}
+        projections = [item for item in self._writer.projections(record) if item not in written]
         exclusions = self._writer.exclusions(record, origin, fields)
         for detail in [*projections, *exclusions]:
             self._add(evidence, detail, kind="detail")
@@ -390,11 +389,6 @@ class _ContextBuilder:
     #
     def _finish(self):
         self._body["omitted_rows"] = self._omitted
-
-        history = self._body["conversation_context"]
-        while history and self._over_budget():
-            history.pop(0)
-
         content = self._serialized()
         record = ResponseContextRecord(
             evidence=self._body,
@@ -438,7 +432,8 @@ class _Writer:
         if not column:
             return None
 
-        label = column_label(column.original_name, column.unit)
+        named = _column_metadata(dataset, column.derived_from) or column
+        label = column_label(named.original_name, named.unit)
 
         return label if len(label) <= _MAX_LABEL_LENGTH else column.sql_name
 

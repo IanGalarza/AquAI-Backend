@@ -48,6 +48,7 @@ _PYTHON_ONLY_FUNCTIONS = {"median", "stddev", "quantile"}
 _COUNT_FUNCTIONS = {"count", "count_distinct"}
 _STATISTIC_FUNCTIONS = {"count": _COUNT_FUNCTIONS}
 _EXTREME_FUNCTIONS = {"min", "max"}
+_EXTREME_OPERATIONS = {"sort", "latest", "aggregate", "calculate"}
 _AUTHORIZED_METADATA = (
     "source_id",
     "semantic_point_id",
@@ -152,6 +153,39 @@ def validate_unrequested_latest(operations, output_steps, *, follow_up=False) ->
         and step.id in relevant
         and (follow_up or step.id in calculated)
     ]
+
+
+#
+# Detecta los órdenes por mediciones guardadas como texto, que serían alfabéticos y no numéricos.
+#
+def validate_text_orderings(operations, variables) -> list[ValidationIssue]:
+    steps = {step.id: step for step in operations}
+
+    return [
+        ValidationIssue(
+            code="text_measurement_order",
+            severity="clarification",
+            step_id=step.id,
+            message=f"El paso {step.id} ordena por {field.name}, una medición guardada como texto: el orden sería "
+            "alfabético (99 quedaría antes que 1000), así que no da mayores ni menores. No ordenes por esa columna "
+            "ni uses otra variable en su lugar; si no hay una columna numérica de la misma variable, respondé "
+            "insufficient_coverage.",
+        )
+        for step in operations
+        if step.operation != "latest"
+        for ordering in step.order_by
+        if (field := _filtered_field(step, ordering, steps)) is not None
+        and _is_text_measurement(field, variables)
+    ]
+
+
+#
+# Indica si el campo guarda como texto una medición: tiene unidad o es una variable pedida.
+#
+def _is_text_measurement(field, variables) -> bool:
+    requested = any(ref.column in variables.get(ref.dataset_id, ()) for ref in field.sources)
+
+    return field.sql_type == "TEXT" and (requested or field.unit is not None)
 
 
 #
@@ -263,7 +297,7 @@ def _unscoped_output_issues(outputs, requested_values) -> list[ValidationIssue]:
 
 
 #
-# Valida que umbrales, períodos, estadísticas, dimensiones, agrupación y gráfico pedidos lleguen a una salida.
+# Valida que umbrales, períodos, estadísticas, extremos, dimensiones, agrupación y gráfico pedidos lleguen a una salida.
 #
 def validate_requested_scope(
     operations,
@@ -271,6 +305,7 @@ def validate_requested_scope(
     *,
     thresholds=(),
     statistics=(),
+    extreme=False,
     dimensions=None,
     categories=False,
     chart=False,
@@ -285,6 +320,7 @@ def validate_requested_scope(
         *_threshold_issues(steps, output_steps, thresholds),
         *_period_issues(steps, output_steps, periods, dated_columns or {}),
         *_statistic_issues(published, statistics),
+        *(_extreme_issues(published) if extreme else []),
     ]
 
     if chart and not any(step.operation == "visualize" for step in published):
@@ -714,6 +750,23 @@ def _statistic_issues(published, statistics) -> list[ValidationIssue]:
         )
         for function in statistics
         if not _STATISTIC_FUNCTIONS.get(function, {function}) & computed
+    ]
+
+
+#
+# Devuelve la incidencia del extremo pedido si ninguna salida ordena ni calcula.
+#
+def _extreme_issues(published) -> list[ValidationIssue]:
+    if any(step.order_by or step.operation in _EXTREME_OPERATIONS for step in published):
+        return []
+
+    return [
+        ValidationIssue(
+            code="missing_requested_extreme",
+            severity="clarification",
+            message="La consulta pide el mayor o el menor valor, pero ninguna salida ordena ni calcula: "
+            "un read solo no lo responde. Agregá un sort por la variable con limit 5, o un aggregate con max o min.",
+        )
     ]
 
 

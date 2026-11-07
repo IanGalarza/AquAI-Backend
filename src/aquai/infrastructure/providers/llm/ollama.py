@@ -518,11 +518,12 @@ async def warm_up_models(settings: LLMSettings) -> None:
                 },
                 agent.timeout_seconds,
             )
-        await client.post(
-            "/api/embed",
-            {"model": settings.embedding.model, "input": ["warm-up"]},
-            settings.embedding.timeout_seconds,
-        )
+        for embedding in (settings.embedding, settings.document_embedding):
+            await client.post(
+                "/api/embed",
+                {"model": embedding.model, "input": ["warm-up"]},
+                embedding.timeout_seconds,
+            )
     except LLMProviderError as error:
         logging.getLogger(__name__).warning(
             "No se pudieron precargar los modelos de Ollama: %s", error

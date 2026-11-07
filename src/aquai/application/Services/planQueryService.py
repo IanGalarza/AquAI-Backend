@@ -26,10 +26,12 @@ from aquai.application.errors import LLMProviderError, PlannerValidationError
 from aquai.application.interfaces.planning import PlannerProvider
 from aquai.application.interfaces.sources import SourceQueries
 from aquai.application.planning.context import (
+    asked_extremes,
     build_planning_context,
     chart_requested,
     extreme_requested,
     latest_requested,
+    numeric_comparison,
     period_phrase,
     requested_periods,
     requested_statistics,
@@ -66,6 +68,7 @@ from aquai.application.planning.validation import (
     validate_requested_scope,
     validate_selections,
     validate_temporal_scope,
+    validate_text_orderings,
     validate_unrequested_latest,
 )
 
@@ -74,9 +77,11 @@ _USER_DECISIONS = {"ambiguous_filter_value"}
 _MAX_ATTEMPTS = 2
 _CATEGORY_LENGTH = 80
 _EXTREME_ROWS = 5
+_EXTREME_SUFFIX = "_extreme"
 _CATEGORY_PREFERENCE = ({"TEXT"}, {"DATE", "TIMESTAMP"})
 _MAX_PLAN_STEPS = 12
 _TEXT_CALCULATIONS = {"count", "count_distinct"}
+_TEXT_COMPARISONS = {"text_measurement_order", "ineligible_calculation"}
 _PUBLICATION_STEP = re.compile(r"output_steps?(?:_[a-z0-9]+)?")
 _MAX_STEP_ID_LENGTH = 63
 _DISTINCT_TEXT_LIMIT = 500
@@ -121,6 +126,7 @@ class _Requested(NamedTuple):
     latest_allowed: bool = True
     follow_up: bool = False
     extreme: bool = False
+    extreme_orders: frozenset = frozenset()
 
 
 _UNRESTRICTED = _Requested(
@@ -212,6 +218,30 @@ def _renamed_references(value, renamed):
     copy = {key: _renamed_references(item, renamed) for key, item in value.items()}
     if copy.get("kind") == "result" and copy.get("step_id") in renamed:
         copy["step_id"] = renamed[copy["step_id"]]
+    return copy
+
+
+#
+# Copia un paso citando las proyecciones numéricas en lugar de las columnas de texto que reemplazan.
+#
+def _projected_step(step, projections):
+    data = _projected_references(step.model_dump(mode="json"), projections)
+    return type(step).model_validate_json(json.dumps(data))
+
+
+#
+# Reemplaza, de forma recursiva, las citas a columnas y resultados por las de sus proyecciones.
+#
+def _projected_references(value, projections):
+    if isinstance(value, list):
+        return [_projected_references(item, projections) for item in value]
+    if not isinstance(value, dict):
+        return value
+
+    copy = {key: _projected_references(item, projections) for key, item in value.items()}
+    cited = {"column": "column", "result": "field"}.get(copy.get("kind"))
+    if cited is not None and copy[cited] in projections:
+        copy[cited] = projections[copy[cited]]
     return copy
 
 
@@ -364,6 +394,14 @@ class PlanQueryService:
             bool(retrieval.dimension_mentions)
             or any(item.kind == "dimension" for item in data_mentions)
         )
+        variables = {
+            item.dataset_id: {name for names in item.variable_matches.values() for name in names}
+            for item in evidence
+        }
+        named = [
+            *(item.text for item in data_mentions if item.kind in {"value", "dimension"}),
+            *self._variable_headers(catalog, variables),
+        ]
         requested = _Requested(
             thresholds=thresholds,
             periods=dates,
@@ -379,13 +417,11 @@ class PlanQueryService:
             time_grain=grain,
             grouping=grain or (None if regrouped else conserved_time_grain(previous_analysis)),
             stale=tuple(stale_values(previous_analysis, data_mentions)),
-            variables={
-                item.dataset_id: {name for names in item.variable_matches.values() for name in names}
-                for item in evidence
-            },
+            variables=variables,
             latest_allowed=temporal,
             follow_up=previous_analysis is not None,
             extreme=extreme_requested(asked),
+            extreme_orders=frozenset() if dated_only else frozenset(asked_extremes(asked, named)),
         )
         verify = partial(
             self._verify,
@@ -418,6 +454,18 @@ class PlanQueryService:
         return self._planning_result(
             proposal, retrieval.unmatched_values, context, excluded, periods, catalog
         )
+
+    #
+    # Devuelve los encabezados de las columnas que corresponden a las variables pedidas.
+    #
+    @staticmethod
+    def _variable_headers(catalog, variables):
+        return [
+            column.original_name
+            for dataset in catalog
+            for column in dataset.columns_metadata
+            if column.sql_name in variables.get(dataset.dataset_id, set())
+        ]
 
     #
     # Combina las menciones de datos con los valores confirmados, quitando las que son columnas.
@@ -643,6 +691,8 @@ class PlanQueryService:
                 return _Proposal(attempt, model, tokens, error=error, rejections=rejections)
 
             defects = self._plan_defects(verified.issues)
+            if any(issue.code in _TEXT_COMPARISONS for issue in defects):
+                context.evidence["text_comparison_rejected"] = True
             if not defects or attempt >= _MAX_ATTEMPTS:
                 return _Proposal(attempt, model, tokens, verified=verified, rejections=rejections)
 
@@ -817,9 +867,7 @@ class PlanQueryService:
             return False
 
         observed = {item["dataset_id"]: item for item in evidence.get("observed_evidence", [])}
-        numeric = any(
-            function not in _TEXT_CALCULATIONS for function in evidence.get("requested_statistics", [])
-        )
+        numeric = numeric_comparison(evidence)
         return any(
             _registers(dataset, observed.get(str(dataset.dataset_id)), mentions, numeric)
             and _dated(dataset, evidence, text_periods)
@@ -983,6 +1031,7 @@ class PlanQueryService:
                     decision.output_steps,
                     thresholds=requested.thresholds,
                     statistics=requested.statistics,
+                    extreme=bool(requested.extreme_orders),
                     dimensions=requested.dimensions,
                     categories=requested.categories,
                     chart=requested.chart_required,
@@ -991,6 +1040,7 @@ class PlanQueryService:
                     dated_columns=period_columns(selected, periods),
                 )
             )
+            issues.extend(validate_text_orderings(operations, requested.variables or {}))
             if not requested.latest_allowed:
                 issues.extend(
                     validate_unrequested_latest(
@@ -1015,6 +1065,8 @@ class PlanQueryService:
         decision = PlanQueryService._single_row_republications(decision, {"latest"})
         decision = PlanQueryService._unpublished_branches(decision)
         decision = PlanQueryService._parallel_branches(decision, requested.variables)
+        decision = PlanQueryService._unranked_extremes(decision, catalog, requested)
+        decision = PlanQueryService._projected_orderings(decision, catalog)
         decision = PlanQueryService._text_measurement_branches(decision, catalog, requested.variables)
         decision = PlanQueryService._result_references(decision)
         decision = PlanQueryService._missing_groupings(decision, catalog)
@@ -1262,6 +1314,60 @@ class PlanQueryService:
         if not forgotten or len(decision.output_steps) + len(forgotten) > _MAX_PLAN_STEPS:
             return decision
         return decision.model_copy(update={"output_steps": [*decision.output_steps, *forgotten]})
+
+    #
+    # Cambia por su proyección numérica las mediciones TEXT por las que ordena una rama, con sus referencias.
+    #
+    @staticmethod
+    def _projected_orderings(decision, catalog):
+        if decision.status != "plannable":
+            return decision
+
+        projections = {
+            (dataset.dataset_id, column.derived_from): column.sql_name
+            for dataset in catalog
+            for column in dataset.columns_metadata
+            if column.derived_from and column.numeric_eligible
+        }
+        steps = {step.id: step for step in decision.steps}
+        renamed = {}
+        for key in decision.output_steps:
+            chain = PlanQueryService._published_chain(steps.get(key), steps)
+            read = chain[-1] if chain and chain[-1].operation == "read" and chain[-1].columns else None
+            found = PlanQueryService._ordered_projections(chain, read, projections) if read else {}
+            if not found:
+                continue
+
+            for step in decision.steps:
+                if step.id == read.id or read.id in PlanQueryService._ancestors(step, steps):
+                    renamed.setdefault(step.id, {}).update(found)
+
+        if not renamed:
+            return decision
+
+        changed = decision.model_copy(deep=True)
+        changed.steps = [
+            _projected_step(step, renamed[step.id]) if step.id in renamed else step
+            for step in changed.steps
+        ]
+        return PlanQueryService._read_selections(changed, catalog)
+
+    #
+    # Devuelve las columnas del read por las que ordena una rama y que tienen proyección numérica.
+    #
+    @staticmethod
+    def _ordered_projections(chain, read, projections):
+        ordered = {
+            item.field.field if isinstance(item.field, ResultRef) else item.field.column
+            for step in chain
+            for item in step.order_by
+        }
+        dataset_id = read.columns[0].dataset_id
+        return {
+            ref.column: projections[(dataset_id, ref.column)]
+            for ref in read.columns
+            if ref.column in ordered and (dataset_id, ref.column) in projections
+        }
 
     #
     # Quita las ramas que calculan sobre mediciones TEXT no numéricas si quedan otras ramas.
@@ -1923,6 +2029,67 @@ class PlanQueryService:
         if outputs and outputs != changed.output_steps:
             changed.output_steps, modified = outputs, True
         return changed if modified else decision
+
+    #
+    # Agrega el orden por la variable a las salidas que leen registros sin elegir el extremo pedido.
+    #
+    @staticmethod
+    def _unranked_extremes(decision, catalog, requested):
+        grouped = requested.categories or requested.statistics or requested.grouping
+        unique = len(requested.extreme_orders) == 1 and len(requested.values) < 2
+        if decision.status != "plannable" or grouped or not unique:
+            return decision
+
+        types = _column_types(catalog)
+        changed, modified = decision.model_copy(deep=True), False
+        steps = {step.id: step for step in changed.steps}
+        for index, key in enumerate(changed.output_steps):
+            measured = PlanQueryService._extreme_column(steps.get(key), requested.variables, types)
+            if measured is None or len(changed.steps) >= _MAX_PLAN_STEPS:
+                continue
+
+            sort = PlanQueryService._extreme_sort(steps[key], measured, *requested.extreme_orders)
+            changed.steps.append(sort)
+            changed.output_steps[index], modified = sort.id, True
+        return changed if modified else decision
+
+    #
+    # Devuelve la columna de la variable pedida en un read sin orden ni límite, si es inequívoca.
+    #
+    @staticmethod
+    def _extreme_column(read, variables, types):
+        if read is None or read.operation != "read" or read.order_by or read.limit is not None:
+            return None
+
+        asked = variables or {}
+        measured = [ref for ref in read.columns if ref.column in asked.get(ref.dataset_id, set())]
+        numeric = [ref for ref in measured if PlanQueryService._is_measured(ref.column, read, types)]
+        found = numeric or measured
+        return found[0] if len(found) == 1 else None
+
+    #
+    # Construye el sort del extremo sobre un read, que deja de traer los registros sin la variable.
+    #
+    @staticmethod
+    def _extreme_sort(read, measured, order):
+        constrained = {item.field.column for item in read.filters if isinstance(item.field, ColumnRef)}
+        if measured.column not in constrained:
+            read.filters.append(FilterSpec(field=measured, operator="is_not_null", values=[]))
+
+        return SortPlanStep(
+            id=f"{read.id[: _MAX_STEP_ID_LENGTH - len(_EXTREME_SUFFIX)]}{_EXTREME_SUFFIX}",
+            tool="sql",
+            operation="sort",
+            depends_on=[read.id],
+            order_by=[
+                OrderingSpec(
+                    field=ResultRef(kind="result", step_id=read.id, field=measured.column),
+                    direction=order,
+                )
+            ],
+            limit=_EXTREME_ROWS,
+            purpose="Ordenar por la variable para mostrar el extremo pedido y sus empates.",
+        )
 
     #
     # Devuelve el id del sort sin límite que ordena registros por una variable medida y se publica.

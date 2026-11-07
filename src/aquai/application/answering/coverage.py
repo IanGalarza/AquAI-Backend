@@ -5,10 +5,12 @@ from aquai.application.answering.wording import dataset_label, file_stem, join_w
 from aquai.application.contracts.planning import MAX_FILTER_VALUES
 from aquai.application.conversations.context import cited_analysis
 from aquai.application.matching import variable_name
-from aquai.application.planning.context import period_phrase
+from aquai.application.planning.context import numeric_comparison, period_phrase
 from aquai.application.planning.temporalText import within_period
 from aquai.application.planning.validation import period_columns
 from aquai.application.units import comparable_unit
+
+_UNPLANNED_STATUSES = {"insufficient_coverage", "failed"}
 
 
 #
@@ -145,17 +147,8 @@ def coverage_notes(state, language) -> list[str]:
     if retrieval.retrieval_method != "semantic":
         return []
 
-    mentions = [item for item in routing.data_mentions if not isinstance(item, str)]
-    variables = list(dict.fromkeys(item.text for item in mentions if item.kind == "variable"))
+    variables, values = _asked(routing, retrieval)
     names = list(dict.fromkeys(variable_name(item) for item in variables))
-    values = [
-        *dict.fromkeys(
-            item.text
-            for item in mentions
-            if item.kind == "value" and item.text not in retrieval.dimension_mentions
-        ),
-        *retrieval.confirmed_values,
-    ]
     if not variables and not values:
         return []
 
@@ -215,6 +208,56 @@ def coverage_notes(state, language) -> list[str]:
 
 
 #
+# Devuelve los avisos de mediciones pedidas que sólo están como texto y por eso no se calcularon.
+#
+def text_measurement_notes(state, language) -> list[str]:
+    retrieval, plan, routing = state.retrieval, state.planning, state.routing
+    if retrieval is None or plan is None or routing is None:
+        return []
+    if plan.status not in _UNPLANNED_STATUSES:
+        return []
+    if not numeric_comparison(plan.context.evidence):
+        return []
+
+    variables, values = _asked(routing, retrieval)
+    evidence = {item.dataset_id: item for item in retrieval.evidence}
+    covering = [
+        item
+        for item in retrieval.candidates
+        if _covers(evidence.get(item.dataset_id), variables, values)
+    ]
+    textual = [
+        (item, columns)
+        for item in covering
+        if (columns := _text_measurements(item, evidence.get(item.dataset_id), variables))
+    ]
+    if len(textual) < len(covering):
+        return []
+
+    return [
+        _not_calculated(_files([(item.name, item.provenance.source_name)], language), columns, language)
+        for item, columns in textual
+    ]
+
+
+#
+# Devuelve las variables y los valores que pide la consulta.
+#
+def _asked(routing, retrieval) -> tuple[list[str], list[str]]:
+    mentions = [item for item in routing.data_mentions if not isinstance(item, str)]
+    variables = list(dict.fromkeys(item.text for item in mentions if item.kind == "variable"))
+    values = [
+        *dict.fromkeys(
+            item.text
+            for item in mentions
+            if item.kind == "value" and item.text not in retrieval.dimension_mentions
+        ),
+        *retrieval.confirmed_values,
+    ]
+    return variables, values
+
+
+#
 # Devuelve para qué hacía falta una fecha: acotar un período o agrupar por tiempo.
 #
 def _dated_purpose(evidence, language) -> str | None:
@@ -269,21 +312,37 @@ def _text_measurements(dataset, evidence, variables) -> list[str]:
 # Redacta el aviso de datos guardados como texto sin versión numérica.
 #
 def _stored_as_text(what, files, columns, language) -> str:
+    storage = _text_storage(columns, language)
+    if language == "es":
+        return f"También hay datos de {what} en {files}, pero no los incluí porque {storage}."
+
+    return f"There is also {what} data in {files}, but I did not include it because {storage}."
+
+
+#
+# Redacta el aviso de mediciones guardadas como texto con las que no se pudo calcular lo pedido.
+#
+def _not_calculated(files, columns, language) -> str:
+    storage = _text_storage(columns, language)
+    if language == "es":
+        return f"En {files}, {storage}, así que no pude calcular lo pedido."
+
+    return f"In {files}, {storage}, so I could not calculate what you asked for."
+
+
+#
+# Redacta que las columnas están guardadas como texto, sin versión numérica.
+#
+def _text_storage(columns, language) -> str:
     names = list(dict.fromkeys(columns))
     listed, single = join_words(names, language), len(names) == 1
     if language == "es":
         stored = "está guardada" if single else "están guardadas"
         version = "no tiene una versión numérica" if single else "no tienen una versión numérica"
-        return (
-            f"También hay datos de {what} en {files}, pero no los incluí porque {listed} {stored} como texto "
-            f"y {version}."
-        )
+        return f"{listed} {stored} como texto y {version}"
 
     stored = "is stored" if single else "are stored"
-    return (
-        f"There is also {what} data in {files}, but I did not include it because {listed} {stored} as text "
-        "without a numeric version."
-    )
+    return f"{listed} {stored} as text without a numeric version"
 
 
 #

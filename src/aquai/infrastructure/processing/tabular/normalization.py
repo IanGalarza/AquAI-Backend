@@ -270,10 +270,7 @@ def _mixed_text_warning(name: str, present: list[object]) -> str | None:
 # Deriva una proyección numérica de una columna de texto de mediciones sin alterar el texto original.
 #
 def numeric_projection(name: str, values: list[object]) -> tuple[list[Decimal | None], int] | None:
-    if NON_MEASUREMENT_COLUMN.search(name):
-        return None
-
-    if not header_unit(name) and not MEASUREMENT_COLUMN.search(name):
+    if not measurement_column(name):
         return None
 
     present = [value for value in values if not is_empty(value)]
@@ -291,6 +288,16 @@ def numeric_projection(name: str, values: list[object]) -> tuple[list[Decimal | 
         return None
 
     return _converted(values, convert), len(present) - convertible
+
+
+#
+# Indica si el encabezado nombra una medición, por su unidad o por su vocabulario.
+#
+def measurement_column(name: str) -> bool:
+    if NON_MEASUREMENT_COLUMN.search(name):
+        return False
+
+    return bool(header_unit(name) or MEASUREMENT_COLUMN.search(name))
 
 
 #

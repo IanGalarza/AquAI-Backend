@@ -2,6 +2,11 @@ from typing import Any, Protocol
 from uuid import UUID
 
 from aquai.application.contracts.documents import PreparedDocument
+from aquai.application.contracts.retrieval import (
+    EvidenceUsage,
+    ReferenceExtraction,
+    SearchTermsDraft,
+)
 
 
 class DocumentProcessor(Protocol):
@@ -56,6 +61,16 @@ class DocumentQueries(Protocol):
     #
     def verified_chunks(self, chunk_ids: list[UUID]) -> dict[UUID, dict[str, Any]]: ...
 
+    #
+    # Devuelve una huella del contenido consultable, que cambia al cargar o desactivar fuentes.
+    #
+    def searchable_version(self) -> tuple: ...
+
+    #
+    # Devuelve el texto buscable de los fragmentos vigentes, con su sección y leyenda.
+    #
+    def searchable_chunks(self) -> list[dict[str, Any]]: ...
+
 
 class DocumentIndex(Protocol):
     #
@@ -72,5 +87,40 @@ class DocumentIndex(Protocol):
     # Busca los fragmentos más cercanos a una consulta y los verifica en PostgreSQL.
     #
     async def search(
-        self, query: str, limit: int = 5, *, kinds: tuple[str, ...] | None = None
+        self,
+        query: str,
+        limit: int = 5,
+        *,
+        kinds: tuple[str, ...] | None = None,
+        document_ids: list[UUID] | None = None,
     ) -> list[dict[str, Any]]: ...
+
+
+class DocumentLexicalIndex(Protocol):
+    #
+    # Devuelve los identificadores de los fragmentos que mejor coinciden con los términos.
+    #
+    async def search(
+        self, query: str, limit: int, *, document_ids: list[UUID] | None = None
+    ) -> list[UUID]: ...
+
+
+class DocumentEvidenceProvider(Protocol):
+    model: str
+
+    #
+    # Convierte pedidos en búsquedas autónomas en español y en inglés.
+    #
+    async def search_terms(self, context: dict) -> tuple[SearchTermsDraft, EvidenceUsage]: ...
+
+    #
+    # Ordena los fragmentos por utilidad y descarta los que no sirven para la consulta.
+    #
+    async def select(self, context: dict) -> tuple[list[int], EvidenceUsage]: ...
+
+    #
+    # Propone valores de referencia de los fragmentos para las variables indicadas.
+    #
+    async def references(
+        self, context: dict, documents: list[str]
+    ) -> tuple[ReferenceExtraction, EvidenceUsage]: ...

@@ -86,7 +86,12 @@ class QdrantDocumentIndex(QdrantSemanticIndex):
     # Busca los fragmentos más cercanos a una consulta y los verifica en PostgreSQL.
     #
     async def search(
-        self, query: str, limit: int = 5, *, kinds: tuple[str, ...] | None = None
+        self,
+        query: str,
+        limit: int = 5,
+        *,
+        kinds: tuple[str, ...] | None = None,
+        document_ids: list[UUID] | None = None,
     ) -> list[dict[str, Any]]:
         if not isinstance(query, str) or not query.strip() or len(query) > 6000:
             raise ValueError("La consulta semántica debe tener entre 1 y 6000 caracteres.")
@@ -98,7 +103,9 @@ class QdrantDocumentIndex(QdrantSemanticIndex):
         vectors = await self._embed([self._embedding_text(query.strip(), query=True)])
         await self._ensure_collection(self._validate_vectors(vectors, expected=1))
 
-        return await self._verified_matches(vectors[0], limit, kinds or _SEARCHABLE_KINDS)
+        return await self._verified_matches(
+            vectors[0], limit, kinds or _SEARCHABLE_KINDS, document_ids
+        )
 
     #
     # Calcula los embeddings e informa los fallos del proveedor como fallos del índice.
@@ -201,14 +208,18 @@ class QdrantDocumentIndex(QdrantSemanticIndex):
     # Pagina los resultados del índice hasta reunir los fragmentos vigentes.
     #
     async def _verified_matches(
-        self, vector: list[float], limit: int, kinds: tuple[str, ...]
+        self,
+        vector: list[float],
+        limit: int,
+        kinds: tuple[str, ...],
+        document_ids: list[UUID] | None,
     ) -> list[dict[str, Any]]:
         matches: list[dict[str, Any]] = []
         page_size = limit * 4
         offset = 0
 
         while len(matches) < limit:
-            response = await self._chunk_page(vector, page_size, offset, kinds)
+            response = await self._chunk_page(vector, page_size, offset, kinds, document_ids)
             points = [point for point in response.points if math.isfinite(point.score)]
             verified = await asyncio.to_thread(
                 self._documents.verified_chunks, [UUID(str(point.id)) for point in points]
@@ -229,21 +240,33 @@ class QdrantDocumentIndex(QdrantSemanticIndex):
     # Consulta una página de fragmentos activos del modelo de embeddings vigente.
     #
     async def _chunk_page(
-        self, vector: list[float], page_size: int, offset: int, kinds: tuple[str, ...]
+        self,
+        vector: list[float],
+        page_size: int,
+        offset: int,
+        kinds: tuple[str, ...],
+        document_ids: list[UUID] | None,
     ) -> Any:
+        conditions = [
+            _field_equals("content_type", _CONTENT_TYPE),
+            _field_equals("embedding_model", self._embedding_model),
+            _field_equals("is_active", True),
+            models.FieldCondition(key="kind", match=models.MatchAny(any=list(kinds))),
+        ]
+        if document_ids:
+            conditions.append(
+                models.FieldCondition(
+                    key="document_id",
+                    match=models.MatchAny(any=[str(item) for item in document_ids]),
+                )
+            )
+
         return await self._call(
             self._client.query_points,
             collection_name=self._settings.qdrant_collection,
             query=vector,
             using=self._vector_name,
-            query_filter=models.Filter(
-                must=[
-                    _field_equals("content_type", _CONTENT_TYPE),
-                    _field_equals("embedding_model", self._embedding_model),
-                    _field_equals("is_active", True),
-                    models.FieldCondition(key="kind", match=models.MatchAny(any=list(kinds))),
-                ]
-            ),
+            query_filter=models.Filter(must=conditions),
             limit=page_size,
             offset=offset,
             with_payload=False,
