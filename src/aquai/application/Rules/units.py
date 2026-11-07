@@ -54,6 +54,24 @@ UNIT_WORD_STARTS = (
     "liter",
     "litre",
 )
+SPELLED_UNITS = (
+    ("microgram", "μg"),
+    ("miligram", "mg"),
+    ("milligram", "mg"),
+    ("nanogram", "ng"),
+    ("picogram", "pg"),
+    ("gram", "g"),
+    ("mililit", "mL"),
+    ("millilit", "mL"),
+    ("microlit", "μL"),
+    ("lit", "L"),
+    ("microsiemens", "μS"),
+    ("milisiemens", "mS"),
+    ("millisiemens", "mS"),
+    ("siemens", "S"),
+    ("celula", "cel"),
+    ("cell", "cel"),
+)
 UNIT_PREFIXES = {
     "k": "1000",
     "c": "0.01",

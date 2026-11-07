@@ -8,7 +8,7 @@ from uuid import UUID
 
 from aquai.application.answering.context import response_language
 from aquai.application.answering.measures import measured_results
-from aquai.application.contracts.retrieval import DocumentFragment, DocumentRetrievalResult
+from aquai.application.contracts.retrieval import DocumentFragment, DocumentRetrievalResult, SearchTerms
 from aquai.application.errors import LLMProviderError, SemanticIndexError
 from aquai.application.interfaces.documents import (
     DocumentEvidenceProvider,
@@ -16,12 +16,11 @@ from aquai.application.interfaces.documents import (
     DocumentLexicalIndex,
     DocumentQueries,
 )
-from aquai.application.matching import normalize_text, variable_name, variable_variants
+from aquai.application.matching import names_subject, variable_name, variable_variants
 from aquai.application.Rules.documents import normalized_text
 from aquai.application.Rules.evidence import (
     PRINTED_FIGURE_TEXT,
     REFERENCE_REQUEST_CLAUSE,
-    SEARCH_STOPWORDS,
 )
 from aquai.application.units import counts_organisms
 
@@ -32,9 +31,6 @@ _MAX_VARIABLES = 2
 _MAX_CONTEXT_CHARS = 500
 _MAX_FOCUS_CHARS = 700
 _SHINGLE_WORDS = 5
-_SHORT_WORD = 4
-_MIN_ROOT = 4
-_FLEXION_CHARS = 2
 _DUPLICATE_OVERLAP = 0.8
 _CANDIDATE_SPREAD = 2
 _ASK_EDGES = re.compile(r"^[\s,;]*(?:y|e|con|and|with)?\s*")
@@ -92,6 +88,18 @@ class RetrieveDocumentsService:
         if request is None:
             return DocumentRetrievalResult(purpose="enrichment", status="skipped")
 
+        return await self._searched(request, started)
+
+    #
+    # Busca el valor de referencia documentado con que la pregunta pide comparar los datos, antes de planificar.
+    #
+    async def retrieve_reference(self, state) -> DocumentRetrievalResult:
+        return await self._searched(_reference_request(state), perf_counter())
+
+    #
+    # Ejecuta una búsqueda y registra su resultado; un fallo deja la evidencia como no disponible.
+    #
+    async def _searched(self, request, started) -> DocumentRetrievalResult:
         result = DocumentRetrievalResult(purpose=request.purpose, status="no_relevant_evidence")
         result.document_ids = request.document_ids
         try:
@@ -119,8 +127,9 @@ class RetrieveDocumentsService:
     async def _search(self, request, result):
         searches, subject = await self._terms(request, result)
         result.queries = [text for item in searches for text in (item.spanish, item.english)]
+        result.subject = list(dict.fromkeys(subject))
         ranked = await self._ranked(request, searches)
-        usable = [item for item in ranked if _usable(item) and _mentions(item, subject)]
+        usable = [item for item in ranked if _usable(item) and (not subject or _mentions(item, subject))]
         if request.purpose == "enrichment":
             usable = _distinct(usable, _CANDIDATE_SPREAD * self._per_document)
         candidates = usable[: self._candidates]
@@ -129,7 +138,8 @@ class RetrieveDocumentsService:
             return
 
         selected = await self._selected(request, candidates, result)
-        chosen = _distinct(selected, self._per_document)[: self._fragments]
+        per_document = self._fragments if request.document_ids else self._per_document
+        chosen = _distinct(selected, per_document)[: self._fragments]
         result.discarded = len(candidates) - len(chosen)
         result.fragments = [_fragment(item, index) for index, item in enumerate(chosen, 1)]
         result.status = "found" if chosen else "no_relevant_evidence"
@@ -139,9 +149,16 @@ class RetrieveDocumentsService:
     #
     async def _terms(self, request, result):
         context = {"requests": request.requests, "context": request.context}
-        draft, usage = await self._evidence.search_terms(context)
-        _add_usage(result, usage)
+        try:
+            draft, usage = await self._evidence.search_terms(context)
+        except LLMProviderError as error:
+            _logger.warning("No se pudieron reformular las búsquedas: %s: %s", type(error).__name__, error)
+            result.warnings.append("No se pudieron reformular las búsquedas; se usaron los pedidos tal cual.")
+            return [SearchTerms(spanish=text[:300], english=text[:300]) for text in request.requests], list(
+                request.subject
+            )
 
+        _add_usage(result, usage)
         subject = request.subject if request.strict_subject else [*request.subject, *draft.subject]
 
         return draft.searches, subject
@@ -224,37 +241,8 @@ def _mentions(chunk, subject) -> bool:
         )
         if part
     )
-    words = set(normalize_text(place).split())
 
-    return any(_covers(term, words) for term in subject)
-
-
-#
-# Indica si todas las palabras de un término aparecen en un texto, sin importar su flexión.
-#
-def _covers(term, words) -> bool:
-    terms = [word for word in normalize_text(term).split() if word not in SEARCH_STOPWORDS]
-
-    return bool(terms) and all(_present(term, words) for term in terms)
-
-
-#
-# Indica si una palabra figura en un texto: las siglas enteras, el resto por su raíz.
-#
-def _present(term, words) -> bool:
-    if len(term) <= _SHORT_WORD:
-        return term in words
-
-    root = _root(term)
-
-    return any(word.startswith(root) for word in words)
-
-
-#
-# Devuelve la parte estable de una palabra: «cyanobacterial» y «cyanobacteria» comparten raíz.
-#
-def _root(word) -> str:
-    return word[: max(_MIN_ROOT, len(word) - _FLEXION_CHARS)]
+    return names_subject(place, subject)
 
 
 #
@@ -274,6 +262,27 @@ def _question_request(state) -> _Request:
         context=context,
         document_ids=routing.document_ids,
         subject=_cited_variables(state),
+    )
+
+
+#
+# Devuelve la búsqueda del valor de referencia con que se pide comparar la variable, en los documentos
+# que la pregunta nombra si los hay.
+#
+def _reference_request(state) -> _Request:
+    routing = state.routing
+    variables = [
+        item.text for item in routing.data_mentions if not isinstance(item, str) and item.kind == "variable"
+    ]
+    request = f"{' y '.join(variables)}: {routing.reference_comparison}" if variables else routing.reference_comparison
+
+    return _Request(
+        purpose="question",
+        requests=[request],
+        focus=request[:_MAX_FOCUS_CHARS],
+        lexical=[0],
+        document_ids=routing.document_ids,
+        subject=[name for mention in variables for name in variable_variants(variable_name(mention))],
     )
 
 

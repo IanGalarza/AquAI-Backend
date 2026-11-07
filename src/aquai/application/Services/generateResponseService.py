@@ -15,8 +15,11 @@ from aquai.application.answering.coverage import (
 from aquai.application.answering.drafting import (
     analytical_request,
     apply_support,
+    asks_interpretation,
     backed_citations,
+    cited_lines,
     cited_references,
+    claim_variants,
     documental_request,
     documented_claims,
     listed_values,
@@ -26,8 +29,10 @@ from aquai.application.answering.drafting import (
     review_draft,
     support_passages,
 )
+from aquai.application.answering.readings import number_readings
 from aquai.application.answering.segments import answer_text
-from aquai.application.answering.wording import file_stem
+from aquai.application.answering.verification import Rejection, paraphrase_drift
+from aquai.application.answering.wording import file_stem, join_words
 from aquai.application.contracts.answering import (
     AnswerSegment,
     DocumentContrast,
@@ -43,9 +48,13 @@ from aquai.application.contracts.execution import ExecutionError
 from aquai.application.errors import LLMProviderError
 from aquai.application.execution import evidence_fingerprint
 from aquai.application.interfaces.answering import ResponseProvider, TextEmbeddings
+from aquai.application.matching import reference_operator
 
 _MIN_SUPPORT = 0.7
 _MIN_LISTED_SUPPORT = 0.45
+_ALIGNMENT_MARGIN = 0.03
+_PAIR_MARGIN = 0.03
+_ALIGNED_ROLES = {"documented", "relation"}
 _RANK = {"result": 0, "meaning": 1, "summary": 2, "chart": 3, "scope": 4, "detail": 5}
 
 _MESSAGES = {
@@ -147,14 +156,17 @@ class GenerateResponseService:
             *period_notes(state, language),
             *contrast.notes,
         ]
-        written = await self._written(response, state, context, notes, contrast, language)
+        thresholds = _threshold_notes(state.routing, language)
+        told = [*notes, *(item.text for item in thresholds)]
+        written = await self._written(response, state, context, told, contrast, language)
         body = written if written is not None else self._verified_text(context, refs)
         if validation.status == "partial":
             missing = blocked_explanations(state, language) or [self._message("partial", language)]
             body = [*(AnswerSegment(kind="note", text=text) for text in missing), *body]
 
         closing = [*notes, *_interpretation_notes(state, response, written, language, self._message)]
-        self._publish(response, [*body, *(AnswerSegment(kind="note", text=item) for item in closing)])
+        self._publish(response, [*body, *thresholds, *(AnswerSegment(kind="note", text=item) for item in closing)])
+        _cite_thresholds(response, state, thresholds)
         _record_trace(response, state)
 
         return self._finish(response, started)
@@ -178,19 +190,21 @@ class GenerateResponseService:
             _record_trace(response, state)
             return self._finish(response, started)
 
+        closing = _reference_notes(routing, language)
         request = documental_request(
             state,
             language,
             self._provider.context_budget_bytes,
             _previous_answers(state),
             _retaken_analyses(state),
+            notes=[item.text for item in closing],
         )
         segments = await self._reviewed_segments(response, request, language)
         if segments is None:
-            self._publish_unwritten(response, language)
+            self._publish_unwritten(response, language, closing)
         else:
             response.document_references = cited_references(segments, retrieval.fragments)
-            self._publish(response, segments)
+            self._publish(response, [*segments, *closing])
 
         _record_trace(response, state)
 
@@ -237,7 +251,6 @@ class GenerateResponseService:
         started = perf_counter()
         try:
             reviewed = await self._best_draft(response, request)
-            reviewed = await self._audited(response, reviewed, request)
         except LLMProviderError as error:
             _record_generation_error(generation, error, request)
             return None
@@ -252,7 +265,8 @@ class GenerateResponseService:
         return published_segments(reviewed, request, language)
 
     #
-    # Quita las oraciones que no se parecen a lo que dicen los fragmentos que citan.
+    # Quita las oraciones que no se parecen a lo que dicen los fragmentos que citan o que pierden o agregan
+    # algo respecto de la oración del fragmento que parafrasean; sin embeddings, no publica lo que no auditó.
     #
     async def _audited(self, response, reviewed, request):
         claims = documented_claims(reviewed.accepted)
@@ -262,27 +276,84 @@ class GenerateResponseService:
         passages = {id(item[0]): support_passages(item[0], request) for item in claims}
         texts = list(
             dict.fromkeys(
-                [*(text for _, text in claims), *(line for lines in passages.values() for line in lines)]
+                [
+                    *(variant for _, text in claims for variant in claim_variants(text)),
+                    *(line for lines in passages.values() for line in lines),
+                ]
             )
         )
-        vectors = dict(zip(texts, await self._embeddings.embed(texts), strict=True))
-        unsupported = [
-            (segment, text)
-            for segment, text in claims
-            if not _supported(vectors, text, passages[id(segment)], _MIN_SUPPORT)
-            and not (
-                listed_values(text, segment, request)
-                and _supported(vectors, text, passages[id(segment)], _MIN_LISTED_SUPPORT)
-            )
-        ]
-        audited = apply_support(reviewed, unsupported)
-        vectors |= await self._rewritten_vectors(audited, vectors)
+        try:
+            vectors = dict(zip(texts, await self._embeddings.embed(texts), strict=True))
+            unsupported = self._unsupported(vectors, claims, passages, request)
+            drifted = self._drifted(vectors, claims, request, unsupported)
+            audited = apply_support(reviewed, [*unsupported, *drifted], request.evidence.required_values)
+            vectors |= await self._rewritten_vectors(audited, vectors)
+        except LLMProviderError:
+            return self._unaudited(response, reviewed, claims)
+
         cited = backed_citations(
-            audited, request, lambda text, lines: _supported(vectors, text, lines, _MIN_SUPPORT)
+            audited, request, lambda text, lines: _best_support(vectors, text, lines), _MIN_SUPPORT
         )
         _record_rejections(response, _new_rejections(reviewed, cited))
 
         return cited
+
+    #
+    # Devuelve las oraciones que no se parecen lo suficiente a lo que citan.
+    #
+    @staticmethod
+    def _unsupported(vectors, claims, passages, request) -> list:
+        return [
+            (segment, text)
+            for segment, text in claims
+            if not _resembles(vectors, text, passages[id(segment)], _MIN_SUPPORT)
+            and not (
+                listed_values(text, segment, request)
+                and _resembles(vectors, text, passages[id(segment)], _MIN_LISTED_SUPPORT)
+            )
+        ]
+
+    #
+    # Devuelve las oraciones con respaldo que, frente a la oración del fragmento que parafrasean, pierden una
+    # acotación o agregan una causa, una generalidad o una conclusión estadística.
+    #
+    @staticmethod
+    def _drifted(vectors, claims, request, unsupported) -> list:
+        rejected = {(id(segment), text) for segment, text in unsupported}
+        question = request.evidence.question
+        drifted = []
+        for segment, text in claims:
+            if segment.role not in _ALIGNED_ROLES or (id(segment), text) in rejected:
+                continue
+
+            lines = cited_lines(segment, request)
+            numbered = _numbered_lines(text, lines, request.evidence.language)
+            aligned = _closest(vectors, text, numbered) if numbered else _aligned_lines(vectors, text, lines)
+            if not aligned:
+                continue
+
+            earlier = _earlier_text(segment, text)
+            relation = segment.role == "relation"
+            problems = [
+                paraphrase_drift(text, _paraphrased(vectors, text, line, pairs), heading, earlier, question, relation)
+                for line, heading, pairs in aligned
+            ]
+            problem = next((item for item in problems if item is not None), None)
+            if problem is not None:
+                drifted.append((segment, text, problem))
+
+        return drifted
+
+    #
+    # Quita las oraciones documentales que no se pudieron auditar, sin descartar lo ya verificado.
+    #
+    @staticmethod
+    def _unaudited(response, reviewed, claims):
+        unaudited = [(segment, text, Rejection("unaudited_claim", text[:120])) for segment, text in claims]
+        audited = apply_support(reviewed, unaudited)
+        _record_rejections(response, _new_rejections(reviewed, audited))
+
+        return audited
 
     #
     # Calcula los vectores de las oraciones que cambiaron al quitar lo que no tenía respaldo.
@@ -315,10 +386,11 @@ class GenerateResponseService:
             _add_tokens(generation, reply)
             reviewed = review_draft(reply.draft, request.evidence)
             _record_rejections(response, reviewed)
-            if best is None or reviewed.score > best.score:
+            reviewed = await self._audited(response, reviewed, request)
+            if best is None or reviewed.score(request.evidence) > best.score(request.evidence):
                 best = reviewed
             if reviewed.sufficient(request.evidence):
-                return reviewed
+                return best
 
             record = retry_record(request, reviewed)
 
@@ -379,11 +451,11 @@ class GenerateResponseService:
     #
     # Publica el aviso de que no se pudo redactar una respuesta documental verificable.
     #
-    def _publish_unwritten(self, response, language):
+    def _publish_unwritten(self, response, language, closing=()):
         technical = response.generation.error is not None
         response.status = "failed" if technical else "insufficient_coverage"
         response.generation.status = "failed" if technical else "deterministic"
-        self._publish(response, [AnswerSegment(text=self._message("unwritten", language))])
+        self._publish(response, [AnswerSegment(text=self._message("unwritten", language)), *closing])
 
     #
     # Publica el aviso de una pregunta documental sin evidencia suficiente.
@@ -642,11 +714,14 @@ def _authorized_lines(response, contrast):
 
 
 #
-# Devuelve el aviso de un resultado que no se pudo interpretar con los documentos.
+# Devuelve el aviso de un resultado que no se pudo interpretar con los documentos, sólo si se pidió.
 #
 def _interpretation_notes(state, response, written, language, message):
     retrieval = state.document_retrieval
+    question = state.routing.original_question if state.routing else state.question
     if retrieval is None or retrieval.purpose != "enrichment" or retrieval.status == "skipped":
+        return []
+    if not asks_interpretation(question):
         return []
     if retrieval.status == "unavailable":
         return [message("interpretation_unavailable", language)]
@@ -684,7 +759,8 @@ def _record_trace(response, state):
         }
         for item in retrieval.fragments
     ]
-    trace.warnings = retrieval.warnings
+    contrast = getattr(state, "document_contrast", None)
+    trace.warnings = [*retrieval.warnings, *(contrast.warnings if contrast else [])]
     response.document_trace = trace
 
 
@@ -707,9 +783,100 @@ def _record_rejections(response, reviewed):
 # Indica si una oración se parece lo suficiente a alguna oración de su evidencia.
 #
 def _supported(vectors, text, passages, threshold) -> bool:
+    return _best_support(vectors, text, passages) >= threshold
+
+
+#
+# Indica si una oración, tal cual o sin la frase que atribuye su fuente, se parece a su evidencia.
+#
+def _resembles(vectors, text, passages, threshold) -> bool:
+    return any(_supported(vectors, variant, passages, threshold) for variant in claim_variants(text))
+
+
+#
+# Devuelve el mayor parecido entre una oración y las de su evidencia.
+#
+def _best_support(vectors, text, passages) -> float:
     claim = vectors[text]
 
-    return any(_cosine(claim, vectors[line]) >= threshold for line in passages)
+    return max((_cosine(claim, vectors[line]) for line in passages if line in vectors), default=0.0)
+
+
+#
+# Devuelve la oración del fragmento que una oración parafrasea y las de ese fragmento casi igual de
+# parecidas, con su sección y los pares con sus vecinas; nada si ninguna se le parece lo suficiente.
+#
+def _aligned_lines(vectors, text, lines) -> list[tuple[str, str, tuple]]:
+    claim = vectors[text]
+    scored = [
+        (_cosine(claim, vectors[line]), key, line, heading, pairs)
+        for key, line, heading, pairs in lines
+        if line in vectors
+    ]
+    if not scored:
+        return []
+
+    best, document, *_ = max(scored, key=lambda item: item[0])
+    if best < _MIN_LISTED_SUPPORT:
+        return []
+
+    return [
+        (line, heading, pairs)
+        for score, key, line, heading, pairs in scored
+        if key == document and score >= best - _ALIGNMENT_MARGIN
+    ]
+
+
+#
+# Devuelve las oraciones de los fragmentos de donde salen las cifras de una oración: las que contienen
+# más de sus números, con su sección y los pares con sus vecinas.
+#
+def _numbered_lines(text, lines, language) -> list[tuple[str, str, tuple]]:
+    wanted = [reading.values for reading in number_readings(text, language)]
+    if not wanted:
+        return []
+
+    counted = []
+    for _, line, heading, pairs in lines:
+        found = set().union(*(reading.values for reading in number_readings(line)))
+        counted.append((sum(bool(values & found) for values in wanted), line, heading, pairs))
+    most = max((item[0] for item in counted), default=0)
+
+    return [(line, heading, pairs) for count, line, heading, pairs in counted if most and count == most]
+
+
+#
+# Devuelve, entre las oraciones que contienen las cifras, la que más se parece a la oración y las casi igual
+# de parecidas: una cifra común puede figurar en oraciones que hablan de otra cosa.
+#
+def _closest(vectors, text, lines) -> list[tuple[str, str, tuple]]:
+    claim = vectors[text]
+    scored = [(_cosine(claim, vectors[line]) if line in vectors else 0.0, item) for item in lines for line in item[:1]]
+    best = max(score for score, _ in scored)
+
+    return [item for score, item in scored if score >= best - _ALIGNMENT_MARGIN]
+
+
+#
+# Devuelve lo que una oración parafrasea: la oración del fragmento o, si se le parece claramente más, el
+# par que forma con una vecina porque la resume entera; sólo contra eso se revisa qué pierde o agrega.
+#
+def _paraphrased(vectors, text, line, pairs) -> str:
+    claim = vectors[text]
+    alone = _cosine(claim, vectors[line]) if line in vectors else 0.0
+    scored = [(_cosine(claim, vectors[item]), item) for item in pairs if item in vectors]
+    score, pair = max(scored, default=(0.0, line))
+
+    return pair if score >= alone + _PAIR_MARGIN else line
+
+
+#
+# Devuelve lo que el párrafo dice antes de una de sus oraciones.
+#
+def _earlier_text(segment, text) -> str:
+    position = segment.text.find(text)
+
+    return segment.text[:position] if position > 0 else ""
 
 
 #
@@ -772,6 +939,78 @@ def _document_response(state, language) -> QueryResponse:
         generation=GenerationRecord(status="deterministic"),
         timings_ms=dict(state.stage_durations_ms),
     )
+
+
+#
+# Devuelve el aviso de los umbrales documentados con que se calculó, con su uso, su condición y su cita.
+#
+def _threshold_notes(routing, language) -> list[AnswerSegment]:
+    options = routing.reference_options if routing is not None else []
+    if not options or routing.route != "data" or not routing.reference_comparison:
+        return []
+
+    listed = join_words(options, language)
+    if language == "en":
+        text = (
+            f"The threshold I used is the reference value the document gives: {listed}."
+            if len(options) == 1
+            else f"The thresholds I used are the reference values the documents give: {listed}."
+        )
+    else:
+        text = (
+            f"El umbral que usé es el valor de referencia que da el documento: {listed}."
+            if len(options) == 1
+            else f"Los umbrales que usé son los valores de referencia que dan los documentos: {listed}."
+        )
+
+    return [AnswerSegment(kind="note", text=text, document_ids=list(routing.reference_documents))]
+
+
+#
+# Agrega a las referencias de la respuesta los fragmentos que dan los umbrales usados.
+#
+def _cite_thresholds(response, state, thresholds):
+    retrieval = state.document_retrieval
+    if not thresholds or retrieval is None:
+        return
+
+    known = {item.evidence_id for item in response.document_references}
+    added = [item for item in cited_references(thresholds, retrieval.fragments) if item.evidence_id not in known]
+    response.document_references = [*response.document_references, *added]
+
+
+#
+# Devuelve el aviso de una comparación con una referencia documental que no se pudo calcular: qué valores dan
+# los documentos para elegir uno, o que no hay uno verificable.
+#
+def _reference_notes(routing, language) -> list[AnswerSegment]:
+    if not routing.reference_comparison:
+        return []
+
+    options = routing.reference_options
+    if not options:
+        text = (
+            "No encontré en los documentos un valor de referencia verificable, en la misma unidad que estos "
+            "datos, con el cual hacer la comparación."
+            if language == "es"
+            else "I found no verifiable reference value in the documents, in the same unit as these data, "
+            "to make the comparison."
+        )
+        return [AnswerSegment(kind="note", text=text)]
+
+    listed = join_words(options, language)
+    example = options[0].split(" (")[0]
+    below = reference_operator(routing.original_question) == "lt"
+    compared = ("están por debajo de" if below else "superan") if language == "es" else ("are below" if below else "exceed")
+    text = (
+        f"Para hacer el cálculo con los datos necesito un único valor: los documentos dan {listed}. "
+        f"Decime cuál querés usar, por ejemplo preguntando cuántas muestras {compared} {example}."
+        if language == "es"
+        else f"To run the calculation on the data I need a single value: the documents give {listed}. "
+        f"Tell me which one to use, for example by asking how many samples {compared} {example}."
+    )
+
+    return [AnswerSegment(kind="note", text=text)]
 
 
 #

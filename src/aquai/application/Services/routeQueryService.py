@@ -17,6 +17,7 @@ from aquai.application.interfaces.sources import SourceQueries
 from aquai.application.matching import (
     contains_any_phrase,
     contains_phrase,
+    documented_reference,
     mentioned_count,
     named_documents,
     normalize_name,
@@ -34,7 +35,10 @@ from aquai.application.planning.followUp import requested_period, requested_time
 from aquai.application.Rules.evidence import (
     CITATION_QUESTION,
     DOCUMENT_ANAPHORA,
+    GUIDELINE_CUES,
     LAST_RESULT,
+    OBSERVED_COMPARISON,
+    ORGANIZATION_NAMES,
     REFERENTIAL_QUESTION,
     REPEAT_REQUEST,
 )
@@ -191,7 +195,9 @@ class RouteQueryService:
         cited = [provided[key] for key in decision.history_message_ids]
         messages = self._with_context(cited, provided)
         last = self._last_assistant_message(state.conversation_history, allowed)
-        route, messages = self._clarification_route(decision, last, messages, provided, result)
+        route, messages = self._clarification_route(
+            decision, last, messages, provided, result, state.question
+        )
 
         asked = [
             item for item in decision.data_mentions if self._literal(item.text, state.question)
@@ -239,20 +245,53 @@ class RouteQueryService:
         if route == "document":
             return self._document_result(state, result, messages, documents)
 
-        return await self._resolve_route(state, catalog, result, decision, route, messages)
+        result = await self._resolve_route(state, catalog, result, decision, route, messages)
+        if result.route == "data":
+            self._record_reference_comparison(result, state.question, documents)
+
+        return result
+
+    #
+    # Registra la referencia documental con que se pide comparar los datos y los documentos que la pregunta
+    # nombra, para buscar ese valor antes de planificar.
+    #
+    @staticmethod
+    def _record_reference_comparison(result, question, documents):
+        reference = documented_reference(question)
+        if reference is None:
+            return
+
+        result.reference_comparison = reference
+        result.document_ids = [item["document_id"] for item in named_documents(question, documents)]
+        result.data_mentions = [
+            item
+            for item in result.data_mentions
+            if isinstance(item, str) or item.kind != "value" or not contains_phrase(reference, item.text)
+        ]
 
     #
     # Corrige la ruta de una pregunta científica o que nombra un documento.
     #
     @staticmethod
     def _documentary_route(route, asked, question, documents):
-        measured = contains_any_phrase(question, MEASURED_STATISTICS)
         if route == "general" and any(item.kind == "variable" for item in asked):
             return "document"
-        if route in {"general", "catalog", "data"} and not measured and not chart_requested(question):
+        if route in {"general", "catalog", "data"} and not RouteQueryService._calculates(route, asked, question):
             return "document" if named_documents(question, documents) else route
 
         return route
+
+    #
+    # Indica si la pregunta pide calcular o comparar sobre los datos, aunque nombre un documento.
+    #
+    @staticmethod
+    def _calculates(route, asked, question):
+        measured = contains_any_phrase(question, MEASURED_STATISTICS) or bool(requested_statistics(question))
+        compared = OBSERVED_COMPARISON.search(question) is not None and any(
+            item.kind == "variable" for item in asked
+        )
+
+        return measured or chart_requested(question) or (route == "data" and compared)
 
     #
     # Devuelve la respuesta documental que continúa un fragmento («¿Y la turbiedad?»), si la hay.
@@ -441,7 +480,7 @@ class RouteQueryService:
     # Decide la ruta cuando el modelo pidió aclaración, continuando una aclaración ya respondida.
     #
     @staticmethod
-    def _clarification_route(decision, last, messages, provided, result):
+    def _clarification_route(decision, last, messages, provided, result, question):
         if decision.route != "needs_clarification":
             return decision.route, messages
 
@@ -449,6 +488,10 @@ class RouteQueryService:
             messages = RouteQueryService._with_context([last, *messages], provided)
             result.warnings.append("Se continuó la solicitud pendiente con la aclaración recibida.")
             return "data", messages
+
+        if RouteQueryService._refers_to_last("document", [], question, last):
+            result.warnings.append("La pregunta breve remite a la última respuesta, que tiene evidencia citable.")
+            return "document", RouteQueryService._with_context([last], provided)
 
         mentions_variable = any(item.kind == "variable" for item in decision.data_mentions)
         if not decision.context_required and mentions_variable:
@@ -546,6 +589,7 @@ class RouteQueryService:
             mentions, [question, *RouteQueryService._pending_requests(messages)]
         )
         mentions = RouteQueryService._without_chart_phrases(mentions)
+        mentions = RouteQueryService._without_reference_values(mentions)
         mentions = RouteQueryService._qualified_variables(
             RouteQueryService._separated_variables(mentions), question
         )
@@ -553,6 +597,21 @@ class RouteQueryService:
         own, conserved = RouteQueryService._conserved_scope(mentions, question, messages)
         result.data_mentions = [*own, *conserved]
         result.conserved_mentions = conserved
+
+    #
+    # Quita los valores que nombran la referencia con que se compara («OMS para uso recreativo», «el nivel
+    # guía»): describen un documento, no registros que filtrar.
+    #
+    @staticmethod
+    def _without_reference_values(mentions):
+        return [
+            item
+            for item in mentions
+            if not (
+                item.kind == "value"
+                and (ORGANIZATION_NAMES.search(item.text) or GUIDELINE_CUES.search(item.text))
+            )
+        ]
 
     #
     # Completa las variables y fechas con los calificativos que siguen en la pregunta.

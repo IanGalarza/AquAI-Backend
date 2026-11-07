@@ -6,7 +6,12 @@ from aquai.application.answering.presentation import format_number
 from aquai.application.answering.wording import NUMERIC_TYPES, column_label
 from aquai.application.execution import decode_rows, execution_records
 from aquai.application.matching import contains_phrase, variable_name, variable_variants
-from aquai.application.units import concentration_basis, presentation_unit_status, unitless_name
+from aquai.application.units import (
+    concentration_basis,
+    is_ph_name,
+    presentation_unit_status,
+    unitless_name,
+)
 
 _COMPARABLE_FUNCTIONS = {None, "mean", "median", "min", "max", "quantile"}
 _MIN_HEAD_LENGTH = 4
@@ -65,6 +70,55 @@ def measured_results(state, language="es") -> list[MeasuredResult]:
     measured = [item for evidence in requested or tables for item in context.measures(evidence)]
 
     return measured or context.chart_measures(state, validation)
+
+
+#
+# Devuelve, antes de calcular, las columnas de los datasets recuperados que miden la variable pedida, con la
+# forma de un resultado sin valores para contrastarlas con un valor de referencia documentado.
+#
+def reference_targets(state) -> list[MeasuredResult]:
+    retrieval = state.retrieval
+    if retrieval is None:
+        return []
+
+    columns = {
+        (str(item.dataset_id), column.sql_name): column
+        for item in retrieval.candidates
+        for column in item.columns_metadata
+    }
+    targets = {}
+    for evidence in retrieval.evidence:
+        for mention, names in evidence.variable_matches.items():
+            for name in names:
+                column = columns.get((str(evidence.dataset_id), name))
+                if column is not None and column.numeric_eligible is not False:
+                    target = _target(evidence.dataset_id, mention, column)
+                    targets.setdefault((target.column, target.unit), target)
+
+    return list(targets.values())
+
+
+#
+# Construye el resultado vacío de una columna medida.
+#
+def _target(dataset_id, mention, column) -> MeasuredResult:
+    unit = column.unit
+    status = "dimensionless" if is_ph_name(column.original_name) else ("documented" if unit else "unknown")
+
+    return MeasuredResult(
+        evidence_id="",
+        operation_id="",
+        field=column.sql_name,
+        label=column_label(column.original_name, unit),
+        variable=variable_name(mention),
+        column=column.original_name,
+        unit=unit,
+        unit_status=status,
+        basis=concentration_basis(column.original_name, unit),
+        function=None,
+        values=(),
+        sources=((str(dataset_id), column.sql_name),),
+    )
 
 
 #

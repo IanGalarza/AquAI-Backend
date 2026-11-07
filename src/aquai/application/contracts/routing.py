@@ -108,6 +108,9 @@ class RoutingResult(BaseModel):
     conserved_mentions: list[DataMention] = Field(default_factory=list)
     tentative_values: list[str] = Field(default_factory=list)
     requested_period: Literal["year", "month", "day"] | None = None
+    reference_comparison: str | None = None
+    reference_options: list[str] = Field(default_factory=list)
+    reference_documents: list[str] = Field(default_factory=list)
     reselects_datasets: bool = False
     inherits_named_sources: bool = False
     context_used: bool = False

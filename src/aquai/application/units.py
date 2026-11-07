@@ -12,6 +12,7 @@ from aquai.application.Rules.units import (
     ORGANISM_COUNTS,
     RATIO_UNIT,
     SIMPLE_UNIT,
+    SPELLED_UNITS,
     STACKED_HEADER_SEPARATOR,
     SYMBOL_VARIANTS,
     UNIT_BASIS,
@@ -102,6 +103,16 @@ def unit_key(unit: str) -> str:
     text = ASCII_MICRO_PREFIX.sub("μ", text)
 
     return UNIT_EQUIVALENTS.get(text, text)
+
+
+#
+# Devuelve el símbolo de una unidad escrita en palabras («microgramos» es µg), o None si no se reconoce.
+#
+def spelled_symbol(word: str | None) -> str | None:
+    plain = unicodedata.normalize("NFKD", (word or "").casefold())
+    plain = "".join(char for char in plain if not unicodedata.combining(char)).replace("gramo", "gram")
+
+    return next((symbol for start, symbol in SPELLED_UNITS if plain.startswith(start)), None)
 
 
 #

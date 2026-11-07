@@ -18,7 +18,6 @@ from aquai.infrastructure.providers.llm.ollama import (
 
 
 _MAX_SEGMENTS = 5
-_MIN_INTERPRETED_SEGMENTS = 2
 
 
 class ResponseGenerationError(LLMProviderError):
@@ -121,8 +120,6 @@ class OllamaResponseProvider:
         schema["$defs"]["DraftSegment"]["required"] = list(segment)
         if documents and not facts:
             segment["document_ids"]["minItems"] = 1
-        if documents and facts:
-            schema["properties"]["segments"]["minItems"] = _MIN_INTERPRETED_SEGMENTS
         schema["properties"]["segments"]["maxItems"] = _MAX_SEGMENTS
         return schema
 

@@ -39,10 +39,17 @@ from aquai.application.Rules.vocabulary import (
     SURROUNDING_PUNCTUATION,
 )
 from aquai.application.Rules.evidence import (
+    COMPARISON_DIRECTIONS,
     DOCUMENT_AUTHOR_NAMES,
     DOCUMENT_YEAR,
+    REFERENCE_LINE_CUES,
     REFERENCE_REQUEST_CLAUSE,
+    SEARCH_STOPWORDS,
 )
+
+_SHORT_TERM = 4
+_MIN_TERM_ROOT = 4
+_TERM_FLEXION_CHARS = 2
 from aquai.application.units import comparable_unit, unit_key, unitless_name
 
 _LETTER_DIGIT_BOUNDARY = re.compile(r"(?<=\d)(?=[^\W\d_])|(?<=[^\W\d_])(?=\d)")
@@ -720,3 +727,59 @@ def _document_years(document) -> set[str]:
 #
 def without_reference_request(question: str) -> str:
     return REFERENCE_REQUEST_CLAUSE.sub("", question).strip() or question
+
+
+#
+# Indica si un texto nombra alguno de los términos de un tema: cada palabra del término figura en él, las
+# siglas enteras y el resto por su raíz («cyanobacterial» nombra «cyanobacteria»).
+#
+def names_subject(text: str, subject) -> bool:
+    words = set(normalize_text(text).split())
+
+    return any(_covers_term(term, words) for term in subject)
+
+
+#
+# Indica si todas las palabras de un término aparecen entre las palabras de un texto.
+#
+def _covers_term(term, words) -> bool:
+    terms = [word for word in normalize_text(term).split() if word not in SEARCH_STOPWORDS]
+
+    return bool(terms) and all(_term_present(word, words) for word in terms)
+
+
+#
+# Indica si una palabra figura en un texto: las siglas enteras, el resto por su raíz.
+#
+def _term_present(term, words) -> bool:
+    if len(term) <= _SHORT_TERM:
+        return term in words
+
+    root = term[: max(_MIN_TERM_ROOT, len(term) - _TERM_FLEXION_CHARS)]
+
+    return any(word.startswith(root) for word in words)
+
+
+#
+# Devuelve la referencia documental con que la pregunta pide comparar los datos sin dar su número
+# («superan el nivel guía de la OMS»), o None si no la hay o si la comparación ya trae un número.
+#
+def documented_reference(question: str) -> str | None:
+    cue = REFERENCE_LINE_CUES.search(question)
+    compared = reference_operator(question) is not None
+    if cue is None or not compared or numeric_comparisons(question):
+        return None
+
+    return question[cue.start() :].strip(" ¿?¡!.") or None
+
+
+#
+# Devuelve el sentido de la comparación pedida con una referencia: por encima (gt) o por debajo (lt).
+#
+def reference_operator(question: str) -> str | None:
+    above = COMPARISON_DIRECTIONS["above"].search(question) is not None
+    below = COMPARISON_DIRECTIONS["below"].search(question) is not None
+    if above == below:
+        return None
+
+    return "gt" if above else "lt"

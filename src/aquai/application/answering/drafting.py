@@ -2,9 +2,15 @@ import json
 from dataclasses import dataclass, field
 from hashlib import sha256
 
-from aquai.application.answering.measures import measured_results
+from aquai.application.answering.measures import measured_results, shown_value
 from aquai.application.answering.readings import number_readings, sentences, without_numbers
-from aquai.application.answering.verification import DraftEvidence, DraftVerifier, Rejection
+from aquai.application.answering.references import documented_guidelines
+from aquai.application.answering.verification import (
+    DraftEvidence,
+    DraftVerifier,
+    Rejection,
+    RequiredValue,
+)
 from aquai.application.answering.wording import file_stem, sentence
 from aquai.application.contracts.answering import (
     AnswerSegment,
@@ -12,16 +18,26 @@ from aquai.application.contracts.answering import (
     ResponseContextRecord,
 )
 from aquai.application.execution import decode_rows, execution_records
+from aquai.application.matching import variable_name, variable_variants
 from aquai.application.Rules.evidence import (
     ANAPHORIC_START,
+    ATTRIBUTION_LEAD,
     COMPARISON_DIRECTIONS,
     EVIDENCE_GAP,
+    EVIDENCE_NOUNS,
+    GUIDELINE_CUES,
+    INTERPRETATION_CUES,
     LEADING_CONNECTOR,
+    ORGANIZATION_NAMES,
     PENDING_CONFIRMATION,
+    REFERENCE_LINE_CUES,
 )
 
 _REQUIRED_KINDS = {"result"}
 _KEPT_KINDS = {"scope", "detail"}
+_INTERPRETING_ROLES = {"documented", "relation"}
+_UNRETRIED_CODES = {"unbacked_citation", "unaudited_claim"}
+_CITATION_MARGIN = 0.03
 _MAX_EXCERPT = 600
 _MISSING_INTERPRETATION = (
     "falta un párrafo documented: parafraseá de cerca lo que dicen los fragmentos sobre esta variable"
@@ -29,6 +45,15 @@ _MISSING_INTERPRETATION = (
 _MISSING_HYPOTHESIS = (
     "falta un párrafo hypothesis: con las lecturas de ambiguities, en condicional, citando sus documentos"
 )
+_MISSING_VALUES = (
+    "documented: la pregunta pide valores de referencia; presentá cada uno de estos con la condición en que "
+    "rige según su fragmento y citándolo, en un párrafo por fragmento, nombrando el valor y su condición en "
+    "la misma oración, sin remitir a otra (nada de el primero o este nivel)"
+)
+_VALUE_NOTES = {
+    "es": "Los documentos dan además el valor de referencia {value} ({source}), que no pude redactar de forma verificable.",
+    "en": "The documents also give the reference value {value} ({source}), which I could not write in a verifiable way.",
+}
 _MIN_SENTENCE_WORDS = 6
 _MIN_PASSAGE_CHARS = 10
 _LISTING_MARKS = 3
@@ -38,12 +63,27 @@ _MAX_PREVIOUS_ANSWER = 1500
 _CORRECTIONS = {
     "unsupported_place": "el fragmento no nombra ese lugar: atribuí el dato al estudio o sistema que sí nombra",
     "unsupported_unit": "copiá la unidad tal como figura junto a ese número en la evidencia",
-    "unsupported_number": "ese número no está en lo que cita el párrafo",
+    "unsupported_number": (
+        "ese número no está en lo que cita el párrafo (un párrafo relation sólo usa los de sus facts); "
+        "escribilo con los separadores del idioma de la respuesta"
+    ),
+    "mixed_sources": "no mezcles en una oración cifras de fragmentos distintos: una oración por fuente",
+    "lost_qualifier": (
+        "agregá esa acotación del fragmento con tus palabras, en esa oración o antes en el mismo párrafo "
+        "(por ejemplo: en agua dulce, en aguas marinas, en ese estudio, en laboratorio, algunas, puede)"
+    ),
+    "unsupported_link": "el fragmento no establece esa relación de causa o influencia: decí sólo lo que afirma",
+    "unsupported_statistic": "no agregues conclusiones estadísticas que el fragmento no expresa",
+    "hidden_value": "no copies [valor no confirmado]: si un valor no está confirmado, no lo menciones",
     "unsupported_result_word": "un párrafo result sólo repite su fact; lo demás va en otro párrafo",
     "observed_in_documented": "un párrafo documented habla de los documentos, no de los datos analizados",
     "unsupported_claim": "reescribí esa oración más cerca del texto del fragmento",
     "unsupported_comparison": "no compares lo observado sin un fact de kind comparison",
     "unsupported_verdict": "no emitas un juicio sobre lo observado",
+    "unsupported_recommendation": (
+        "no recomiendes acciones a partir de lo observado; si un documento propone acciones para un nivel, "
+        "decilo en un párrafo documented como lo que ese documento indica"
+    ),
     "unsupported_classification": "no clasifiques lo observado",
     "unsupported_causality": "no afirmes causas de lo observado",
     "unsupported_attribution": "atribuí cada dato sólo a la fuente del fragmento que lo contiene",
@@ -72,22 +112,39 @@ class ReviewedDraft:
     missing_facts: list[str]
 
     #
-    # Indica si conviene publicar el borrador: resultados completos y evidencia documental en uso.
+    # Indica si conviene publicar el borrador sin otro intento: resultados completos, los valores de
+    # referencia documentados presentados, nada perdido en la verificación y la interpretación o la
+    # hipótesis que hagan falta.
     #
     def sufficient(self, evidence: DraftEvidence) -> bool:
         return (
             bool(self.accepted)
             and not self.missing_facts
-            and (self.interprets or not evidence.documents)
+            and not self.missing_values(evidence)
+            and not self.lost
+            and (self.interprets or not evidence.documents_required)
             and (self.reads_ambiguity or not evidence.allows_hypotheses)
         )
 
     #
-    # Indica si el borrador explica algo con documentos, más allá de contrastar el resultado.
+    # Devuelve los valores de referencia documentados que el borrador no presentó.
+    #
+    def missing_values(self, evidence: DraftEvidence) -> list[RequiredValue]:
+        return DraftVerifier(evidence).missing_values(self.accepted)
+
+    #
+    # Indica si el borrador explica o relaciona algo con documentos.
     #
     @property
     def interprets(self) -> bool:
-        return any(item.document_ids and item.role == "documented" for item in self.accepted)
+        return any(item.document_ids and item.role in _INTERPRETING_ROLES for item in self.accepted)
+
+    #
+    # Devuelve los problemas que quitaron texto del borrador y que otro intento puede corregir.
+    #
+    @property
+    def lost(self) -> list[Rejection]:
+        return [problem for _, problem in self.rejections if problem.code not in _UNRETRIED_CODES]
 
     #
     # Indica si el borrador da una lectura condicional con sus valores, no sólo un aviso.
@@ -97,13 +154,20 @@ class ReviewedDraft:
         return any(item.role == "hypothesis" and number_readings(item.text) for item in self.accepted)
 
     #
-    # Devuelve qué tan útil es el borrador para elegir entre intentos.
+    # Devuelve qué tan útil es el borrador para elegir entre intentos: completo, con la interpretación
+    # pedida, con los valores de referencia documentados, con más oraciones documentales verificadas y,
+    # a igualdad, con menos texto perdido.
     #
-    @property
-    def score(self) -> tuple:
-        documented = sum(item.role == "documented" for item in self.accepted)
+    def score(self, evidence: DraftEvidence) -> tuple:
+        verified = sum(
+            len(sentences(item.text)) + len(item.items)
+            for item in self.accepted
+            if item.role in _INTERPRETING_ROLES
+        )
+        interpreted = self.interprets or not evidence.documents_required
+        missing = len(self.missing_values(evidence))
 
-        return not self.missing_facts, documented, -len(self.rejections)
+        return not self.missing_facts, interpreted, -missing, verified, -len(self.lost)
 
 
 #
@@ -189,21 +253,26 @@ def _record(body, budget, omitted) -> ResponseContextRecord:
 #
 def analytical_request(state, context, language, budget, *, notes=(), comparisons=(), ambiguities=()):
     catalog = {item["sentence_id"]: item for item in context.evidence["sentence_catalog"]}
+    question = state.routing.original_question if state.routing else state.question
+    requested = asks_interpretation(question)
     body = {
-        "question": state.routing.original_question if state.routing else state.question,
+        "question": question,
         "language": language,
         "status": context.evidence["status"],
+        "interpretation_requested": requested,
         "facts": _facts(catalog),
         "ambiguities": [item.model_dump(mode="json") for item in ambiguities],
         "notes": list(notes),
         "documents": [],
     }
     kept = _fitted_documents(body, _usable_fragments(state), budget)
+    compared = state.routing is not None and state.routing.reference_comparison is not None
+    required = documented_guidelines(kept, _asked_subject(state), question) if compared else []
     available = {item.evidence_id for item in kept}
     contrasted = [item for item in comparisons if item.document_id in available]
     legible = [item for item in ambiguities if set(item.evidence_ids) & available]
     catalog.update(_comparison_entries(contrasted))
-    body["facts"] = _facts(catalog, without_definitions=bool(kept))
+    body["facts"] = _facts(catalog, without_definitions=bool(kept) and requested)
     body["ambiguities"] = [item.model_dump(mode="json") for item in legible]
     evidence = DraftEvidence(
         facts={item["id"]: item["text"] for item in body["facts"]},
@@ -215,16 +284,26 @@ def analytical_request(state, context, language, budget, *, notes=(), comparison
         document_languages={item.evidence_id: item.language for item in kept},
         doubtful_documents={item.evidence_id for item in kept if item.doubts},
         document_labels={item.evidence_id: fragment_label(item) for item in kept},
+        document_sources={item.evidence_id: _fragment_source(item) for item in kept},
         hypothesis_values=_hypothesis_texts(legible),
-        question=body["question"],
+        question=question,
         result_names=[name for item in measured_results(state, language) for name in item.names],
         allows_hypotheses=bool(legible),
+        documents_required=requested and bool(kept),
+        required_values=required,
         language=language,
         places=_asked_places(state),
         document_contexts={item.evidence_id: _fragment_context(item) for item in kept},
     )
 
     return WriterRequest(_record(body, budget, context.omitted_rows), evidence, catalog, legible)
+
+
+#
+# Indica si la pregunta pide interpretar el resultado o contrastarlo con valores de referencia.
+#
+def asks_interpretation(question: str) -> bool:
+    return bool(INTERPRETATION_CUES.search(question) or REFERENCE_LINE_CUES.search(question))
 
 
 #
@@ -274,7 +353,7 @@ def _comparison_entries(comparisons) -> dict:
 #
 # Arma la redacción de una respuesta documental.
 #
-def documental_request(state, language, budget, previous, analyses=()):
+def documental_request(state, language, budget, previous, analyses=(), notes=()):
     body = {
         "question": state.question,
         "language": language,
@@ -282,12 +361,16 @@ def documental_request(state, language, budget, previous, analyses=()):
         "comparisons": [],
         "ambiguities": [],
         "previous_answers": [item[:_MAX_PREVIOUS_ANSWER] for item in previous],
-        "notes": [],
+        "notes": list(notes),
         "documents": [],
     }
     kept = _fitted_documents(body, _usable_fragments(state), budget)
     catalog = _retaken_facts(analyses, kept)
     body["facts"] = _facts(catalog)
+    retaken = [item.text for message in analyses for item in message.scope if item.kind == "value"]
+    named = [item for item in _asked_places(state) if item[:1].isupper()]
+    asked = REFERENCE_LINE_CUES.search(state.question) is not None
+    required = documented_guidelines(kept, _asked_subject(state), state.question) if asked else []
     evidence = DraftEvidence(
         facts={item["id"]: item["text"] for item in body["facts"]},
         fact_documents=_fact_documents(catalog),
@@ -296,10 +379,13 @@ def documental_request(state, language, budget, previous, analyses=()):
         document_languages={item.evidence_id: item.language for item in kept},
         doubtful_documents={item.evidence_id for item in kept if item.doubts},
         document_labels={item.evidence_id: fragment_label(item) for item in kept},
+        document_sources={item.evidence_id: _fragment_source(item) for item in kept},
         question=state.question,
         previous_answers=body["previous_answers"],
+        documents_required=bool(kept),
+        required_values=required,
         language=language,
-        places=[item.text for message in analyses for item in message.scope if item.kind == "value"],
+        places=list(dict.fromkeys([*named, *retaken])),
         document_contexts={item.evidence_id: _fragment_context(item) for item in kept},
     )
 
@@ -347,12 +433,37 @@ def _retaken_entry(segment, documents):
 
 
 #
+# Devuelve los nombres del tema preguntado: los de su variable o, si no se nombró una, los términos con que
+# se buscó, sin organismos ni palabras de guía.
+#
+def _asked_subject(state) -> list[str]:
+    mentions = state.routing.data_mentions if state.routing else []
+    variables = [item.text for item in mentions if not isinstance(item, str) and item.kind == "variable"]
+    named = [name for mention in variables for name in variable_variants(variable_name(mention))]
+    retrieval = state.document_retrieval
+    searched = [
+        term
+        for term in (retrieval.subject if retrieval is not None else [])
+        if not ORGANIZATION_NAMES.search(term) and not GUIDELINE_CUES.search(term)
+    ]
+
+    return named or searched
+
+
+#
 # Devuelve los lugares y valores por los que se acotó la consulta.
 #
 def _asked_places(state) -> list[str]:
     mentions = state.routing.data_mentions if state.routing else []
 
     return [item.text for item in mentions if not isinstance(item, str) and item.kind == "value"]
+
+
+#
+# Devuelve cómo se identifica la fuente de un fragmento: su cita, su título y su archivo.
+#
+def _fragment_source(fragment) -> str:
+    return " ".join([fragment_label(fragment), fragment.title or "", fragment.file_name])
 
 
 #
@@ -487,7 +598,12 @@ def retry_record(request: WriterRequest, reviewed: ReviewedDraft) -> ResponseCon
         for role, problem in reviewed.rejections
     ]
     problems += [f"result: falta mencionar {key}" for key in reviewed.missing_facts]
-    if not reviewed.interprets:
+    missing = reviewed.missing_values(request.evidence)
+    if missing:
+        listed = "; ".join(f"{item.shown} ({item.evidence_id})" for item in request.evidence.required_values)
+        problems.insert(0, f"{_MISSING_VALUES}: {listed}")
+        problems += [f"documented: falta {item.shown} ({item.evidence_id}): «{item.sentence[:160]}»" for item in missing]
+    if request.evidence.documents_required and not reviewed.interprets:
         problems.append(_MISSING_INTERPRETATION)
     if request.evidence.allows_hypotheses and not reviewed.reads_ambiguity:
         problems.insert(0, _MISSING_HYPOTHESIS)
@@ -510,8 +626,26 @@ def published_segments(reviewed: ReviewedDraft, request: WriterRequest, language
     published.extend(_unused_comparisons(reviewed.accepted, catalog))
     if request.ambiguities and not reviewed.reads_ambiguity:
         published.extend(_written_hypotheses(request.ambiguities, language))
+    published.extend(_value_notes(reviewed.missing_values(request.evidence), request.evidence, language))
 
     return published
+
+
+#
+# Avisa qué valores de referencia documentados no quedaron en la redacción verificada, con su fuente.
+#
+def _value_notes(missing, evidence, language) -> list[AnswerSegment]:
+    return [
+        AnswerSegment(
+            kind="note",
+            text=_VALUE_NOTES[language].format(
+                value=shown_value(min(item.values), language),
+                source=evidence.document_labels.get(item.evidence_id, item.evidence_id),
+            ),
+            document_ids=[item.evidence_id],
+        )
+        for item in missing
+    ]
 
 
 #
@@ -736,24 +870,69 @@ def documented_claims(segments) -> list:
 
 
 #
-# Indica si una oración sólo dice qué falta confirmar o qué no figura, sin afirmar nada documental.
+# Devuelve las formas de una oración que se comparan con su evidencia: tal cual y sin la frase que atribuye
+# la fuente («Según la OMS, …»), que cambia la redacción pero no lo que se afirma.
+#
+def claim_variants(text) -> list[str]:
+    stripped = ATTRIBUTION_LEAD.sub("", text, count=1).strip()
+
+    return [text, stripped] if stripped and stripped != text and len(stripped.split()) >= _MIN_SENTENCE_WORDS else [text]
+
+
+#
+# Indica si una oración sólo dice qué falta confirmar o qué no figura en los documentos, sin afirmar nada
+# documental; un hallazgo negativo («no se encontraron diferencias») sí se audita.
 #
 def _states_a_gap(segment, text) -> bool:
     pending = segment.role == "hypothesis" and PENDING_CONFIRMATION.search(text) is not None
+    absent = EVIDENCE_GAP.search(text) is not None and EVIDENCE_NOUNS.search(text) is not None
 
-    return (pending or EVIDENCE_GAP.search(text) is not None) and not number_readings(text)
+    return (pending or absent) and not number_readings(text)
 
 
 #
-# Devuelve las oraciones de la evidencia que respaldan a un párrafo: sus fragmentos y sus hechos.
+# Devuelve las oraciones de la evidencia que respaldan a un párrafo: sus fragmentos, sus hechos y, en una
+# hipótesis, las lecturas condicionales que la autorizan.
 #
 def support_passages(segment, request: WriterRequest) -> list[str]:
     body = request.record.evidence
     fragments = [item["text"] for item in body["documents"] if item["id"] in segment.document_ids]
     facts = [item["text"] for item in body["facts"] if item["id"] in segment.fact_ids]
-    lines = [line for text in fragments for line in _lines(text)]
+    readings = request.evidence.hypothesis_values if segment.role == "hypothesis" else []
+    lines = [line for text in fragments for line in _lines_and_pairs(text)]
 
-    return [*facts, *lines]
+    return [*facts, *readings, *lines]
+
+
+#
+# Devuelve las oraciones de un fragmento y cada par de oraciones seguidas: una oración puede resumir dos
+# consecutivas del mismo fragmento, nunca de fragmentos distintos.
+#
+def _lines_and_pairs(text) -> list[str]:
+    lines = _lines(text)
+
+    return [*lines, *(f"{first} {second}" for first, second in zip(lines, lines[1:]))]
+
+
+#
+# Devuelve cada oración de los fragmentos que cita un párrafo, con el documento, la sección de donde sale
+# y los pares que forma con sus oraciones vecinas.
+#
+def cited_lines(segment, request: WriterRequest) -> list[tuple[str, str, str, tuple[str, ...]]]:
+    documents = request.record.evidence["documents"]
+    cited = []
+    for item in documents:
+        if item["id"] not in segment.document_ids:
+            continue
+
+        lines = _lines(item["text"])
+        heading = (item.get("section") or "").split(" > ")[-1]
+        for index, line in enumerate(lines):
+            before = [f"{lines[index - 1]} {line}"] if index else []
+            after = [f"{line} {lines[index + 1]}"] if index + 1 < len(lines) else []
+            cited.append((item["id"], line, heading, (*before, *after)))
+
+    return cited
 
 
 #
@@ -801,18 +980,19 @@ def _is_listing(text) -> bool:
 #
 # Quita del borrador las oraciones sin respaldo y registra cuáles fueron.
 #
-def apply_support(reviewed: ReviewedDraft, unsupported: list) -> ReviewedDraft:
+def apply_support(reviewed: ReviewedDraft, unsupported: list, required=()) -> ReviewedDraft:
     rejected = {id(segment): set() for segment in reviewed.accepted}
     rejections = list(reviewed.rejections)
-    for segment, text in unsupported:
+    for segment, text, *problem in unsupported:
         rejected[id(segment)].add(text)
-        rejections.append((segment.role, Rejection("unsupported_claim", text[:120])))
+        rejections.append((segment.role, problem[0] if problem else Rejection("unsupported_claim", text[:120])))
 
-    kept = [_without_claims(item, rejected[id(item)]) for item in reviewed.accepted]
+    values = frozenset(value for item in required for value in item.values)
+    kept = [_without_claims(item, rejected[id(item)], values) for item in reviewed.accepted]
     rejections += [
         (item.role, Rejection("lost_presentation", text[:120]))
         for item in reviewed.accepted
-        for text in _orphans(item, rejected[id(item)])
+        for text in _orphans(item, rejected[id(item)], values)
     ]
 
     return ReviewedDraft(
@@ -823,11 +1003,11 @@ def apply_support(reviewed: ReviewedDraft, unsupported: list) -> ReviewedDraft:
 #
 # Devuelve un párrafo sin las oraciones rechazadas ni las que quedan sueltas, o None si no queda nada.
 #
-def _without_claims(segment, rejected):
+def _without_claims(segment, rejected, values=frozenset()):
     if not rejected:
         return segment
 
-    dropped = {*rejected, *_orphans(segment, rejected)}
+    dropped = {*rejected, *_orphans(segment, rejected, values)}
     kept = [item for item in sentences(segment.text) if item not in dropped]
     items = [item for item in segment.items if item not in rejected]
     if not kept:
@@ -837,14 +1017,28 @@ def _without_claims(segment, rejected):
 
 
 #
-# Devuelve lo que queda sin contexto si cae la oración que presentaba la fuente: un valor medido se sostiene solo.
+# Devuelve lo que queda sin contexto si cae la oración que presentaba la fuente: un valor medido se sostiene
+# solo, salvo que remita a lo que se quitó («A este nivel…») y no presente él mismo un valor de referencia
+# pedido.
 #
-def _orphans(segment, rejected) -> list[str]:
+def _orphans(segment, rejected, values=frozenset()) -> list[str]:
     lead, *rest = sentences(segment.text) or [""]
     if segment.role != "documented" or lead not in rejected:
         return []
 
-    return [item for item in rest if item not in rejected and not _reports_a_measure(item)]
+    return [item for item in rest if item not in rejected and not _stands_alone(item, values)]
+
+
+#
+# Indica si una oración se sostiene sin la que la presentaba.
+#
+def _stands_alone(text, values) -> bool:
+    if not _reports_a_measure(text):
+        return False
+    if ANAPHORIC_START.search(text) is None:
+        return True
+
+    return any(reading.values & values for reading in number_readings(text))
 
 
 #
@@ -857,11 +1051,11 @@ def _reports_a_measure(text) -> bool:
 #
 # Quita de los párrafos documentales las citas que no sostienen ninguna de sus oraciones publicadas.
 #
-def backed_citations(reviewed: ReviewedDraft, request: WriterRequest, resembles) -> ReviewedDraft:
+def backed_citations(reviewed: ReviewedDraft, request: WriterRequest, support, threshold=0.0) -> ReviewedDraft:
     rejections = list(reviewed.rejections)
     accepted = []
     for segment in reviewed.accepted:
-        kept = _backing_documents(segment, request, resembles)
+        kept = _backing_documents(segment, request, support, threshold)
         rejections += [
             (segment.role, Rejection("unbacked_citation", key))
             for key in segment.document_ids
@@ -873,27 +1067,36 @@ def backed_citations(reviewed: ReviewedDraft, request: WriterRequest, resembles)
 
 
 #
-# Devuelve las citas de un párrafo que lo sostienen, o todas si ninguna lo hace o no es documental.
+# Devuelve las citas de un párrafo que sostienen alguna de sus oraciones, o todas si ninguna lo hace
+# o el párrafo no es documental.
 #
-def _backing_documents(segment, request: WriterRequest, resembles) -> list[str]:
+def _backing_documents(segment, request: WriterRequest, support, threshold) -> list[str]:
     if segment.role != "documented":
         return segment.document_ids
 
-    claims = [text for _, text in documented_claims([segment])]
     texts = {item["id"]: item["text"] for item in request.record.evidence["documents"]}
-    backing = [
-        key
+    backing = set()
+    for _, claim in documented_claims([segment]):
+        backing |= _claim_documents(claim, segment, request, texts, support, threshold)
+
+    return [key for key in segment.document_ids if key in backing] or segment.document_ids
+
+
+#
+# Devuelve los documentos que sostienen una oración: los que contienen todas sus cifras o, si no tiene
+# cifras, los que más se le parecen; un fragmento que sólo trata el mismo tema no queda citado.
+#
+def _claim_documents(claim, segment, request: WriterRequest, texts, support, threshold) -> set[str]:
+    holders = {key for key in segment.document_ids if _holds_values(claim, texts.get(key, ""))}
+    if holders:
+        return holders
+
+    scores = {
+        key: float(support(claim, support_passages(segment.model_copy(update={"document_ids": [key]}), request)))
         for key in segment.document_ids
-        if any(_backs(claim, key, texts.get(key, ""), segment, request, resembles) for claim in claims)
-    ]
+    }
+    best = max(scores.values(), default=0.0)
+    if best <= 0 or best < threshold:
+        return set()
 
-    return backing or segment.document_ids
-
-
-#
-# Indica si un documento sostiene una oración: contiene sus cifras o se le parece como pide la auditoría.
-#
-def _backs(claim, key, text, segment, request: WriterRequest, resembles) -> bool:
-    cited = segment.model_copy(update={"document_ids": [key]})
-
-    return _holds_values(claim, text) or resembles(claim, support_passages(cited, request))
+    return {key for key, score in scores.items() if score >= best - _CITATION_MARGIN}

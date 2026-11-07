@@ -3,6 +3,7 @@ from dataclasses import dataclass, field
 
 from aquai.application.answering.readings import (
     HIDDEN_VALUE,
+    Reading,
     folded,
     group_values,
     number_readings,
@@ -16,6 +17,7 @@ from aquai.application.Rules.evidence import (
     ATTRIBUTED_SOURCE,
     BOUND_WORDS,
     CAUSAL_CLAIMS,
+    CAUSAL_LINKS,
     CHEMICAL_NAME,
     COMPARISON_DIRECTIONS,
     CONDITIONAL_CUES,
@@ -34,14 +36,19 @@ from aquai.application.Rules.evidence import (
     OBSERVED_REFERENCE,
     OBSERVED_VERDICTS,
     ORGANIZATION_NAMES,
+    QUALIFIER_FAMILIES,
+    RECOMMENDATIONS,
+    RELATION_LANGUAGE,
     RELATIVE_QUANTITIES,
     RESULT_WORDS,
+    SITUATED_FAMILIES,
     SOURCE_ALIASES,
     UNSUPPORTED_STATISTICS,
     UNSUPPORTED_VERDICTS,
     VERDICT_LIMITS,
+    WATER_USES,
 )
-from aquai.application.units import comparable_unit
+from aquai.application.units import comparable_unit, spelled_symbol
 
 _TABLE_CELL = "|"
 _HEDGE_WINDOW = 40
@@ -50,6 +57,16 @@ _BOUNDS = {"<", ">", "≤", "≥"}
 _LABEL_WINDOW = 8
 _MIN_ROOT = 4
 _FLEXION_CHARS = 2
+
+
+@dataclass(frozen=True)
+class RequiredValue:
+    """Valor de referencia que un fragmento fija para lo preguntado y que la respuesta tiene que presentar."""
+
+    evidence_id: str
+    values: frozenset
+    shown: str
+    sentence: str
 
 
 @dataclass
@@ -65,11 +82,14 @@ class DraftEvidence:
     document_languages: dict[str, str | None] = field(default_factory=dict)
     doubtful_documents: set[str] = field(default_factory=set)
     document_labels: dict[str, str] = field(default_factory=dict)
+    document_sources: dict[str, str] = field(default_factory=dict)
     hypothesis_values: list[str] = field(default_factory=list)
     question: str = ""
     result_names: list[str] = field(default_factory=list)
     previous_answers: list[str] = field(default_factory=list)
     allows_hypotheses: bool = False
+    documents_required: bool = False
+    required_values: list[RequiredValue] = field(default_factory=list)
     language: str = "es"
     places: list[str] = field(default_factory=list)
     document_contexts: dict[str, str] = field(default_factory=dict)
@@ -88,7 +108,6 @@ class _Authorized:
     values: set = field(default_factory=set)
     pairs: set = field(default_factory=set)
     comparators: set = field(default_factory=set)
-    tokens: set = field(default_factory=set)
     unitless: set = field(default_factory=set)
     bounded: set = field(default_factory=set)
     exact: set = field(default_factory=set)
@@ -101,7 +120,6 @@ class _Authorized:
         self.text += f" {folded(text)}"
         for reading in number_readings(text, language):
             self.values |= reading.values | group_values(reading.text)
-            self.tokens.add(reading.text)
             if reading.unit:
                 unit = comparable_unit("", reading.unit)
                 self.pairs |= {(value, unit) for value in reading.values}
@@ -143,6 +161,7 @@ class DraftVerifier:
         return [
             *self._form(text),
             *self._numbers(segment, text),
+            *self._sources(segment, text),
             *self._result_wording(segment, text),
             *self._verdicts(segment, text),
             *self._comparisons(segment, text),
@@ -171,6 +190,20 @@ class DraftVerifier:
             for key in self._evidence.required_facts
             if key not in cited or not self._shows_values(key, shown)
         ]
+
+    #
+    # Devuelve los valores de referencia documentados que ningún párrafo documental llegó a presentar.
+    #
+    def missing_values(self, segments) -> list[RequiredValue]:
+        shown = {
+            value
+            for segment in segments
+            if segment.role in {"documented", "relation"}
+            for reading in number_readings(_full_text(segment), self._evidence.language)
+            for value in reading.values
+        }
+
+        return [item for item in self._evidence.required_values if not item.values & shown]
 
     #
     # Indica si los valores de una oración obligatoria figuran en el texto publicado.
@@ -268,13 +301,13 @@ class DraftVerifier:
     # Devuelve los problemas de un número leído del borrador.
     #
     def _reading_problems(self, reading, allowed, fragments, text) -> list[Rejection]:
-        if not reading.values & allowed.values and reading.text not in allowed.tokens:
+        if not reading.values & allowed.values:
             return [Rejection("unsupported_number", reading.text)]
         if reading.comparator and not self._comparator_allowed(reading, allowed):
             return [Rejection("unsupported_comparator", f"{reading.comparator}{reading.text}")]
         if _drops_bound(reading, allowed, text):
             return [Rejection("dropped_bound", reading.text)]
-        if reading.spelled_unit and folded(reading.spelled_unit) not in allowed.text:
+        if reading.spelled_unit and not self._spelled_unit_allowed(reading, allowed, fragments):
             return [Rejection("unsupported_unit", f"{reading.text} {reading.spelled_unit}")]
         unknown = reading.unit and reading.values & allowed.unitless
         if unknown or (reading.unit and not self._unit_matches(reading, allowed, fragments)):
@@ -288,6 +321,51 @@ class DraftVerifier:
     @staticmethod
     def _comparator_allowed(reading, allowed) -> bool:
         return any((value, reading.comparator) in allowed.comparators for value in reading.values)
+
+    #
+    # Indica si una unidad escrita en palabras figura así en la evidencia o es la que acompaña al número allí.
+    #
+    def _spelled_unit_allowed(self, reading, allowed, fragments) -> bool:
+        if folded(reading.spelled_unit) in allowed.text:
+            return True
+
+        symbol = spelled_symbol(reading.spelled_unit)
+        written = Reading(reading.text, reading.values, symbol, start=reading.start, end=reading.end)
+
+        return symbol is not None and self._unit_matches(written, allowed, fragments)
+
+    #
+    # Revisa que las cifras de cada oración documental salgan de un mismo fragmento, sin mezclar fuentes.
+    #
+    def _sources(self, segment, text) -> list[Rejection]:
+        evidence = self._evidence
+        cited = [key for key in segment.document_ids if key not in evidence.doubtful_documents]
+        if segment.role != "documented" or len(cited) < 2:
+            return []
+
+        shared = _Authorized()
+        for key in segment.fact_ids:
+            shared.add_fact(evidence.facts[key], evidence.language)
+        for answer in evidence.previous_answers:
+            shared.add(answer, evidence.language)
+        holders = [self._document_values(key) for key in cited]
+
+        return [
+            Rejection("mixed_sources", sentence[:80])
+            for sentence in sentences(text)
+            if not _single_source(sentence, holders, shared.values, evidence.language)
+        ]
+
+    #
+    # Devuelve los números que aporta un fragmento, con los años de su cita.
+    #
+    def _document_values(self, key) -> set:
+        evidence = self._evidence
+        allowed = _Authorized()
+        allowed.add(evidence.documents[key], evidence.document_languages.get(key))
+        allowed.add(" ".join(DOCUMENT_YEAR.findall(evidence.document_labels.get(key, ""))), None)
+
+        return allowed.values
 
     #
     # Devuelve los textos de los fragmentos confiables que aportan números al segmento.
@@ -397,7 +475,7 @@ class DraftVerifier:
         if verdict and not VERDICT_LIMITS.search(sentence[: verdict.start()]):
             rejections.append(Rejection("unsupported_verdict", verdict.group()))
 
-        if segment.role == "documented":
+        if segment.role == "documented" and self._evidence.facts:
             mention = OBSERVED_REFERENCE.search(sentence)
             if mention:
                 rejections.append(Rejection("observed_in_documented", mention.group()))
@@ -411,14 +489,28 @@ class DraftVerifier:
             ("unsupported_quantity", RELATIVE_QUANTITIES),
         ):
             found = pattern.search(sentence)
-            if found and not VERDICT_LIMITS.search(sentence[: found.start()]):
+            limited = found and VERDICT_LIMITS.search(sentence[: found.start()])
+            if found and not limited and not self._quotes_facts(segment, found.group()):
                 rejections.append(Rejection(code, found.group()))
 
         cause = CAUSAL_CLAIMS.search(sentence)
         if cause and not _hedged(sentence, cause.start()):
             rejections.append(Rejection("unsupported_causality", cause.group()))
 
+        advice = RECOMMENDATIONS.search(sentence)
+        if advice:
+            rejections.append(Rejection("unsupported_recommendation", advice.group()))
+
         return rejections
+
+    #
+    # Indica si unas palabras repiten lo que dicen los hechos citados, como la condición de un valor guía.
+    #
+    def _quotes_facts(self, segment, words) -> bool:
+        cited = normalize_text(" ".join(self._evidence.facts[key] for key in segment.fact_ids)).split()
+        roots = {_root(word) for word in cited}
+
+        return all(_root(word) in roots for word in normalize_text(words).split())
 
     #
     # Revisa que una comparación de lo observado salga de un contraste y respete su sentido.
@@ -432,6 +524,8 @@ class DraftVerifier:
             for key in segment.fact_ids
             if key in self._evidence.fact_directions
         ]
+        if segment.role == "result":
+            directions += self._filtered_directions(segment)
         rejections = []
         for sentence in sentences(text):
             compared = OBSERVED_COMPARISON.search(sentence)
@@ -441,6 +535,15 @@ class DraftVerifier:
                 rejections.append(Rejection("wrong_direction", compared.group()))
 
         return rejections
+
+    #
+    # Devuelve los sentidos de comparación que ya dicen los hechos citados como filtro («mayor que 20.000»):
+    # un resultado puede repetirlos con otras palabras sin comparar nada nuevo.
+    #
+    def _filtered_directions(self, segment) -> list[str]:
+        cited = " ".join(self._evidence.facts[key] for key in segment.fact_ids)
+
+        return [name for name, pattern in COMPARISON_DIRECTIONS.items() if pattern.search(cited)]
 
     #
     # Revisa que un párrafo documental sólo atribuya algo a un lugar si sus fragmentos lo nombran.
@@ -483,22 +586,55 @@ class DraftVerifier:
     #
     def _attributions(self, segment, text) -> list[Rejection]:
         evidence = self._evidence
-        sources = [
-            f"{evidence.document_labels.get(key, '')} {evidence.document_contexts.get(key, evidence.documents[key])}"
-            for key in segment.document_ids
-            if key not in evidence.doubtful_documents
-        ]
         facts = [evidence.facts[key] for key in segment.fact_ids]
         rejections = []
         for sentence in sentences(text):
-            for name in _named_sources(sentence):
-                naming = [item for item in sources if _names_source(name, item)]
-                if naming:
-                    rejections.extend(self._attributed_values(sentence, name, [*naming, *facts]))
-                else:
+            names = _named_sources(sentence)
+            for name in names:
+                naming = self._naming_documents(segment, name, names)
+                if not naming:
                     rejections.append(Rejection("unsupported_attribution", name))
+                    continue
+
+                texts = [self._source_text(key) for key in naming if key not in evidence.doubtful_documents]
+                rejections.extend(self._attributed_values(sentence, name, [*texts, *facts]))
 
         return rejections
+
+    #
+    # Devuelve los documentos citados que son esa fuente, o que la citan si la oración también los nombra a ellos.
+    #
+    def _naming_documents(self, segment, name, names) -> list[str]:
+        evidence = self._evidence
+        own = [key for key in segment.document_ids if _names_source(name, self._metadata(key))]
+        if own:
+            return own
+
+        others = [item for item in names if item != name]
+
+        return [
+            key
+            for key in segment.document_ids
+            if _names_source(name, self._source_text(key))
+            and any(_names_source(item, self._metadata(key)) for item in others)
+        ]
+
+    #
+    # Devuelve cómo se identifica un documento: su cita, su título y su archivo.
+    #
+    def _metadata(self, key) -> str:
+        evidence = self._evidence
+
+        return evidence.document_sources.get(key) or evidence.document_labels.get(key, "")
+
+    #
+    # Devuelve la cita de un documento junto con su texto, su sección y su leyenda.
+    #
+    def _source_text(self, key) -> str:
+        evidence = self._evidence
+        context = evidence.document_contexts.get(key, evidence.documents[key])
+
+        return f"{evidence.document_labels.get(key, '')} {context}"
 
     #
     # Revisa que los números atribuidos a una fuente salgan de fragmentos que la nombran.
@@ -545,6 +681,77 @@ class DraftVerifier:
 #
 def _full_text(segment) -> str:
     return "\n".join([segment.text, *segment.items])
+
+
+#
+# Devuelve lo que una paráfrasis pierde o agrega respecto de la oración del fragmento que más se le parece:
+# una acotación (atenuación, alcance del estudio, condición, cuantificador, ambiente o uso del agua), una
+# relación causal, una generalidad o una conclusión estadística que el fragmento no expresa. Un párrafo que
+# relaciona lo observado con un valor documentado sólo debe conservar el ambiente y el uso del agua.
+#
+def paraphrase_drift(claim, passage, heading="", earlier="", question="", relation=False) -> Rejection | None:
+    situated = f"{passage} {heading}"
+    for family, patterns in QUALIFIER_FAMILIES.items():
+        if relation and family not in SITUATED_FAMILIES:
+            continue
+
+        source = situated if family in SITUATED_FAMILIES else passage
+        kept = _kept_text(family, claim, earlier, question)
+        found = patterns[0].search(source)
+        if found and not patterns[-1].search(kept):
+            return Rejection("lost_qualifier", f"{family} «{found.group()}»: {claim[:70]}")
+
+    for use in _water_uses(situated) - _water_uses(f"{earlier} {claim} {question}"):
+        return Rejection("lost_qualifier", f"uso del agua «{use}»: {claim[:70]}")
+
+    if relation:
+        return None
+
+    for code, added, expressed in (
+        ("unsupported_link", CAUSAL_LINKS, RELATION_LANGUAGE),
+        ("unsupported_frequency", FREQUENCY_WORDS, FREQUENCY_WORDS),
+        ("unsupported_statistic", UNSUPPORTED_STATISTICS, UNSUPPORTED_STATISTICS),
+    ):
+        found = added.search(claim)
+        if found and not expressed.search(passage):
+            return Rejection(code, f"{found.group()}: {claim[:70]}")
+
+    return None
+
+
+#
+# Devuelve dónde puede figurar una acotación: la oración misma o, si sitúa el estudio o el ambiente, también
+# lo ya dicho en el párrafo y, para el ambiente, la pregunta.
+#
+def _kept_text(family, claim, earlier, question) -> str:
+    if family in SITUATED_FAMILIES:
+        return f"{earlier} {claim} {question}"
+    if family in {"alcance del estudio", "condición experimental"}:
+        return f"{earlier} {claim}"
+
+    return claim
+
+
+#
+# Devuelve los usos del agua que nombra un texto.
+#
+def _water_uses(text) -> set[str]:
+    return {
+        use
+        for use, phrases in WATER_USES.items()
+        if any(contains_phrase(text, phrase, plural_insensitive=True) for phrase in phrases)
+    }
+
+
+#
+# Indica si las cifras propias de una oración están todas en un mismo fragmento citado.
+#
+def _single_source(sentence, holders, shared, language) -> bool:
+    readings = [item for item in number_readings(sentence, language) if not item.values & shared]
+    if len(readings) < 2:
+        return True
+
+    return any(all(item.values & values for item in readings) for values in holders)
 
 
 #

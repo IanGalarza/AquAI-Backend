@@ -65,9 +65,9 @@ UNSUPPORTED_STATISTICS = re.compile(
     re.IGNORECASE,
 )
 REFERENCE_LINE_CUES = re.compile(
-    r"\b(?:valor(?:es)?\s+(?:gu[ií]a|de\s+referencia|l[ií]mite)|l[ií]nea\s+de\s+referencia|umbral(?:es)?|"
-    r"l[ií]mite(?:s)?\s+(?:normativo|permitido|recomendado|de\s+referencia)s?|norma(?:s|tiva)?|"
-    r"guideline|reference\s+(?:line|value)|threshold)\b",
+    r"\b(?:(?:valor|nivel)(?:es)?\s+(?:gu[ií]a|de\s+referencia|l[ií]mite|de\s+alerta)|l[ií]nea\s+de\s+referencia|"
+    r"umbral(?:es)?|l[ií]mite(?:s)?\s+(?:normativo|permitido|recomendado|de\s+referencia)s?|norma(?:s|tiva)?|"
+    r"guideline|guidance\s+levels?|alert\s+levels?|reference\s+(?:line|value)|threshold)\b",
     re.IGNORECASE,
 )
 WATER_USES = {
@@ -178,6 +178,13 @@ OBSERVED_VERDICTS = re.compile(
     r"(?:low|high)(?:er)?\s+(?:probability|risk)|adverse\s+effects?)\b",
     re.IGNORECASE,
 )
+RECOMMENDATIONS = re.compile(
+    r"\b(?:se\s+(?:recomiend\w*|sugier\w*|aconsej\w*|deber[ií]an?|debe|deben)|recomend(?:amos|ar[ií]a|able)|"
+    r"conviene|convendr[ií]a|hay\s+que|habr[ií]a\s+que|es\s+(?:necesario|recomendable|aconsejable|conveniente)|"
+    r"deber[ií]an?\s+(?:informar|cerrar|prohibir|evitar|restringir|tomar|realizar|monitorear|controlar)|"
+    r"should|must|ought\s+to|(?:is|are)\s+recommended|we\s+recommend|it\s+is\s+(?:necessary|advisable))\b",
+    re.IGNORECASE,
+)
 OBSERVED_REFERENCE = re.compile(
     r"\b(?:este\s+(?:resultado|valor|promedio)|estos\s+(?:resultados|valores)|esta\s+agua|estas\s+aguas|"
     r"(?:el\s+)?valor\s+observado|lo\s+observado|lo\s+(?:ya\s+)?calculado|los\s+datos\s+analizados|en\s+los\s+datos|"
@@ -208,10 +215,11 @@ RESULT_WORDS = frozenset(
     estos estas fecha fechas fue fueron grafico grafica graficaron graficos hoja la las lo los lugar lugares medido
     medida medidos medidas mes meses mostrando muestra muestran mostro numero o observado observada observados
     observadas obtenido obtenida obtenidos para por presenta presentan que registrado registrada registrados
-    registradas registro registros resultado resultados respectivamente se ser sitio sitios son su sus tabla total
+    registradas registro registros resultado resultados respectivamente se segun ser sitio sitios son su sus tabla total
     un una unos unas valor valores y ya analizado analizados analizada analizadas calcularon calculo calcular
     obteniendo obtuvo obtuvieron disponible disponibles periodo periodos cual cuales donde puede pueden consultar
-    consultarse presentando representa representan ver verse excluyendo excluidos excluidas
+    consultarse presentando representa representan ver verse excluyendo excluidos excluidas hubo hay
+    registraron identificaron encontraron superior superiores inferior inferiores otro otra lado parte mientras
     a an and are as at by chart data during file for from in is it its measured obtained observed of on or per
     place recorded records registered result results sheet site sites table that the this to value values was
     were with year years""".split()
@@ -220,7 +228,12 @@ ANAPHORIC_START = re.compile(
     r"^(?:esto|esta|este|ese|esa|eso|estos|estas|esos|esas|en\s+ese\s+caso|de\s+ser\s+as[ií]|this|these|that|those|"
     r"in\s+that\s+case|(?:los|las)\s+(?:m[aá]s|m[aá]xim|m[ií]nim|valores|concentraciones|niveles)|ambas?|dich[oa]s?|"
     r"the\s+(?:highest|lowest|values|concentrations|levels)|both|(?:en\s+)?otros?\s+(?:estudios?|trabajos?)|"
-    r"another\s+study|por\s+su\s+parte|la\s+misma\s+autora|el\s+mismo\s+autor)\b",
+    r"another\s+study|por\s+su\s+parte|la\s+misma\s+autora|el\s+mismo\s+autor|"
+    r"(?:el|la|los|las)\s+(?:primer[oa]s?|segund[oa]s?|tercer[oa]s?|[uú]ltim[oa]s?)(?=\s*[,;:]|"
+    r"\s+(?:es|son|fue|fueron|era|eran|se|corresponde\w*|equivale\w*|representa\w*)\b)|"
+    r"the\s+(?:former|latter)|the\s+(?:first|second|third|last)(?=\s*[,;:]|\s+(?:is|was|are|were)\b)|"
+    r"(?:a|en|con|para|bajo|ante|desde|hasta|at|in|on|under|with|for|from)\s+"
+    r"(?:este|esta|ese|esa|estos|estas|esos|esas|dich[oa]s?|tal(?:es)?|this|that|these|those|such)\b)\b",
     re.IGNORECASE,
 )
 GUIDELINE_CUES = re.compile(
@@ -250,6 +263,110 @@ EVIDENCE_GAP = re.compile(
     re.IGNORECASE,
 )
 NEGATION = re.compile(r"\b(?:no|ni|sin|not|neither|without)\b", re.IGNORECASE)
+EVIDENCE_NOUNS = re.compile(
+    r"\b(?:documentos?|fragmentos?|textos?|fuentes?|evidencia|bibliograf[ií]a|literatura|art[ií]culos?|"
+    r"documents?|fragments?|texts?|sources?|evidence|literature|articles?)\b",
+    re.IGNORECASE,
+)
+QUALIFIER_FAMILIES = {
+    "atenuación": (
+        re.compile(
+            r"\b(?:podr[ií]an?|posibles?|posiblemente|(?:poco\s+|im)?probables?|probablemente|potencial(?:es|mente)?|quiz[aá]s?|"
+            r"tal\s+vez|sugier\w*|suger\w*|parec\w*|se\s+asoci\w*|estar[ií]an?|ser[ií]an?|habr[ií]an?|"
+            r"may|might|could|would|possibl[ey]|probabl[ey]|(?:un)?likely|potential(?:ly)?|suggest\w*|"
+            r"appears?\s+to|seems?\s+to)\b",
+            re.IGNORECASE,
+        ),
+        re.compile(
+            r"\b(?:podr[ií]an?|puede|pueden|pod[ií]a|posibles?|posiblemente|(?:poco\s+|im)?probables?|probablemente|potencial\w*|"
+            r"quiz[aá]s?|tal\s+vez|sugier\w*|suger\w*|parec\w*|asoci\w*|relacion\w*|vincul\w*|suele|suelen|"
+            r"estar[ií]an?|ser[ií]an?|habr[ií]an?|may|might|could|would|can|possibl[ey]|probabl[ey]|"
+            r"(?:un)?likely|potential(?:ly)?|suggest\w*|appears?\s+to|seems?\s+to|associated|related)\b",
+            re.IGNORECASE,
+        ),
+    ),
+    "alcance del estudio": (
+        re.compile(
+            r"\b(?:en\s+(?:este|el\s+presente|nuestro)\s+(?:estudio|trabajo|an[aá]lisis|muestreo|relevamiento)|"
+            r"en\s+esta\s+(?:investigaci[oó]n|tesis)|nuestros\s+(?:resultados|datos)|"
+            r"in\s+(?:this|the\s+present|our)\s+(?:study|work|survey|research|analysis|investigation)|"
+            r"our\s+(?:study|results|data|findings)|(?:during|throughout)\s+(?:this|the)\s+study|"
+            r"the\s+(?:present|current)\s+study)\b",
+            re.IGNORECASE,
+        ),
+        re.compile(
+            r"\b(?:estudios?|trabajos?|investigaci[oó]n(?:es)?|tesis|autor(?:es|as?)?|an[aá]lisis|monitoreos?|"
+            r"muestreos?|campañas?|relevamientos?|seg[uú]n|de\s+acuerdo\s+con|et\s+al|reportaron|registraron|"
+            r"observaron|encontraron|hallaron|midieron|detectaron|describieron|documentaron|informaron|"
+            r"stud(?:y|ies)|work|research|authors?|survey|analysis|according\s+to|reported|found|observed|"
+            r"measured|recorded)\b",
+            re.IGNORECASE,
+        ),
+    ),
+    "condición experimental": (
+        re.compile(
+            r"\b(?:laborator\w*|in\s+vitro|in\s+vivo|experimental\w*|bioensayos?|bioassays?|cultivos?|"
+            r"cultures?|cultured|mesocosm\w*|microcosm\w*|ratones|ratas|mice|rats)\b",
+            re.IGNORECASE,
+        ),
+    ),
+    "cuantificador parcial": (
+        re.compile(
+            r"\b(?:some|certain|a\s+few|few|several|algun[oa]s|ciert[oa]s|poc[oa]s|vari[oa]s)\b",
+            re.IGNORECASE,
+        ),
+    ),
+    "ambiente marino": (
+        re.compile(r"\b(?:marin[oa]s?|oce[aá]n\w*|agua\s+de\s+mar|marine|oceans?|oceanic|sea(?:water)?)\b", re.IGNORECASE),
+    ),
+    "ambiente costero": (
+        re.compile(
+            r"\b(?:coster[oa]s?|costas?|litoral(?:es)?|playas?|coastal|coasts?|beach(?:es)?|shores?|littoral)\b",
+            re.IGNORECASE,
+        ),
+    ),
+    "ambiente estuarino": (
+        re.compile(r"\b(?:estuari[oa]s?|estuarin[oa]s?|estuar(?:y|ies|ine))\b", re.IGNORECASE),
+    ),
+    "agua dulce": (
+        re.compile(
+            r"\b(?:agua\s+dulce|aguas\s+dulces|dulceacu[ií]col\w*|freshwaters?|fresh\s+waters?)\b", re.IGNORECASE
+        ),
+    ),
+}
+SITUATED_FAMILIES = {"ambiente marino", "ambiente costero", "ambiente estuarino", "agua dulce"}
+CAUSAL_LINKS = re.compile(
+    r"\b(?:contribu(?:ye|yen|y[oó]|yeron|ir|ido|yendo)|favorec\w+|promuev\w+|promov\w+|propici(?:a|an|ó|aron|ar)|"
+    r"desencaden\w+|conduc(?:e|en|ir|ido|ía|ían)\s+a|llev(?:a|an|ó|aron|ar)\s+a(?!\s+cabo)|provoc\w+|"
+    r"caus(?:a|an|ó|aron|ado|ada|ados|adas|ar|ante|antes)|determin(?:a|an|ó|aron|ante|antes)|impuls\w+|"
+    r"se\s+deb(?:e|en|i[oó]|ieron)\s+a|debid[oa]s?\s+a|a\s+causa\s+de|"
+    r"origin(?:a|an|ó|aron|ado|ada|ados|adas|ar)|gener(?:a|an|ó|aron|ado|ada|ados|adas|ar)|"
+    r"producid[oa]s?\s+por|atribu(?:ye|yen|ido|ida|idos|idas|ible|ibles|y[oó]|yeron)|"
+    r"contribut(?:e|es|ed|ing)|favou?r(?:s|ed|ing)?|promot(?:e|es|ed|ing)|leads?\s+to|led\s+to|trigger\w*|"
+    r"drives?|driven|induc(?:e|es|ed|ing)|caus(?:e|es|ed|ing)|due\s+to|because|"
+    r"result(?:s|ed|ing)?\s+(?:in|from)|attribut(?:e|ed|able))\b",
+    re.IGNORECASE,
+)
+RELATION_LANGUAGE = re.compile(
+    rf"(?:{CAUSAL_LINKS.pattern})|\b(?:influ\w+|afect\w+|modul\w+|control\w+|regul\w+|depend\w+|"
+    r"respond\w+|correlaci\w+|correlat\w+|asoci\w+|associat\w+|relacion\w+|relat(?:ed|ion\w*)|vincul\w+|"
+    r"linked|conducive|propicias?|favorables?|favourable|consecuencia\w*|consequen\w+|"
+    r"increas\w+|aument\w+|decreas\w+|disminu\w+)\b",
+    re.IGNORECASE,
+)
+DETECTION_LIMIT = re.compile(
+    r"\b(?:l[ií]mites?\s+de\s+(?:detecci[oó]n|cuantificaci[oó]n)|detection\s+limits?|"
+    r"limits?\s+of\s+(?:detection|quantification)|quantification\s+limits?|LOD|LOQ)\b",
+    re.IGNORECASE,
+)
+INTERPRETATION_CUES = re.compile(
+    r"\b(?:qu[eé]\s+(?:significa|implica|indica|representa|quiere\s+decir)|es\s+(?:normal|alto|alta|bajo|baja|"
+    r"mucho|poco|preocupante|habitual|esperable|bueno|malo)|interpret\w*|explic\w*|por\s+qu[eé]|"
+    r"a\s+qu[eé]\s+se\s+debe|compar\w*\s+con|en\s+comparaci[oó]n|respecto\s+(?:de|a)\s+(?:los|las|la|el)\s+"
+    r"(?:valor|nivel|l[ií]mite|norma|gu[ií]a)\w*|what\s+does\s+(?:it|this|that)\s+mean|is\s+(?:it|this|that)\s+"
+    r"(?:normal|high|low|a\s+lot)|interpret\w*|explain\w*|why|compare\w*\s+(?:with|to))\b",
+    re.IGNORECASE,
+)
 PENDING_CONFIRMATION = re.compile(
     r"\b(?:confirm\w*|verific\w*|consultar|verify|verified)\b"
     r".{0,80}\b(?:unidad|fuente|dato|equivalencia|unit|source|original)\b",
@@ -262,6 +379,13 @@ ATTRIBUTED_SOURCE = re.compile(
     r"(?P<name>[A-ZÁÉÍÓÚÑ][\w-]*(?:\s+(?:(?:de|del|la|las|el|los|of|the|for)\s+)*[A-ZÁÉÍÓÚÑ][\w-]*)*)"
 )
 SOURCE_ALIASES = (("oms", "who", "world health", "organizacion mundial de la salud"),)
+ATTRIBUTION_LEAD = re.compile(
+    r"^(?:(?:seg[uú]n|de\s+acuerdo\s+(?:con|a)|conforme\s+a|according\s+to|as\s+reported\s+by)\b[^,]{0,160},\s*|"
+    r"(?:(?:la|el|los|las|the)\s+)?[^,.;]{0,90}?\b(?:establece|establecen|indica|indican|señala|señalan|sostiene|"
+    r"afirma|afirman|reporta|reportan|informa|informan|describe|describen|define|definen|plantea|plantean|"
+    r"explica|explican|states?|indicates?|reports?|describes?|defines?|explains?)\s+(?:que|that)\s+)",
+    re.IGNORECASE,
+)
 BOUND_WORDS = re.compile(
     r"\b(?:menor(?:es)?|inferior(?:es)?|mayor(?:es)?|superior(?:es)?|debajo|encima|menos\s+de|m[aá]s\s+de|hasta|"
     r"m[aá]xim[oa]s?|m[ií]nim[oa]s?|less|lower|below|under|greater|higher|above|over|more\s+than|up\s+to|"

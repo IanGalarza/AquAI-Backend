@@ -1,3 +1,4 @@
+import re
 from decimal import Decimal
 
 from aquai.application.answering.hypotheses import documented_values
@@ -9,27 +10,44 @@ from aquai.application.answering.readings import (
     sentences,
     written_nearby,
 )
-from aquai.application.answering.verification import rows_of_place
+from aquai.application.answering.verification import RequiredValue, rows_of_place
 from aquai.application.answering.wording import join_words
 from aquai.application.contracts.answering import ComparisonFact, ReferenceLine, ReferenceValue
 from aquai.application.contracts.retrieval import ReferenceDraft
 from aquai.application.matching import (
     contains_phrase,
     named_variable_groups,
+    names_subject,
     requires_chemical_basis,
 )
 from aquai.application.Rules.documents import normalized_text
 from aquai.application.Rules.evidence import (
+    DETECTION_LIMIT,
+    DOCUMENT_YEAR,
     GUIDELINE_CUES,
     MEAN_WITH_DEVIATION,
     REFERENCE_LINE_CUES,
     WATER_USES,
 )
-from aquai.application.units import comparable_unit, concentration_basis
+from aquai.application.units import comparable_unit, concentration_basis, counts_organisms, unit_key
 
 _MAX_SCALE_GAP = 10
 _TABLE_CELL = "|"
 _MAX_LINES = 3
+_MIN_CONDITION_WORDS = 2
+_MAX_CONDITION_CHARS = 120
+_MAX_GUIDELINES = 4
+_CITED_NUMBER = re.compile(
+    r"\b(?:tablas?|tables?|fig(?:ura|ure)?s?|cap[ií]tulos?|chapters?|secci[oó]n|sections?|p|pp|vol|n[º°o])\.?\s*$",
+    re.IGNORECASE,
+)
+_CONTRACTIONS = re.compile(r"\b(de|a) el\b ", re.IGNORECASE)
+_USE_STEMS = {
+    "drinking": ("consumo", "potable", "bebida", "drinking", "tap water"),
+    "recreational": ("recrea", "bano", "baño", "bathing", "swimming"),
+    "irrigation": ("riego", "irrigation"),
+    "aquatic_life": ("vida acuatica", "vida acuática", "biota", "aquatic"),
+}
 _USE_LABELS = {
     "es": {
         "drinking": "agua de consumo",
@@ -61,6 +79,52 @@ _KIND_LABELS = {
 _COMPARABLE_KINDS = ("guideline", "limit", "typical_range")
 _LINE_KINDS = ("guideline", "limit")
 _INCOMPARABLE = ("other_unit", "other_basis")
+
+
+#
+# Devuelve los valores guía o límites que los fragmentos confiables fijan para lo preguntado: oraciones que
+# dicen una guía o un límite, nombran el tema, no son de otro uso del agua y dan una cifra que no es un año
+# ni el número de una tabla o figura.
+#
+def documented_guidelines(fragments, subject, question) -> list[RequiredValue]:
+    asked = water_uses(question)
+    found = {}
+    for fragment in fragments:
+        heading = (fragment.section or [""])[-1]
+        for line in (part for row in fragment.text.splitlines() for part in sentences(row)):
+            if fragment.doubts or not _states_guideline(line, subject):
+                continue
+            uses = water_uses(f"{line} {heading}")
+            reading = _leading_value(line, fragment.language)
+            if reading is None or (asked and uses and not uses & asked):
+                continue
+            item = RequiredValue(fragment.evidence_id, reading.values, reading.text, line)
+            found.setdefault(min(reading.values), item)
+
+    return list(found.values())[:_MAX_GUIDELINES]
+
+
+#
+# Indica si una oración fija una guía o un límite para el tema preguntado.
+#
+def _states_guideline(line, subject) -> bool:
+    return (
+        GUIDELINE_CUES.search(line) is not None
+        and DETECTION_LIMIT.search(line) is None
+        and names_subject(line, subject)
+    )
+
+
+#
+# Devuelve la primera cifra de una oración que no es un año ni el número de una tabla, figura o página.
+#
+def _leading_value(line, language):
+    for reading in number_readings(line, language):
+        year = reading.unit is None and DOCUMENT_YEAR.fullmatch(reading.text) is not None
+        if not year and not _CITED_NUMBER.search(line[: reading.start]):
+            return reading
+
+    return None
 
 
 #
@@ -119,16 +183,45 @@ def verified_references(drafts, fragments, results, question, places=()) -> list
         result = _target(draft, results)
         if fragment is None or result is None or fragment.doubts:
             continue
-        draft = _with_stated_mean(draft)
+        draft = _with_stated_mean(_with_counted_unit(draft))
         if not _literal(draft, fragment) or not _names_variable(draft, fragment, result):
             continue
-        if not _in_variable_cell(draft, fragment, result):
+        if not _in_variable_cell(draft, fragment, result) or _detection_limit(draft, fragment):
             continue
 
-        reference = _reference(draft, fragment, result, asked, places)
-        verified.setdefault(_identity(reference), reference)
+        _keep(verified, _reference(draft, fragment, result, asked, places))
 
     return list(verified.values())
+
+
+#
+# Guarda una referencia sin repetir su valor; entre dos iguales prefiere la que dice su condición.
+#
+def _keep(verified, reference) -> None:
+    key = _identity(reference)
+    current = verified.get(key)
+    if current is None or (current.condition is None and reference.condition is not None):
+        verified[key] = reference
+
+
+#
+# Deja en la unidad propuesta sólo la unidad: en «cyanobacterial cells/ml» el organismo no es parte de ella.
+#
+def _with_counted_unit(draft):
+    words = (draft.unit or "").split()
+    for index in range(1, len(words)):
+        unit = " ".join(words[index:])
+        if counts_organisms(unit) and not counts_organisms(draft.unit):
+            return draft.model_copy(update={"unit": unit})
+
+    return draft
+
+
+#
+# Indica si el valor es un límite de detección o de cuantificación, que no es un valor de referencia.
+#
+def _detection_limit(draft, fragment) -> bool:
+    return DETECTION_LIMIT.search(f"{_lead_in(draft.quote, fragment.text)} {draft.quote}") is not None
 
 
 #
@@ -271,7 +364,7 @@ def _names_any(text, names) -> bool:
 def _reference(draft, fragment, result, asked, places) -> ReferenceValue:
     context = " ".join([*fragment.section, fragment.element_caption or "", fragment.title or ""])
     around = f"{draft.quote} {context}"
-    uses = water_uses(draft.quote) or water_uses(context)
+    uses = _value_uses(draft, fragment, context)
     status, detail = _compatibility(draft, result, uses, asked)
 
     return ReferenceValue(
@@ -283,12 +376,56 @@ def _reference(draft, fragment, result, asked, places) -> ReferenceValue:
         high=draft.high,
         unit=draft.unit,
         basis=concentration_basis(draft.quote, draft.unit),
-        water_use=next(iter(sorted(uses & asked or uses)), None),
+        water_use=next(iter(uses)) if len(uses) == 1 else None,
+        condition=_stated_condition(draft, fragment),
         same_place=any(_reports_place(draft, fragment, place, around) for place in places),
         quote=draft.quote,
         status=status,
         detail=detail,
     )
+
+
+#
+# Devuelve el uso del agua del valor: el de su cita, el de su oración o, si no lo dicen, el de su sección;
+# cuando el texto más cercano nombra varios usos, vale el que propuso el modelo sólo si es uno de ellos.
+#
+def _value_uses(draft, fragment, context) -> set[str]:
+    proposed = _proposed_uses(draft.water_use)
+    sentence = f"{_lead_in(draft.quote, fragment.text)} {draft.quote}"
+    for named in (water_uses(draft.quote), water_uses(sentence), water_uses(context)):
+        chosen = named & proposed
+        if named:
+            return chosen if len(chosen) == 1 else named
+
+    return set()
+
+
+#
+# Devuelve el uso del agua que propuso el modelo, leído con el vocabulario cerrado.
+#
+def _proposed_uses(text) -> set[str]:
+    plain = normalized_text(text or "")
+
+    return {use for use, stems in _USE_STEMS.items() if any(stem in plain for stem in stems)}
+
+
+#
+# Devuelve la condición en que rige el valor (nivel, alerta, probabilidad de efectos, organismo), sólo si el
+# fragmento la escribe tal cual y no es la misma cita del número.
+#
+def _stated_condition(draft, fragment) -> str | None:
+    condition = " ".join((draft.condition or "").split()).strip(" .,;:")
+    source = " ".join([fragment.text, fragment.element_caption or "", *fragment.section])
+    if len(condition.split()) < _MIN_CONDITION_WORDS:
+        return None
+    if normalized_text(condition) not in normalized_text(source):
+        return None
+
+    bounds = {_decimal(item) for item in (draft.low, draft.high) if item is not None}
+    if any(reading.values & bounds for reading in number_readings(condition)):
+        return None
+
+    return condition[:_MAX_CONDITION_CHARS]
 
 
 #
@@ -321,7 +458,9 @@ def _stated_kind(draft, fragment) -> str:
 #
 def _compatibility(draft, result, uses, asked):
     status, detail = _unit_compatibility(draft, result)
-    if status == "compatible" and asked and not asked & uses:
+    if status != "compatible":
+        return status, detail
+    if len(uses) > 1 or (asked and not asked & uses):
         return "other_use", ", ".join(sorted(uses)) or None
 
     return status, detail
@@ -360,15 +499,77 @@ def _identity(reference):
 #
 def comparison_facts(references, results, language) -> list[ComparisonFact]:
     by_field = {item.field: item for item in results}
+    comparable = most_specified(references)
+    ambiguous = {id(item) for group in _unconditioned_groups(comparable) for item in group}
     facts = []
-    for reference in references:
+    for reference in comparable:
         result = by_field.get(reference.result_field)
-        if reference.status != "compatible" or not _comparable(reference):
-            continue
-        if result is not None and result.values:
+        if id(reference) not in ambiguous and result is not None and result.values:
             facts.append(_comparison(reference, result, language))
 
     return facts
+
+
+#
+# Devuelve las referencias comparables sin repetir un mismo valor citado por varios documentos: se queda con
+# la que dice su uso del agua y su condición, y conserva los usos distintos.
+#
+def most_specified(references) -> list:
+    comparable = [item for item in references if item.status == "compatible" and _comparable(item)]
+    groups = {}
+    for item in comparable:
+        key = (item.result_field, item.kind, item.low, item.high, unit_key(item.unit or ""))
+        groups.setdefault(key, []).append(item)
+
+    kept = set()
+    for group in groups.values():
+        named = [item for item in group if item.water_use] or group
+        for use in dict.fromkeys(item.water_use for item in named):
+            same = [item for item in named if item.water_use == use]
+            kept.add(id(next((item for item in same if item.condition), same[0])))
+
+    return [item for item in comparable if id(item) in kept]
+
+
+#
+# Devuelve los grupos de guías o límites del mismo tipo, unidad y uso con valores distintos en los que alguno
+# no dice su condición: presentarlos como un mismo valor guía confundiría criterios distintos.
+#
+def _unconditioned_groups(references) -> list[list]:
+    groups = {}
+    for item in references:
+        if item.kind in _COMPARABLE_KINDS:
+            key = (item.result_field, item.kind, unit_key(item.unit or ""), item.water_use)
+            groups.setdefault(key, []).append(item)
+
+    return [
+        group
+        for group in groups.values()
+        if len({(item.low, item.high) for item in group}) > 1 and any(item.condition is None for item in group)
+    ]
+
+
+#
+# Explica qué valores de referencia no se compararon por ser varios sin una condición verificable.
+#
+def ambiguity_notes(references, results, language) -> list[str]:
+    comparable = most_specified(references)
+    labels = {item.field: item.variable for item in results}
+    notes = []
+    for group in _unconditioned_groups(comparable):
+        ordered = sorted(group, key=lambda item: item.low if item.low is not None else item.high)
+        values = join_words(list(dict.fromkeys(_bounds_text(item, language) for item in ordered)), language)
+        unit = f" {format_unit(group[0].unit)}" if group[0].unit else ""
+        variable = labels.get(group[0].result_field, group[0].variable)
+        notes.append(
+            f"The documents give several reference values for {variable} ({values}{unit}) and I could not "
+            "verify which condition each one applies to, so I did not compare the result with them."
+            if language == "en"
+            else f"Los documentos dan varios valores de referencia para {variable} ({values}{unit}) y no pude "
+            "verificar a qué condición corresponde cada uno, así que no comparé el resultado con ellos."
+        )
+
+    return notes
 
 
 #
@@ -412,7 +613,7 @@ def _single_value(reference, result, language) -> str:
 
     words = {"below": "está por debajo de", "above": "está por encima de", "within": "está dentro de"}
 
-    return f"{result.label} ({value}) {words[position]} {target}."
+    return _contracted(f"{result.label} ({value}) {words[position]} {target}.")
 
 
 #
@@ -427,9 +628,16 @@ def _several_values(reference, result, language) -> str:
             return f"None of the {total} values of {result.label} is above {target}."
         return f"{above} of {total} values of {result.label} are above {target}."
     if not above:
-        return f"Ninguno de los {total} valores de {result.label} está por encima de {target}."
+        return _contracted(f"Ninguno de los {total} valores de {result.label} está por encima de {target}.")
 
-    return f"{above} de {total} valores de {result.label} están por encima de {target}."
+    return _contracted(f"{above} de {total} valores de {result.label} están por encima de {target}.")
+
+
+#
+# Contrae «de el» y «a el» como corresponde en español.
+#
+def _contracted(text) -> str:
+    return _CONTRACTIONS.sub(lambda match: "del " if match.group(1).lower() == "de" else "al ", text)
 
 
 #
@@ -461,8 +669,8 @@ def _reference_text(reference, language, result_unit=None) -> str:
     kind = _KIND_LABELS[language][reference.kind]
     written = result_unit or reference.unit
     unit = f" {format_unit(written)}" if written else ""
-    use = _USE_LABELS[language].get(reference.water_use)
-    suffix = f" ({use})" if use else ""
+    details = [item for item in (_USE_LABELS[language].get(reference.water_use), reference.condition) if item]
+    suffix = f" ({'; '.join(details)})" if details else ""
 
     joiner = {"es": "de", "en": "of"}[language] if reference.kind != "observed" else ":"
 
@@ -505,6 +713,35 @@ def incompatibility_notes(references, language) -> list[str]:
         f"No comparé este resultado con los valores de referencia documentados: están en {named}, otra "
         "unidad o base química, y no los convertí."
     ]
+
+
+#
+# Devuelve las guías y límites verificados que sirven de umbral: compatibles y de un único valor.
+#
+def threshold_references(references) -> list[ReferenceValue]:
+    return [
+        item
+        for item in references
+        if item.status == "compatible" and item.kind in _LINE_KINDS and _single_bound(item) is not None
+    ]
+
+
+#
+# Devuelve el único valor de una referencia que sirve de umbral.
+#
+def threshold_value(reference) -> Decimal:
+    return _decimal(_single_bound(reference))
+
+
+#
+# Describe un valor de referencia con su unidad, su uso y su condición.
+#
+def reference_option(reference, language) -> str:
+    unit = f" {format_unit(reference.unit)}" if reference.unit else ""
+    details = [item for item in (_USE_LABELS[language].get(reference.water_use), reference.condition) if item]
+    suffix = f" ({'; '.join(details)})" if details else ""
+
+    return f"{_bounds_text(reference, language)}{unit}{suffix}"
 
 
 #

@@ -41,6 +41,7 @@ from aquai.application.Rules.vocabulary import YEAR_COLUMN_NAMES
 
 _EQUALITY_OPERATORS = {"eq", "ieq", "in"}
 _RANGE_OPERATORS = {"lt", "le", "gt", "ge"}
+_GROUPED_DIGITS = 5
 _DATE_TYPES = {"DATE", "TIMESTAMP"}
 _ORDERING_OPERATIONS = {"sort", "latest"}
 _MAX_LABEL_LENGTH = 200
@@ -450,7 +451,7 @@ class _Writer:
         if not isinstance(value, (Decimal, int, float)):
             return str(value)
         if exact:
-            return str(value).replace(".", ",") if self.es else str(value)
+            return _exact_number(value, self.language)
 
         return format_number(value, self.language)
 
@@ -1778,7 +1779,20 @@ def _contiguous_days(days) -> bool:
 
 
 #
-# Devuelve el valor como fecha ISO, o None si no lo es.
+# Escribe un valor exacto, sin redondear, con los separadores del idioma y de miles en los enteros largos.
+#
+def _exact_number(value, language) -> str:
+    text = format(Decimal(str(value)), "f")
+    integer, _, fraction = text.partition(".")
+    decimal, thousands = (",", ".") if language == "es" else (".", ",")
+    if len(integer.lstrip("-")) >= _GROUPED_DIGITS:
+        integer = f"{int(integer):,}".replace(",", thousands)
+
+    return integer + (decimal + fraction if fraction else "")
+
+
+#
+# Devuelve la fecha ISO de un valor de filtro, o None si no lo es.
 #
 def _iso_date(value):
     try:

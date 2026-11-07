@@ -7,11 +7,21 @@ from aquai.application.Rules.evidence import ABBREVIATION_END, SENTENCE_END
 from aquai.application.Rules.units import UNIT_WORD_STARTS
 from aquai.application.units import comparable_unit, concentration_basis
 
+_SUPERSCRIPT_DIGITS = "⁰¹²³⁴⁵⁶⁷⁸⁹"
+_POWER = rf"(?:[{_SUPERSCRIPT_DIGITS}]+|\d{{1,2}})(?!\d|[.,]\d)"
 _NUMBER = re.compile(
-    r"(?<![\w.,/-])-?\d+(?:[.,   ]\d{3})*(?:[.,]\d+)?(?:[eE][-+]?\d+)?(?!\d)"
+    rf"(?P<scientific>(?<![\w.,/-])-?\d+(?:[.,]\d+)?\s?[×x·]\s?10\s?(?:\^\s?)?(?:[-⁻]\s?)?{_POWER}"
+    rf"|(?<![\w.,/-])10(?:\^\s?-?\d{{1,2}}|⁻?[{_SUPERSCRIPT_DIGITS}]+)(?!\d)"
+    r"|(?<![\w.,/-])10\s(?:-\s?)?\d{1,2}(?=\s?(?:cells?|c[eé]l\w*|ind\w*|UFC|CFU|NMP|MPN)\b))"
+    r"|(?<![\w.,/-])-?\d+(?:[.,   ]\d{3})*(?:[.,]\d+)?(?:[eE][-+]?\d+)?(?!\d)"
     r"|(?<![\w.,])\d+(?:[.,]\d+)?(?=[-–/]\d)"
     r"|(?<=[-–/])\d+(?:[.,]\d+)?(?!\d)"
 )
+_SCIENTIFIC_PARTS = re.compile(
+    r"(?:(?P<mantissa>-?\d+(?:[.,]\d+)?)\s?[×x·]\s?)?10\s?(?:\^\s?)?(?P<sign>[-⁻]\s?)?"
+    rf"(?P<power>[{_SUPERSCRIPT_DIGITS}]+|\d{{1,2}})"
+)
+_SUPERSCRIPTS = str.maketrans(_SUPERSCRIPT_DIGITS, "0123456789")
 _BASIS = r"(?:\s?(?:N|P|NO3|NO2|NH4|PO4|O2)(?=\s?[/LlLl]))?"
 _UNIT = re.compile(
     r"\s?(?P<unit>%|[°º◦]\s?C|"
@@ -83,6 +93,22 @@ def number_values(token: str, language: str | None = None) -> frozenset[Decimal]
 
 
 #
+# Devuelve el valor de un número en notación científica: «7,3 × 10⁵» y su forma aplanada «7.3 × 10 5».
+#
+def scientific_values(token: str, language: str | None = None) -> frozenset[Decimal]:
+    parts = _SCIENTIFIC_PARTS.fullmatch(token.translate(_MINUS_SIGNS))
+    if parts is None:
+        return frozenset()
+
+    mantissa = parts.group("mantissa")
+    mantissas = number_values(mantissa, language) if mantissa else frozenset({Decimal(1)})
+    power = int(parts.group("power").translate(_SUPERSCRIPTS))
+    exponent = -power if parts.group("sign") else power
+
+    return frozenset(value.scaleb(exponent).normalize() for value in mantissas)
+
+
+#
 # Convierte textos en números normalizados, omitiendo los que no lo son.
 #
 def _forms(*texts) -> frozenset[Decimal]:
@@ -109,7 +135,8 @@ def number_readings(text: str, language: str | None = None) -> list[Reading]:
     readings = []
     consumed = 0
     for match in _NUMBER.finditer(source):
-        values = number_values(match.group(), language)
+        scientific = match.group("scientific") is not None
+        values = scientific_values(match.group(), language) if scientific else number_values(match.group(), language)
         if not values or match.start() < consumed or _is_list_marker(source, match):
             continue
         if match.group() in _UNIT_EXPONENTS and _UNIT_BEFORE.search(source[: match.start()]):
@@ -294,7 +321,7 @@ def _numerator(unit: str) -> str:
 # Devuelve cada número de un token separado por espacios: en una tabla pueden ser celdas distintas.
 #
 def group_values(token: str) -> frozenset[Decimal]:
-    if " " not in token:
+    if " " not in token or _SCIENTIFIC_PARTS.fullmatch(token.translate(_MINUS_SIGNS)):
         return frozenset()
 
     return frozenset(value for part in token.split() for value in number_values(part))

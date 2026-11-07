@@ -660,17 +660,91 @@ def requested_dimensions(evidence, datasets) -> dict[UUID, set[str]]:
 
 
 #
-# Devuelve las incidencias de las salidas que no conservan cada umbral pedido.
+# Devuelve las incidencias de las salidas que no conservan cada umbral pedido. Varios umbrales en el mismo
+# sentido son alternativas (los niveles de una guía): cada salida aplica uno solo y, en cada dataset, cada
+# alternativa tiene su salida.
 #
 def _threshold_issues(steps, output_steps, thresholds) -> list[ValidationIssue]:
+    required, alternatives = threshold_groups(thresholds)
+    chains = {key: [steps[item] for item in _reachable_step_ids(steps, [key])] for key in output_steps}
     issues = []
-
-    for key in output_steps:
-        chain = [steps[item] for item in _reachable_step_ids(steps, [key])]
-        for threshold in thresholds:
+    for key, chain in chains.items():
+        for threshold in required:
             issues.extend(_output_threshold_issues(key, chain, steps, threshold))
+        for group in alternatives:
+            issues.extend(_alternative_issues(key, chain, steps, group))
+
+    for group in alternatives:
+        issues.extend(_uncovered_alternatives(chains, group))
 
     return issues
+
+
+#
+# Separa los umbrales que toda salida debe aplicar de los grupos de alternativas en un mismo sentido.
+#
+def threshold_groups(thresholds) -> tuple[list[RequestedThreshold], list[list[RequestedThreshold]]]:
+    groups = {}
+    for item in thresholds:
+        groups.setdefault((item.operator, item.compares_statistic), []).append(item)
+
+    required = [group[0] for group in groups.values() if len(group) == 1]
+    alternatives = [group for group in groups.values() if len(group) > 1]
+
+    return required, alternatives
+
+
+#
+# Indica si una rama filtra con un umbral.
+#
+def chain_applies(chain, threshold) -> bool:
+    return any(applies_threshold(predicate, threshold) for step in chain for predicate in step.filters)
+
+
+#
+# Devuelve los datasets que lee una rama.
+#
+def chain_datasets(chain) -> frozenset:
+    return frozenset(ref.dataset_id for step in chain if step.operation == "read" for ref in step.columns)
+
+
+#
+# Devuelve las incidencias de una salida que no aplica exactamente una de las alternativas.
+#
+def _alternative_issues(key, chain, steps, group) -> list[ValidationIssue]:
+    applied = [item for item in group if chain_applies(chain, item)]
+    if len(applied) == 1:
+        return _output_threshold_issues(key, chain, steps, applied[0])
+
+    texts = " / ".join(item.text for item in group)
+    return [
+        ValidationIssue(
+            code="combined_alternative_thresholds" if applied else "missing_requested_threshold",
+            severity="clarification",
+            step_id=key,
+            message=f"La consulta pide por separado {texts}: la salida {key} debe filtrar con uno solo.",
+        )
+    ]
+
+
+#
+# Devuelve las alternativas que ninguna salida de un dataset aplica.
+#
+def _uncovered_alternatives(chains, group) -> list[ValidationIssue]:
+    by_dataset = {}
+    for chain in chains.values():
+        by_dataset.setdefault(chain_datasets(chain), []).append(chain)
+
+    return [
+        ValidationIssue(
+            code="missing_requested_threshold",
+            severity="clarification",
+            message=f"La consulta pide {item.text}, pero ninguna salida de uno de los datasets lo aplica.",
+        )
+        for members in by_dataset.values()
+        for item in group
+        if not any(chain_applies(chain, item) for chain in members)
+    ]
 
 
 #

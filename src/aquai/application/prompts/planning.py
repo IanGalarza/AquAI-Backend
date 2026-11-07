@@ -59,7 +59,8 @@ operator y value exactos. Con compares_statistic=true se filtra el resultado cal
 read -> aggregate (group_by por la dimensión) -> sort con el filtro sobre el alias del
 cálculo ('sitios con conductividad promedio mayor que 500'). Si no, filtrá la variable en
 el read antes de calcular ('mediciones con turbiedad mayor que 100': read con filtro gt
-100 -> aggregate count).
+100 -> aggregate count). Varios requested_thresholds con el mismo operator son alternativas,
+como los niveles de una guía: armá una salida por cada uno, con un solo umbral en cada salida.
 
 Estados:
 - plannable: todas las partes de la pregunta tienen cobertura verificable en los

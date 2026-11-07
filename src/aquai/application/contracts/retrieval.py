@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import Literal
+from typing import Annotated, Literal
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue
@@ -117,6 +117,7 @@ class DocumentRetrievalResult(BaseModel):
     purpose: Literal["question", "enrichment"]
     status: Literal["found", "no_relevant_evidence", "unavailable", "skipped"]
     queries: list[str] = Field(default_factory=list)
+    subject: list[str] = Field(default_factory=list)
     document_ids: list[UUID] = Field(default_factory=list)
     candidates: int = Field(default=0, ge=0)
     discarded: int = Field(default=0, ge=0)
@@ -136,7 +137,7 @@ class SearchTerms(BaseModel):
 
 class SearchTermsDraft(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
-    subject: list[str] = Field(min_length=1, max_length=6)
+    subject: list[Annotated[str, Field(min_length=1, max_length=80)]] = Field(min_length=1, max_length=6)
     searches: list[SearchTerms] = Field(min_length=1, max_length=6)
 
 
@@ -157,6 +158,7 @@ class ReferenceDraft(BaseModel):
     unit: str | None = Field(default=None, max_length=40)
     kind: Literal["guideline", "limit", "typical_range", "observed"]
     water_use: str | None = Field(default=None, max_length=80)
+    condition: str | None = Field(default=None, max_length=160)
 
 
 class ReferenceExtraction(BaseModel):
@@ -170,3 +172,4 @@ class EvidenceUsage(BaseModel):
     model: str
     input_tokens: int | None = None
     output_tokens: int | None = None
+    complete: bool = True

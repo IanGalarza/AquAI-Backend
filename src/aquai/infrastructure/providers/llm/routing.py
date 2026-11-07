@@ -39,6 +39,15 @@ class _StructuredConversationProvider:
     # Envía el contexto a Ollama y devuelve la salida estructurada con sus metadatos.
     #
     async def _generate(self, context, schema=None):
+        body, metadata = await self._reply(context, schema)
+        decision = self._parse_output(self._message_content(body, metadata), metadata)
+
+        return decision, metadata
+
+    #
+    # Envía el contexto a Ollama y devuelve la respuesta cruda con sus metadatos, sin validarla.
+    #
+    async def _reply(self, context, schema=None):
         content = json.dumps(context, ensure_ascii=False, separators=(",", ":"))
         if len(content.encode("utf-8")) > self.context_budget_bytes:
             raise LLMProviderError("El contexto conversacional supera el límite permitido.")
@@ -67,9 +76,8 @@ class _StructuredConversationProvider:
             "input_tokens": prompt_tokens(body),
             "output_tokens": body.get("eval_count"),
         }
-        decision = self._parse_output(self._message_content(body, metadata), metadata)
 
-        return decision, metadata
+        return body, metadata
 
     #
     # Extrae el contenido de la respuesta y falla si está incompleta o sin contexto suficiente.

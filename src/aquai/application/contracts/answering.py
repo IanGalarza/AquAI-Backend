@@ -69,7 +69,7 @@ class ConversationMessage(BaseModel):
 
 
 class ResponseContextRecord(BaseModel):
-    prompt_version: str = "aquai-response-v4"
+    prompt_version: str = "aquai-response-v5"
     evidence: dict[str, JsonValue]
     sha256: str
     size_bytes: int
@@ -174,6 +174,7 @@ class ReferenceValue(BaseModel):
     unit: str | None = None
     basis: str | None = None
     water_use: str | None = None
+    condition: str | None = None
     same_place: bool = False
     quote: str
     status: Literal["compatible", "other_unit", "other_basis", "unit_unknown", "other_use"]
@@ -221,6 +222,7 @@ class DocumentContrast(BaseModel):
     hypotheses: list[UnitHypothesis] = Field(default_factory=list)
     lines: list[ReferenceLine] = Field(default_factory=list)
     notes: list[str] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
     proposed: int = 0
     model: str | None = None
     input_tokens: int | None = None

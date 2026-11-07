@@ -53,6 +53,20 @@ def next_after_documents(state: QueryResponseState):
 
 
 #
+# Elige el siguiente nodo tras recuperar datasets: buscar antes la referencia documental pedida, o planificar.
+#
+def next_after_retrieval(state: QueryResponseState):
+    return "reference_resolver" if state.routing.reference_comparison else "planner"
+
+
+#
+# Elige el siguiente nodo tras buscar la referencia: planificar con ella o presentar lo que dicen los documentos.
+#
+def next_after_reference(state: QueryResponseState):
+    return "document_response" if state.routing.route == "document" else "planner"
+
+
+#
 # Elige el siguiente nodo tras planificar: SQL, Python o validación.
 #
 def next_after_planning(state: QueryResponseState):
@@ -160,7 +174,8 @@ def build_query_planning_graph(
                     document_services = await asyncio.to_thread(document_services_factory)
 
             documents, references = document_services
-            result = await documents.retrieve(state)
+            result = _resolved_evidence(state) if analytical else None
+            result = result or await documents.retrieve(state)
             current = state.model_copy(update={"document_retrieval": result})
             contrast = await references.contrast(current) if analytical else None
         except Exception as error:
@@ -173,6 +188,31 @@ def build_query_planning_graph(
             "document_retrieval": result,
             "document_contrast": contrast,
             "stage_durations_ms": _stage_durations(state, "documents", started),
+        }
+
+    async def resolve_reference(state: QueryResponseState):
+        nonlocal document_services
+        started = perf_counter()
+        try:
+            async with retrieval_lock:
+                if document_services is None:
+                    document_services = await asyncio.to_thread(document_services_factory)
+
+            documents, references = document_services
+            retrieval = await documents.retrieve_reference(state)
+            found = await references.documented_thresholds(state, retrieval)
+            routing = references.resolved_routing(state, retrieval, found)
+        except Exception as error:
+            _logger.warning("Falló la búsqueda de la referencia documental: %s", type(error).__name__)
+            return {"stage_durations_ms": _stage_durations(state, "reference", started)}
+
+        documental = {"retrieval": None} if routing.route == "document" else {}
+
+        return {
+            **documental,
+            "routing": routing,
+            "document_retrieval": retrieval,
+            "stage_durations_ms": _stage_durations(state, "reference", started),
         }
 
     async def plan(state: QueryResponseState):
@@ -256,6 +296,7 @@ def build_query_planning_graph(
     builder.add_node("router", route)
     builder.add_node("direct_response", respond_directly)
     builder.add_node("retriever", retrieve)
+    builder.add_node("reference_resolver", resolve_reference)
     builder.add_node("planner", plan)
     builder.add_node("sql_agent", execute_sql)
     builder.add_node("python_agent", execute_python)
@@ -283,7 +324,16 @@ def _add_edges(builder: StateGraph) -> None:
         },
     )
     builder.add_edge("direct_response", END)
-    builder.add_edge("retriever", "planner")
+    builder.add_conditional_edges(
+        "retriever",
+        next_after_retrieval,
+        {"reference_resolver": "reference_resolver", "planner": "planner"},
+    )
+    builder.add_conditional_edges(
+        "reference_resolver",
+        next_after_reference,
+        {"document_response": "document_response", "planner": "planner"},
+    )
     builder.add_conditional_edges(
         "planner",
         next_after_planning,
@@ -303,6 +353,17 @@ def _add_edges(builder: StateGraph) -> None:
     )
     builder.add_edge("response_generator", END)
     builder.add_edge("document_response", END)
+
+
+#
+# Devuelve los fragmentos de la referencia que se resolvió antes de planificar, para citarlos al responder.
+#
+def _resolved_evidence(state):
+    retrieval = state.document_retrieval
+    if not state.routing.reference_comparison or retrieval is None or retrieval.status != "found":
+        return None
+
+    return retrieval.model_copy(update={"purpose": "enrichment"})
 
 
 #

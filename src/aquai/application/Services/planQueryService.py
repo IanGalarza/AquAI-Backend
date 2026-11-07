@@ -60,10 +60,13 @@ from aquai.application.planning.limits import (
 from aquai.application.planning.temporalText import profile_temporal_text, within_period
 from aquai.application.planning.validation import (
     applies_threshold,
+    chain_applies,
+    chain_datasets,
     filters_period,
     period_columns,
     period_matches,
     requested_dimensions,
+    threshold_groups,
     validate_operations,
     validate_requested_scope,
     validate_selections,
@@ -1637,20 +1640,16 @@ class PlanQueryService:
         if not thresholds or decision.status != "plannable":
             return decision
 
+        required, alternatives = threshold_groups(thresholds)
         changed = decision.model_copy(deep=True)
         steps = {step.id: step for step in changed.steps}
         types = _column_types(catalog)
         modified = False
         for key in changed.output_steps:
             chain = PlanQueryService._published_chain(steps.get(key), steps)
-            for threshold in thresholds:
-                applied = any(
-                    applies_threshold(predicate, threshold)
-                    for step in chain
-                    for predicate in step.filters
-                )
+            for threshold in required:
                 target = PlanQueryService._threshold_target(chain, threshold, types)
-                if applied or target is None:
+                if chain_applies(chain, threshold) or target is None:
                     continue
 
                 step, field = target
@@ -1658,7 +1657,103 @@ class PlanQueryService:
                     FilterSpec(field=field, operator=threshold.operator, values=[threshold.value])
                 )
                 modified = True
+
+        for group in alternatives:
+            expanded = PlanQueryService._alternative_branches(changed, group, types)
+            if expanded is None:
+                return decision
+            modified |= expanded
+
         return changed if modified else decision
+
+    #
+    # Deja una salida por alternativa en cada dataset: aplica la que falta, separa las combinadas y copia la
+    # rama para las demás. Devuelve None si las copias superan los límites del plan.
+    #
+    @staticmethod
+    def _alternative_branches(decision, group, types):
+        steps = {step.id: step for step in decision.steps}
+        chains = [(key, PlanQueryService._published_chain(steps.get(key), steps)) for key in decision.output_steps]
+        by_dataset = {}
+        for key, chain in chains:
+            by_dataset.setdefault(chain_datasets(chain), []).append((key, chain))
+
+        copies, modified = [], False
+        for members in by_dataset.values():
+            covered = set()
+            for key, chain in members:
+                applied = [index for index, item in enumerate(group) if chain_applies(chain, item)]
+                if not applied:
+                    index = next((index for index in range(len(group)) if index not in covered), 0)
+                    modified |= PlanQueryService._applied_alternative(chain, None, group[index], types)
+                    applied = [index] if chain_applies(chain, group[index]) else []
+                for index in applied[1:]:
+                    PlanQueryService._without_threshold(chain, group[index])
+                    copies.append((key, chain, group[applied[0]], group[index]))
+                    modified = True
+                covered.update(applied)
+
+            template = next(((key, chain) for key, chain in members if any(chain_applies(chain, item) for item in group)), None)
+            for index, item in enumerate(group):
+                if index not in covered and template is not None:
+                    source = next(alternative for alternative in group if chain_applies(template[1], alternative))
+                    copies.append((template[0], template[1], source, item))
+                    modified = True
+
+        return None if not PlanQueryService._copied_alternatives(decision, copies, types) else modified
+
+    #
+    # Aplica una alternativa a una rama: reemplaza la que ya filtra o agrega el filtro donde corresponde.
+    #
+    @staticmethod
+    def _applied_alternative(chain, source, threshold, types) -> bool:
+        if source is not None:
+            for step in chain:
+                for position, predicate in enumerate(step.filters):
+                    if applies_threshold(predicate, source):
+                        step.filters[position] = predicate.model_copy(update={"values": [threshold.value]})
+                        return True
+            return False
+
+        target = PlanQueryService._threshold_target(chain, threshold, types)
+        if target is None:
+            return False
+
+        step, field = target
+        step.filters.append(FilterSpec(field=field, operator=threshold.operator, values=[threshold.value]))
+
+        return True
+
+    #
+    # Quita de una rama el filtro de una alternativa.
+    #
+    @staticmethod
+    def _without_threshold(chain, threshold):
+        for step in chain:
+            step.filters = [item for item in step.filters if not applies_threshold(item, threshold)]
+
+    #
+    # Agrega al plan una copia de rama por alternativa, publicada junto a su original; False si no caben.
+    #
+    @staticmethod
+    def _copied_alternatives(decision, copies, types) -> bool:
+        outputs = list(decision.output_steps)
+        for number, (key, chain, source, threshold) in enumerate(copies, 1):
+            renamed = {step.id: f"{step.id}_t{number}" for step in chain}
+            copied = [_renamed_step(step, renamed) for step in reversed(chain)]
+            if not PlanQueryService._applied_alternative(copied, source, threshold, types):
+                return False
+            decision.steps.extend(copied)
+            outputs.insert(outputs.index(key) + 1 if key in outputs else len(outputs), renamed[key])
+
+        decision.output_steps = outputs
+        too_large = (
+            len(decision.steps) > _MAX_PLAN_STEPS
+            or len(decision.output_steps) > _MAX_PLAN_STEPS
+            or any(len(step.id) > _MAX_STEP_ID_LENGTH for step in decision.steps)
+        )
+
+        return not too_large
 
     #
     # Acota cada rama al período pedido, copiándolas por período o quitando las que no tienen fechas.
