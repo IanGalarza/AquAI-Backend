@@ -3,7 +3,7 @@ from decimal import Decimal
 
 from aquai.application.answering.naming import FieldNames
 from aquai.application.answering.presentation import format_number
-from aquai.application.answering.wording import NUMERIC_TYPES, column_label
+from aquai.application.answering.wording import NUMERIC_TYPES, column_label, spoken_label
 from aquai.application.execution import decode_rows, execution_records
 from aquai.application.matching import contains_phrase, variable_name, variable_variants
 from aquai.application.units import (
@@ -109,7 +109,7 @@ def _target(dataset_id, mention, column) -> MeasuredResult:
         evidence_id="",
         operation_id="",
         field=column.sql_name,
-        label=column_label(column.original_name, unit),
+        label=spoken_label(column_label(column.original_name, unit)),
         variable=variable_name(mention),
         column=column.original_name,
         unit=unit,
@@ -154,7 +154,7 @@ class _Context:
     def _label(self, dataset_id, sql_name):
         column = self._named(dataset_id, sql_name)
 
-        return column_label(column.original_name, column.unit) if column else None
+        return spoken_label(column_label(column.original_name, column.unit)) if column else None
 
     #
     # Devuelve la columna que da nombre a una medición: la de origen si es una proyección numérica.

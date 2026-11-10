@@ -18,7 +18,7 @@ from aquai.application.contracts.planning import (
 )
 from aquai.application.contracts.retrieval import VerifiedDataset
 from aquai.application.errors import PlannerValidationError
-from aquai.application.matching import contains_phrase, singular_words
+from aquai.application.matching import abbreviates, contains_phrase, singular_words
 from aquai.application.planning.temporalText import period_bounds
 from aquai.application.Rules.vocabulary import YEAR_COLUMN_NAMES
 from aquai.application.units import comparable_unit, presentation_unit_status
@@ -93,7 +93,8 @@ def _equality_text_values(step) -> set[str]:
 #
 def _keeps_value(scope, value) -> bool:
     return any(
-        item.casefold() == value.casefold() or contains_phrase(item, value) for item in scope
+        item.casefold() == value.casefold() or contains_phrase(item, value) or abbreviates(item, value)
+        for item in scope
     )
 
 
@@ -177,6 +178,37 @@ def validate_text_orderings(operations, variables) -> list[ValidationIssue]:
         if (field := _filtered_field(step, ordering, steps)) is not None
         and _is_text_measurement(field, variables)
     ]
+
+
+#
+# Valida que los cálculos publicados midan las variables pedidas o conservadas: en un seguimiento el modelo
+# arrastra variables de pedidos anteriores ya reemplazados («¿Y la conductividad?» tras el pH).
+#
+def validate_requested_variables(operations, output_steps, variables) -> list[ValidationIssue]:
+    steps = {step.id: step for step in operations}
+    relevant = _reachable_step_ids(steps, output_steps)
+    issues = []
+
+    for step in (item for item in operations if item.id in relevant and item.calculations):
+        for field in step.output_fields:
+            asked = [variables.get(ref.dataset_id) for ref in field.sources]
+            unrequested = (
+                field.numeric_eligible
+                and field.sources
+                and all(columns and ref.column not in columns for ref, columns in zip(field.sources, asked))
+            )
+            if unrequested:
+                issues.append(
+                    ValidationIssue(
+                        code="unrequested_variable",
+                        severity="clarification",
+                        step_id=step.id,
+                        message=f"El paso {step.id} calcula {field.name}, una variable que la consulta no pide "
+                        "ni conserva del análisis citado: calculá sólo las variables pedidas.",
+                    )
+                )
+
+    return issues
 
 
 #
@@ -312,6 +344,8 @@ def validate_requested_scope(
     time_grain=None,
     periods=(),
     dated_columns=None,
+    order=None,
+    variables=None,
 ) -> list[ValidationIssue]:
     steps = {step.id: step for step in operations}
     relevant = _reachable_step_ids(steps, output_steps)
@@ -320,7 +354,8 @@ def validate_requested_scope(
         *_threshold_issues(steps, output_steps, thresholds),
         *_period_issues(steps, output_steps, periods, dated_columns or {}),
         *_statistic_issues(published, statistics),
-        *(_extreme_issues(published) if extreme else []),
+        *(_extreme_issues(published, extreme) if extreme else []),
+        *(_order_issues(steps, output_steps, order, variables or {}) if order else []),
     ]
 
     if chart and not any(step.operation == "visualize" for step in published):
@@ -830,7 +865,20 @@ def _statistic_issues(published, statistics) -> list[ValidationIssue]:
 #
 # Devuelve la incidencia del extremo pedido si ninguna salida ordena ni calcula.
 #
-def _extreme_issues(published) -> list[ValidationIssue]:
+def _extreme_issues(published, extreme=True) -> list[ValidationIssue]:
+    directions = set(extreme) if isinstance(extreme, (set, frozenset)) else set()
+    if len(directions) == 1 and _opposite_extremes(published, *directions):
+        return [
+            ValidationIssue(
+                code="missing_requested_extreme",
+                severity="clarification",
+                message="La consulta pide el "
+                + ("mayor" if "desc" in directions else "menor")
+                + " valor, pero el plan ordena o calcula el extremo contrario: usá direction="
+                + next(iter(directions))
+                + (" o max." if "desc" in directions else " o min."),
+            )
+        ]
     if any(step.order_by or step.operation in _EXTREME_OPERATIONS for step in published):
         return []
 
@@ -842,6 +890,75 @@ def _extreme_issues(published) -> list[ValidationIssue]:
             "un read solo no lo responde. Agregá un sort por la variable con limit 5, o un aggregate con max o min.",
         )
     ]
+
+
+#
+# Devuelve las incidencias de las salidas que publican la variable pedida sin el orden que pide la consulta.
+#
+def _order_issues(steps, output_steps, order, variables) -> list[ValidationIssue]:
+    direction = "de mayor a menor" if order == "desc" else "de menor a mayor"
+    issues = []
+
+    for key in output_steps:
+        rows = _published_rows(steps.get(key), steps)
+        if rows is None or not any(_measures(field, variables) for field in rows.output_fields):
+            continue
+        if _orders_variable(rows, steps, order, variables):
+            continue
+
+        issues.append(
+            ValidationIssue(
+                code="missing_requested_order",
+                severity="clarification",
+                step_id=key,
+                message=f"La consulta pide los valores ordenados {direction}, pero la salida {key} no los ordena "
+                f"por la variable: agregá order_by con direction={order} sobre la variable (o un sort con "
+                "ese orden sobre el cálculo), sin limit.",
+            )
+        )
+
+    return issues
+
+
+#
+# Indica si un campo mide una variable pedida como número; sin variables reconocidas, cualquier número.
+#
+def _measures(field, variables) -> bool:
+    if not field.numeric_eligible:
+        return False
+    if not variables:
+        return True
+
+    return any(ref.column in variables.get(ref.dataset_id, ()) for ref in field.sources)
+
+
+#
+# Indica si la cadena que publica las filas ordena primero por la variable pedida en el sentido pedido.
+#
+def _orders_variable(step, steps, order, variables) -> bool:
+    while step is not None:
+        if step.order_by and step.operation != "latest":
+            first = step.order_by[0]
+            field = _filtered_field(step, first, steps)
+            return first.direction == order and field is not None and _measures(field, variables)
+        if step.operation not in _PASSTHROUGH_OPERATIONS or not step.depends_on:
+            return False
+        step = steps.get(step.depends_on[0])
+
+    return False
+
+
+#
+# Indica si las salidas sólo eligen el extremo contrario al pedido: ordenan al revés o calculan la otra cota.
+#
+def _opposite_extremes(published, direction) -> bool:
+    wanted, other = ("max", "min") if direction == "desc" else ("min", "max")
+    orders = {step.order_by[0].direction for step in published if step.order_by and step.operation != "latest"}
+    functions = {item.function for step in published for item in step.calculations}
+    if direction in orders or wanted in functions:
+        return False
+
+    return bool(orders) or other in functions
 
 
 #
@@ -1281,6 +1398,16 @@ class _OperationValidator:
                 chart.x != chart.y,
                 "Los ejes x e y del gráfico deben ser campos distintos: x es la categoría "
                 "(por ejemplo, el sitio agrupado) e y el valor calculado.",
+            )
+
+        if step.depends_on and self._is_single_row(step.depends_on[0]):
+            self._issue(
+                "single_value_chart",
+                "El gráfico parte de un único valor (un aggregate sin group_by) y no muestra nada: graficá "
+                "los registros de la variable (histograma, o x=fecha si es una fecha verificada) o agrupá "
+                "por una categoría o período; si ningún gráfico corresponde, no publiques visualize.",
+                step.id,
+                "clarification",
             )
 
         if source in self._limited_steps:

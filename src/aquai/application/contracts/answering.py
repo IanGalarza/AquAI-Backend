@@ -167,6 +167,7 @@ class ReferenceValue(BaseModel):
 
     evidence_id: str
     result_field: str
+    result_evidence_id: str | None = None
     variable: str
     kind: Literal["guideline", "limit", "typical_range", "observed"]
     low: float | None = Field(default=None, allow_inf_nan=False)

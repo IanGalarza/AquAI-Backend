@@ -11,7 +11,7 @@ from aquai.application.answering.readings import (
     written_nearby,
 )
 from aquai.application.answering.verification import RequiredValue, rows_of_place
-from aquai.application.answering.wording import join_words
+from aquai.application.answering.wording import calculation_noun, join_words
 from aquai.application.contracts.answering import ComparisonFact, ReferenceLine, ReferenceValue
 from aquai.application.contracts.retrieval import ReferenceDraft
 from aquai.application.matching import (
@@ -36,6 +36,7 @@ _TABLE_CELL = "|"
 _MAX_LINES = 3
 _MIN_CONDITION_WORDS = 2
 _MAX_CONDITION_CHARS = 120
+_SECTION_NUMBER = re.compile(r"^\s*(?:\d+(?:\.\d+)*\.?|[IVX]+\.)\s+")
 _MAX_GUIDELINES = 4
 _CITED_NUMBER = re.compile(
     r"\b(?:tablas?|tables?|fig(?:ura|ure)?s?|cap[ií]tulos?|chapters?|secci[oó]n|sections?|p|pp|vol|n[º°o])\.?\s*$",
@@ -67,13 +68,13 @@ _KIND_LABELS = {
         "guideline": "el valor guía",
         "limit": "el límite",
         "typical_range": "el rango típico",
-        "observed": "lo reportado en ese lugar",
+        "observed": "lo que reporta la bibliografía citada para el mismo sitio",
     },
     "en": {
         "guideline": "the guideline value",
         "limit": "the limit",
         "typical_range": "the typical range",
-        "observed": "what was reported there",
+        "observed": "what the cited literature reports for the same site",
     },
 }
 _COMPARABLE_KINDS = ("guideline", "limit", "typical_range")
@@ -180,18 +181,49 @@ def verified_references(drafts, fragments, results, question, places=()) -> list
     verified = {}
     for draft in drafts:
         fragment = documents.get(draft.document_id)
-        result = _target(draft, results)
-        if fragment is None or result is None or fragment.doubts:
+        if fragment is None or fragment.doubts:
             continue
         draft = _with_stated_mean(_with_counted_unit(draft))
-        if not _literal(draft, fragment) or not _names_variable(draft, fragment, result):
+        if not _literal(draft, fragment) or _detection_limit(draft, fragment):
             continue
-        if not _in_variable_cell(draft, fragment, result) or _detection_limit(draft, fragment):
+        for result in _targets(draft, results):
+            if _names_variable(draft, fragment, result) and _in_variable_cell(draft, fragment, result):
+                _keep(verified, _reference(draft, fragment, result, asked, places))
+
+    return _headed_conditions(list(verified.values()), documents)
+
+
+#
+# Da como condición el título de su sección a los valores distintos de una misma guía que no la dicen,
+# sólo si esos títulos los distinguen: «8.7.1 Relatively low probability…» frente a «8.7.2 Moderate…».
+#
+def _headed_conditions(references, documents) -> list:
+    for group in _unconditioned_groups(references):
+        headings = {id(item): _heading(documents.get(item.evidence_id)) for item in group}
+        bounds = {(item.low, item.high) for item in group}
+        named = {
+            heading
+            for heading in headings.values()
+            if heading and not any(reading.values for reading in number_readings(heading))
+        }
+        if len(named) < len(bounds) or len(set(headings.values())) != len(group):
             continue
+        for item in group:
+            if item.condition is None:
+                item.condition = headings[id(item)]
 
-        _keep(verified, _reference(draft, fragment, result, asked, places))
+    return references
 
-    return list(verified.values())
+
+#
+# Devuelve el título más profundo de la sección de un fragmento, sin su numeración.
+#
+def _heading(fragment) -> str | None:
+    if fragment is None or not fragment.section:
+        return None
+
+    heading = _SECTION_NUMBER.sub("", fragment.section[-1]).strip(" .:")
+    return heading[:_MAX_CONDITION_CHARS] if len(heading.split()) >= _MIN_CONDITION_WORDS else None
 
 
 #
@@ -276,16 +308,18 @@ def _cell_of_variable(row, first_row, draft, result) -> bool:
 
 
 #
-# Devuelve el resultado al que se refiere una referencia propuesta.
+# Devuelve los resultados a los que se refiere una referencia propuesta: todos los que nombran su variable,
+# porque archivos distintos pueden medirla en unidades distintas.
 #
-def _target(draft, results):
+def _targets(draft, results):
     wanted = normalized_text(draft.variable)
-    for result in results:
-        names = (result.variable, result.column, result.label)
-        if any(normalized_text(name) == wanted for name in names):
-            return result
+    named = [
+        result
+        for result in results
+        if any(normalized_text(name) == wanted for name in (result.variable, result.column, result.label))
+    ]
 
-    return results[0] if len(results) == 1 else None
+    return named or (results[:1] if len(results) == 1 else [])
 
 
 #
@@ -370,6 +404,7 @@ def _reference(draft, fragment, result, asked, places) -> ReferenceValue:
     return ReferenceValue(
         evidence_id=fragment.evidence_id,
         result_field=result.field,
+        result_evidence_id=result.evidence_id,
         variable=result.variable,
         kind=_stated_kind(draft, fragment),
         low=draft.low,
@@ -491,23 +526,55 @@ def _unit_compatibility(draft, result):
 # Devuelve la identidad de una referencia, para no repetirla.
 #
 def _identity(reference):
-    return reference.result_field, reference.low, reference.high, reference.unit, reference.water_use
+    return (
+        reference.result_evidence_id,
+        reference.result_field,
+        reference.low,
+        reference.high,
+        reference.unit,
+        reference.water_use,
+    )
 
 
 #
 # Devuelve los contrastes verificados entre los resultados y sus referencias compatibles.
 #
 def comparison_facts(references, results, language) -> list[ComparisonFact]:
-    by_field = {item.field: item for item in results}
     comparable = most_specified(references)
     ambiguous = {id(item) for group in _unconditioned_groups(comparable) for item in group}
     facts = []
     for reference in comparable:
-        result = by_field.get(reference.result_field)
+        result = compared_result(reference, results)
         if id(reference) not in ambiguous and result is not None and result.values:
             facts.append(_comparison(reference, result, language))
 
     return facts
+
+
+#
+# Devuelve el resultado con que se verificó una referencia, sólo si mide en una unidad comparable.
+#
+def compared_result(reference, results):
+    matching = [
+        item
+        for item in results
+        if item.field == reference.result_field
+        and reference.result_evidence_id in (None, item.evidence_id)
+    ]
+    result = matching[0] if len(matching) == 1 else None
+    if result is None or result.unit_status == "dimensionless":
+        return result
+
+    own = comparable_unit(result.column, result.unit)
+
+    return result if comparable_unit(reference.quote, reference.unit) == own else None
+
+
+#
+# Indica si dos unidades son la misma magnitud con la misma base química.
+#
+def _same_unit(unit, other) -> bool:
+    return comparable_unit("", unit or "") == comparable_unit("", other or "")
 
 
 #
@@ -518,7 +585,7 @@ def most_specified(references) -> list:
     comparable = [item for item in references if item.status == "compatible" and _comparable(item)]
     groups = {}
     for item in comparable:
-        key = (item.result_field, item.kind, item.low, item.high, unit_key(item.unit or ""))
+        key = (item.result_evidence_id, item.result_field, item.kind, item.low, item.high, unit_key(item.unit or ""))
         groups.setdefault(key, []).append(item)
 
     kept = set()
@@ -539,7 +606,7 @@ def _unconditioned_groups(references) -> list[list]:
     groups = {}
     for item in references:
         if item.kind in _COMPARABLE_KINDS:
-            key = (item.result_field, item.kind, unit_key(item.unit or ""), item.water_use)
+            key = (item.result_evidence_id, item.result_field, item.kind, unit_key(item.unit or ""), item.water_use)
             groups.setdefault(key, []).append(item)
 
     return [
@@ -607,13 +674,26 @@ def _single_value(reference, result, language) -> str:
     value = f"{shown_value(result.values[0], language)}{unit}"
     position = _position(result.values[0], reference)
     target = _reference_text(reference, language, result.unit)
+    subject = _subject(result, language)
     if language == "en":
         words = {"below": "is below", "above": "is above", "within": "is within"}
-        return f"{result.label} ({value}) {words[position]} {target}."
+        return f"{subject} ({value}) {words[position]} {target}."
 
     words = {"below": "está por debajo de", "above": "está por encima de", "within": "está dentro de"}
 
-    return _contracted(f"{result.label} ({value}) {words[position]} {target}.")
+    return _contracted(f"{subject} ({value}) {words[position]} {target}.")
+
+
+#
+# Devuelve el resultado como sujeto de la oración, con su artículo: «El pH promedio», «La mediana de…».
+#
+def _subject(result, language) -> str:
+    if language == "en":
+        return f"The {result.label}"
+
+    feminine = calculation_noun(result.function, [result.variable], language)[1] if result.function else False
+
+    return f"{'La' if feminine else 'El'} {result.label}"
 
 
 #
@@ -667,7 +747,7 @@ def _bound(value, other) -> Decimal:
 #
 def _reference_text(reference, language, result_unit=None) -> str:
     kind = _KIND_LABELS[language][reference.kind]
-    written = result_unit or reference.unit
+    written = result_unit if result_unit and _same_unit(reference.unit, result_unit) else reference.unit
     unit = f" {format_unit(written)}" if written else ""
     details = [item for item in (_USE_LABELS[language].get(reference.water_use), reference.condition) if item]
     suffix = f" ({'; '.join(details)})" if details else ""
@@ -773,6 +853,7 @@ def _chart_line(chart, references, question, language):
         if item.kind in _LINE_KINDS
         and _single_bound(item) is not None
         and item.result_field == field.name
+        and (field.unit is None or _same_unit(item.unit, field.unit))
     ]
     compatible = [item for item in candidates if item.status == "compatible"]
     if not compatible:

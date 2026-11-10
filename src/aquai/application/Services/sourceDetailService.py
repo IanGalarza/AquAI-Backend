@@ -35,8 +35,23 @@ class SourceDetailService:
         source["queryable"] = any(dataset["queryable"] for dataset in source["datasets"])
         if self._documents and source["file_type"] in DOCUMENT_FILE_TYPES:
             source["document"] = await self._document_summary(source)
+            source["queryable"] = self._searchable_document(source, source_ready)
 
         return SourceDetailResponse.model_validate(source)
+
+    #
+    # Indica si el chat puede citar el documento: activo, preparado, indexado y sin repetir otra fuente.
+    #
+    @staticmethod
+    def _searchable_document(source: dict, ready: bool) -> bool:
+        document = source.get("document") or {}
+
+        return bool(
+            ready
+            and source["is_active"]
+            and str(source["semantic_index_status"]) == "ready"
+            and not document.get("duplicate_of_source_id")
+        )
 
     #
     # Devuelve el resumen del documento con el motivo del último fallo de indexación.

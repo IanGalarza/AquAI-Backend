@@ -21,6 +21,7 @@ class ColumnDetail(BaseModel):
     representation: str | None = None
     derived_from: str | None = None
     excluded_count: int | None = Field(default=None, ge=0)
+    censored_count: int | None = Field(default=None, ge=0)
     header_missing: bool = False
 
     #

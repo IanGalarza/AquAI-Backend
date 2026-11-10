@@ -179,6 +179,6 @@ def _threshold_text(operator, value) -> str:
 def _distinct_references(references) -> list:
     found = {}
     for item in references:
-        found.setdefault((item.result_field, item.low, item.high, item.evidence_id), item)
+        found.setdefault((item.result_evidence_id, item.result_field, item.low, item.high, item.evidence_id), item)
 
     return list(found.values())

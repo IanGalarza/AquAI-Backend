@@ -5,6 +5,7 @@ from decimal import Decimal
 from aquai.application.answering.presentation import format_number, format_unit
 from aquai.application.planning.temporalText import period_bounds
 from aquai.application.Rules.units import STACKED_HEADER_SEPARATOR
+from aquai.application.Rules.variables import VARIABLE_SYNONYMS
 from aquai.application.Rules.vocabulary import (
     NUMBER_WORDS,
     PLACE_NAME_LOWERCASE_WORDS,
@@ -48,6 +49,8 @@ _MONTHS = {
         "December",
     ),
 }
+_DATE_LABEL = re.compile(r"(?:fecha|date)\b", re.IGNORECASE)
+_MAX_ABBREVIATION = 4
 _GRAINS = {
     "es": {"year": "año", "month": "mes", "day": "día"},
     "en": {"year": "year", "month": "month", "day": "day"},
@@ -197,6 +200,18 @@ def dataset_label(name: str) -> str:
 
 
 #
+# Devuelve el nombre de una variable abreviada en su encabezado junto al nombre completo: «conductividad (Cond)».
+#
+def spoken_label(label: str) -> str:
+    plain = " ".join(re.sub(r"[\W_]+", " ", label.casefold()).split())
+    for group in VARIABLE_SYNONYMS:
+        if len(plain) <= _MAX_ABBREVIATION and plain in group[1:]:
+            return f"{group[0]} ({label})"
+
+    return label
+
+
+#
 # Devuelve la etiqueta de una columna sin su unidad.
 #
 def column_label(original_name: str, unit: str | None = None) -> str:
@@ -277,6 +292,8 @@ def calculation_noun(
 ) -> tuple[str, bool]:
     if function == "count" and not variables:
         return ("cantidad de registros", True) if language == "es" else ("number of records", False)
+    if function == "count_distinct" and len(variables) == 1 and _DATE_LABEL.match(str(variables[0])):
+        return ("cantidad de fechas distintas", True) if language == "es" else ("number of distinct dates", False)
     if function == "mean" and list(variables) == ["pH"]:
         return ("pH promedio" if language == "es" else "mean pH"), False
 

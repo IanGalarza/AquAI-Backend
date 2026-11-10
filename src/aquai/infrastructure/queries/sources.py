@@ -26,6 +26,7 @@ from aquai.application.contracts.retrieval import DatasetProvenance, VerifiedDat
 from aquai.application.contracts.routing import CatalogDataset
 from aquai.application.dtos.requests.listSources import SourceSort
 from aquai.application.errors import SourceNotFoundError
+from aquai.application.matching import aligned_span
 from aquai.application.Rules.documents import DOCUMENT_FILE_TYPES, TABULAR_FILE_TYPES
 from aquai.domain.enums.sourceStatus import ProcessingStatus
 from aquai.domain.models import Dataset, Document, Source
@@ -37,6 +38,7 @@ _ACCENTED = "áàäâãéèëêíìïîóòöôõúùüûñç"
 _UNACCENTED = "aaaaaeeeeiiiiooooouuuunc"
 _COLUMN_SUMMARY_KEYS = ("sql_name", "original_name", "sql_type", "unit")
 _MISSING_OBJECT_SQLSTATES = {"42P01", "42703", "42501"}
+_MIN_ANCHOR_WORD = 4
 
 
 #
@@ -255,10 +257,31 @@ class SqlAlchemySourceQueries:
                 )
                 for term, pattern in patterns.items():
                     statement = _matching_values_statement(table, columns, pattern, per_column)
-                    for row in connection.execute(statement).mappings():
-                        matches = result.setdefault(dataset.dataset_id, {})
-                        matches.setdefault(term, []).append(dict(row))
+                    rows = [dict(row) for row in connection.execute(statement).mappings()]
+                    rows += self._abbreviated_values(connection, table, columns, term, rows, per_column)
+                    if rows:
+                        result.setdefault(dataset.dataset_id, {})[term] = rows
         return result
+
+    #
+    # Devuelve los valores que escriben el término abreviado o completo («Pta Lara» y «Punta Lara»): busca
+    # candidatos con un patrón laxo y conserva sólo los que se alinean palabra por palabra.
+    #
+    @staticmethod
+    def _abbreviated_values(connection, table, columns, term, found, per_column):
+        pattern = _abbreviation_pattern(term)
+        if pattern is None:
+            return []
+
+        known = {(row["column"], row["value"]) for row in found}
+        statement = _matching_values_statement(table, columns, pattern, per_column)
+        return [
+            dict(row)
+            for row in connection.execute(statement).mappings()
+            if (row["column"], row["value"]) not in known
+            and isinstance(row["value"], str)
+            and (aligned_span(term, row["value"]) or aligned_span(row["value"], term))
+        ]
 
     #
     # Devuelve los valores distintos de columnas de texto de un dataset, con un tope por columna.
@@ -599,6 +622,19 @@ def _contains_patterns(terms: list[str]) -> dict[str, str]:
         if words:
             patterns[term] = "%" + "%".join(words) + "%"
     return patterns
+
+
+#
+# Devuelve el patrón laxo de un término de varias palabras: la inicial de cada una y la última completa,
+# para encontrar sus abreviaturas; None si el término tiene una sola palabra.
+#
+def _abbreviation_pattern(term: str) -> str | None:
+    accent_table = str.maketrans(_ACCENTED, _UNACCENTED)
+    words = re.findall(r"[^\W\d_]+", term.casefold().translate(accent_table))
+    if len(words) < 2 or len(words[-1]) < _MIN_ANCHOR_WORD:
+        return None
+
+    return "%" + "%".join([*(word[0] for word in words[:-1]), words[-1]]) + "%"
 
 
 #

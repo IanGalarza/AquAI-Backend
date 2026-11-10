@@ -279,7 +279,8 @@ def numeric_projection(name: str, values: list[object]) -> tuple[list[Decimal | 
     convertible = sum(number is not None for number in numbers)
     censored = sum(_is_censored(value) for value, number in zip(present, numbers) if number is None)
 
-    if not _mostly_numeric_with_gaps(convertible, censored, len(present)):
+    complete = convertible == len(present) and convert is not _number
+    if not complete and not _mostly_numeric_with_gaps(convertible, censored, len(present)):
         return None
 
     markers = [value for value, number in zip(present, numbers) if number is None]
@@ -301,11 +302,19 @@ def measurement_column(name: str) -> bool:
 
 
 #
-# Indica si la columna es mayormente numérica, con huecos o valores censurados, pero no completa.
+# Indica si la columna es mayormente numérica, con huecos o valores censurados, pero no completa: una completa
+# sólo se proyecta si su separador decimal está demostrado, porque la inferencia la dejó TEXT por ambigua.
 #
 def _mostly_numeric_with_gaps(convertible: int, censored: int, present: int) -> bool:
     measured = convertible + censored
     return convertible >= 2 and convertible != present and measured * 4 >= present * 3
+
+
+#
+# Cuenta los valores censurados de una columna, como «<0,01»: quedan fuera de la proyección numérica.
+#
+def censored_count(values: list[object]) -> int:
+    return sum(_is_censored(value) for value in values)
 
 
 #

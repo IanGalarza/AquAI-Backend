@@ -14,6 +14,7 @@ from aquai.application.contracts.routing import DatasetBinding
 from aquai.application.interfaces.retrieval import DatasetSemanticSearch
 from aquai.application.interfaces.sources import SourceQueries
 from aquai.application.matching import (
+    abbreviates,
     contains_phrase,
     formula_named,
     normalize_text,
@@ -183,12 +184,19 @@ def _has_inner_connector(text):
 
 
 #
+# Indica si un valor guardado escribe la mención como palabras completas o con abreviaturas.
+#
+def _names_value(stored, value) -> bool:
+    return contains_phrase(stored, value) or abbreviates(stored, value)
+
+
+#
 # Indica si un valor figura en los registros hallados como palabras completas.
 #
 def _stored_as_words(found, value):
     for rows in found.values():
         for row in rows.get(value, []):
-            if isinstance(row["value"], str) and contains_phrase(row["value"], value):
+            if isinstance(row["value"], str) and _names_value(row["value"], value):
                 return True
     return False
 
@@ -613,7 +621,7 @@ class RetrieveDatasetsService:
     def _value_matches(rows, value):
         columns = {}
         for row in rows:
-            if not (isinstance(row["value"], str) and contains_phrase(row["value"], value)):
+            if not (isinstance(row["value"], str) and _names_value(row["value"], value)):
                 continue
             match = columns.setdefault(
                 row["column"], ValueMatch(column=row["column"], values=[], rows=0)

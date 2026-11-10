@@ -9,6 +9,7 @@ from typing import NamedTuple
 
 from aquai.application.contracts.planning import (
     MAX_FILTER_VALUES,
+    CalculationSpec,
     ColumnRef,
     FilterSpec,
     GroupingSpec,
@@ -25,6 +26,7 @@ from aquai.application.contracts.routing import DataMention
 from aquai.application.errors import LLMProviderError, PlannerValidationError
 from aquai.application.interfaces.planning import PlannerProvider
 from aquai.application.interfaces.sources import SourceQueries
+from aquai.application.matching import abbreviates, contains_phrase, normalize_text
 from aquai.application.planning.context import (
     asked_extremes,
     build_planning_context,
@@ -33,6 +35,7 @@ from aquai.application.planning.context import (
     latest_requested,
     numeric_comparison,
     period_phrase,
+    requested_order,
     requested_periods,
     requested_statistics,
     requested_thresholds,
@@ -69,6 +72,7 @@ from aquai.application.planning.validation import (
     threshold_groups,
     validate_operations,
     validate_requested_scope,
+    validate_requested_variables,
     validate_selections,
     validate_temporal_scope,
     validate_text_orderings,
@@ -81,6 +85,8 @@ _MAX_ATTEMPTS = 2
 _CATEGORY_LENGTH = 80
 _EXTREME_ROWS = 5
 _EXTREME_SUFFIX = "_extreme"
+_ORDER_SUFFIX = "_ordered"
+_SAMPLING_DATES = "fechas_de_muestreo_distintas"
 _CATEGORY_PREFERENCE = ({"TEXT"}, {"DATE", "TIMESTAMP"})
 _MAX_PLAN_STEPS = 12
 _TEXT_CALCULATIONS = {"count", "count_distinct"}
@@ -90,6 +96,11 @@ _MAX_STEP_ID_LENGTH = 63
 _DISTINCT_TEXT_LIMIT = 500
 _GRAIN_NAMES = {"day": "día", "month": "mes", "year": "año"}
 _PERIOD_LITERAL = re.compile(r"(?:1[89]|2\d)\d{2}(?:-\d{1,2}(?:-\d{1,2}(?:[T ][\d:.]+)?)?)?")
+_SAMPLE_COUNT = re.compile(
+    r"\b(?:cu[aá]nt[oa]s|how\s+many|cantidad\s+de|n[uú]mero\s+de|number\s+of)\s+(?:muestras?|muestreos?|samples?)\b",
+    re.IGNORECASE,
+)
+_DATE_NAME = re.compile(r"(?:fecha|date)(?:_(?:de_)?(?:muestreo|toma|sampling))?")
 _HINTS = {
     "resultado inexistente": "Cada paso expone sólo las salidas de su dependencia: para un valor por categoría, "
     "agregá esa columna como group_by del aggregate y usá su output_name después.",
@@ -130,6 +141,9 @@ class _Requested(NamedTuple):
     follow_up: bool = False
     extreme: bool = False
     extreme_orders: frozenset = frozenset()
+    order: str | None = None
+    question: str = ""
+    value_matches: dict | None = None
 
 
 _UNRESTRICTED = _Requested(
@@ -393,6 +407,7 @@ class PlanQueryService:
             return self._over_budget(common)
 
         values = [item.text for item in data_mentions if item.kind == "value"]
+        variable_texts = [item.text for item in data_mentions if item.kind == "variable"]
         asks_dimension = not dated_only and (
             bool(retrieval.dimension_mentions)
             or any(item.kind == "dimension" for item in data_mentions)
@@ -416,7 +431,10 @@ class PlanQueryService:
             chart_required=chart_required,
             values=values,
             categories=asks_dimension,
-            several_rows=asks_dimension or limits[0] is not None or len(values) > 1,
+            several_rows=asks_dimension
+            or limits[0] is not None
+            or len(values) > 1
+            or requested_order(asked, variable_texts) is not None,
             time_grain=grain,
             grouping=grain or (None if regrouped else conserved_time_grain(previous_analysis)),
             stale=tuple(stale_values(previous_analysis, data_mentions)),
@@ -425,6 +443,15 @@ class PlanQueryService:
             follow_up=previous_analysis is not None,
             extreme=extreme_requested(asked),
             extreme_orders=frozenset() if dated_only else frozenset(asked_extremes(asked, named)),
+            order=None if dated_only else requested_order(asked, variable_texts),
+            question=asked,
+            value_matches={
+                item.dataset_id: {
+                    mention: [(match.column, match.values) for match in matches]
+                    for mention, matches in item.value_matches.items()
+                }
+                for item in evidence
+            },
         )
         verify = partial(
             self._verify,
@@ -1034,16 +1061,24 @@ class PlanQueryService:
                     decision.output_steps,
                     thresholds=requested.thresholds,
                     statistics=requested.statistics,
-                    extreme=bool(requested.extreme_orders),
+                    extreme=requested.extreme_orders,
                     dimensions=requested.dimensions,
                     categories=requested.categories,
                     chart=requested.chart_required,
                     time_grain=requested.time_grain,
                     periods=requested.periods,
                     dated_columns=period_columns(selected, periods),
+                    order=requested.order,
+                    variables=requested.variables,
                 )
             )
             issues.extend(validate_text_orderings(operations, requested.variables or {}))
+            if requested.follow_up:
+                issues.extend(
+                    validate_requested_variables(
+                        operations, decision.output_steps, requested.variables or {}
+                    )
+                )
             if not requested.latest_allowed:
                 issues.extend(
                     validate_unrequested_latest(
@@ -1067,8 +1102,10 @@ class PlanQueryService:
         decision = PlanQueryService._unrequested_charts(decision, requested.chart)
         decision = PlanQueryService._single_row_republications(decision, {"latest"})
         decision = PlanQueryService._unpublished_branches(decision)
-        decision = PlanQueryService._parallel_branches(decision, requested.variables)
+        decision = PlanQueryService._parallel_branches(decision, requested.variables, requested.values)
+        decision = PlanQueryService._omitted_values(decision, requested)
         decision = PlanQueryService._unranked_extremes(decision, catalog, requested)
+        decision = PlanQueryService._unordered_records(decision, catalog, requested)
         decision = PlanQueryService._projected_orderings(decision, catalog)
         decision = PlanQueryService._text_measurement_branches(decision, catalog, requested.variables)
         decision = PlanQueryService._result_references(decision)
@@ -1081,6 +1118,8 @@ class PlanQueryService:
         if not requested.several_rows:
             decision = PlanQueryService._single_row_republications(decision, {"sort"})
         decision = PlanQueryService._extremes_as_sort(decision, catalog)
+        decision = PlanQueryService._misdirected_extremes(decision, requested)
+        decision = PlanQueryService._sampling_events(decision, catalog, requested.question)
         if requested.extreme:
             decision = PlanQueryService._extreme_rankings(decision, catalog)
         decision = PlanQueryService._measured_latest(decision, requested.variables)
@@ -1281,7 +1320,7 @@ class PlanQueryService:
     # Publica las ramas paralelas olvidadas que calculan lo mismo sobre otro dataset con la variable pedida.
     #
     @staticmethod
-    def _parallel_branches(decision, variables):
+    def _parallel_branches(decision, variables, mentions=()):
         if decision.status != "plannable":
             return decision
 
@@ -1290,7 +1329,7 @@ class PlanQueryService:
         chains = [
             PlanQueryService._published_chain(steps.get(key), steps) for key in decision.output_steps
         ]
-        shapes = {PlanQueryService._parallel_shape(chain) for chain in chains if chain}
+        shapes = {PlanQueryService._parallel_shape(chain, mentions) for chain in chains if chain}
         read = {
             chain[-1].columns[0].dataset_id
             for chain in chains
@@ -1307,7 +1346,7 @@ class PlanQueryService:
             if (
                 source is None
                 or dataset_id in read
-                or PlanQueryService._parallel_shape(chain) not in shapes
+                or PlanQueryService._parallel_shape(chain, mentions) not in shapes
                 or not measured & {ref.column for ref in source.columns}
             ):
                 continue
@@ -1317,6 +1356,52 @@ class PlanQueryService:
         if not forgotten or len(decision.output_steps) + len(forgotten) > _MAX_PLAN_STEPS:
             return decision
         return decision.model_copy(update={"output_steps": [*decision.output_steps, *forgotten]})
+
+    #
+    # Repone en una salida el filtro de un valor pedido que el modelo omitió, si en ese dataset el valor figura en
+    # una sola columna: se filtra por los valores guardados que lo escriben («PUNTA LARA» para «pta lara»).
+    #
+    @staticmethod
+    def _omitted_values(decision, requested):
+        if decision.status != "plannable" or not requested.values or not requested.value_matches:
+            return decision
+
+        changed, modified = decision.model_copy(deep=True), False
+        steps = {step.id: step for step in changed.steps}
+        for key in changed.output_steps:
+            chain = PlanQueryService._published_chain(steps.get(key), steps)
+            read = chain[-1] if chain and chain[-1].operation == "read" and chain[-1].columns else None
+            if read is None:
+                continue
+
+            dataset_id = read.columns[0].dataset_id
+            filtered = [
+                value
+                for step in chain
+                for predicate in step.filters
+                if predicate.operator in {"eq", "ieq", "in"}
+                for value in predicate.values
+                if isinstance(value, str)
+            ]
+            for mention in requested.values:
+                matches = requested.value_matches.get(dataset_id, {}).get(mention, [])
+                kept = any(
+                    PlanQueryService._filtered_mention(value, [mention]) == normalize_text(mention)
+                    for value in filtered
+                )
+                if kept or len(matches) != 1 or not 0 < len(matches[0][1]) <= MAX_FILTER_VALUES:
+                    continue
+
+                column, values = matches[0]
+                field = ColumnRef(kind="column", dataset_id=dataset_id, column=column)
+                read.filters.append(FilterSpec(field=field, operator="in", values=list(values)))
+                if column not in {ref.column for ref in read.columns}:
+                    read.columns.append(field)
+                for selection in changed.datasets:
+                    if selection.dataset_id == dataset_id and column not in selection.columns:
+                        selection.columns.append(column)
+                modified = True
+        return changed if modified else decision
 
     #
     # Cambia por su proyección numérica las mediciones TEXT por las que ordena una rama, con sus referencias.
@@ -1422,10 +1507,10 @@ class PlanQueryService:
     # Devuelve la forma de una rama: sus operaciones y los valores de texto que filtra.
     #
     @staticmethod
-    def _parallel_shape(chain):
+    def _parallel_shape(chain, mentions=()):
         values = sorted(
             {
-                str(value).casefold()
+                PlanQueryService._filtered_mention(value, mentions)
                 for step in chain
                 for predicate in step.filters
                 if predicate.operator in {"eq", "ieq", "in"}
@@ -1434,6 +1519,19 @@ class PlanQueryService:
             }
         )
         return PlanQueryService._branch_shape(chain), tuple(values)
+
+    #
+    # Devuelve la mención pedida que representa un valor de filtro («Balneario Bagliardi» es «Bagliardi»),
+    # o el valor mismo: dos ramas que filtran el mismo lugar con etiquetas distintas son paralelas.
+    #
+    @staticmethod
+    def _filtered_mention(value, mentions):
+        named = [
+            mention
+            for mention in mentions
+            if contains_phrase(value, mention) or abbreviates(value, mention)
+        ]
+        return normalize_text(named[0]) if len(named) == 1 else str(value).casefold()
 
     #
     # Devuelve las operaciones de una rama sin filtros ni columnas: cálculos y agrupaciones temporales.
@@ -2147,6 +2245,166 @@ class PlanQueryService:
             changed.steps.append(sort)
             changed.output_steps[index], modified = sort.id, True
         return changed if modified else decision
+
+    #
+    # Ordena en el sentido pedido («de mayor a menor») las salidas que publican la variable sin ordenarla:
+    # un read de registros recibe el orden; un aggregate agrupado, un sort por su único cálculo.
+    #
+    @staticmethod
+    def _unordered_records(decision, catalog, requested):
+        if decision.status != "plannable" or requested.order is None or requested.extreme_orders:
+            return decision
+
+        types = _column_types(catalog)
+        changed, modified = decision.model_copy(deep=True), False
+        steps = {step.id: step for step in changed.steps}
+        for index, key in enumerate(changed.output_steps):
+            step = steps.get(key)
+            if PlanQueryService._reversed_order(step, steps, requested.variables, requested.order):
+                modified = True
+                continue
+
+            measured = PlanQueryService._extreme_column(step, requested.variables, types)
+            if measured is not None:
+                step.order_by = [OrderingSpec(field=measured, direction=requested.order)]
+                modified = True
+                continue
+
+            sort = PlanQueryService._ordered_aggregate(step, steps, requested)
+            if sort is not None and len(changed.steps) < _MAX_PLAN_STEPS:
+                changed.steps.append(sort)
+                changed.output_steps[index], modified = sort.id, True
+        return changed if modified else decision
+
+    #
+    # Invierte el orden de la salida que ordena por la variable pedida, sin límite, en el sentido contrario.
+    #
+    @staticmethod
+    def _reversed_order(step, steps, variables, order, *, limited=False):
+        if step is not None and step.operation == "visualize" and step.depends_on:
+            step = steps.get(step.depends_on[0])
+        if step is None or not step.order_by or step.operation == "latest":
+            return False
+        if step.limit is not None and not limited:
+            return False
+
+        first = step.order_by[0]
+        name = first.field.field if isinstance(first.field, ResultRef) else first.field.column
+        asked = {column for columns in (variables or {}).values() for column in columns}
+        if name not in asked or first.direction == order:
+            return False
+
+        first.direction = order
+        return True
+
+    #
+    # Cuando se preguntan muestras, agrega a cada conteo de filas las fechas de muestreo distintas: en una tabla
+    # con una fila por taxón o parámetro, las filas no son muestras y la respuesta debe poder distinguirlos.
+    #
+    @staticmethod
+    def _sampling_events(decision, catalog, question):
+        if decision.status != "plannable" or _SAMPLE_COUNT.search(question) is None:
+            return decision
+
+        types = _column_types(catalog)
+        changed, modified = decision.model_copy(deep=True), False
+        steps = {step.id: step for step in changed.steps}
+        for key in changed.output_steps:
+            count = _passthrough_origin(steps.get(key), steps)
+            read = steps.get(count.depends_on[0]) if count is not None and count.depends_on else None
+            date = PlanQueryService._sampling_date(count, read, types)
+            if date is None:
+                continue
+
+            if date not in {ref.column for ref in read.columns}:
+                read.columns.append(ColumnRef(kind="column", dataset_id=read.columns[0].dataset_id, column=date))
+            for selection in changed.datasets:
+                if selection.dataset_id == read.columns[0].dataset_id and date not in selection.columns:
+                    selection.columns.append(date)
+            count.calculations.append(
+                CalculationSpec(
+                    function="count_distinct",
+                    inputs=[ResultRef(kind="result", step_id=read.id, field=date)],
+                    output_name=_SAMPLING_DATES,
+                )
+            )
+            modified = True
+        return changed if modified else decision
+
+    #
+    # Devuelve la columna de fecha con que contar muestreos bajo un conteo de filas sin agrupar por fecha.
+    #
+    @staticmethod
+    def _sampling_date(count, read, types):
+        counts_rows = (
+            count is not None
+            and count.operation == "aggregate"
+            and [item.function for item in count.calculations] == ["count"]
+            and not count.calculations[0].inputs
+        )
+        if not counts_rows or read is None or read.operation != "read" or not read.columns:
+            return None
+
+        dataset_id = read.columns[0].dataset_id
+        dated = [
+            name
+            for (owner, name), sql_type in types.items()
+            if owner == dataset_id and (sql_type in {"DATE", "TIMESTAMP"} or _DATE_NAME.fullmatch(name))
+        ]
+        grouped = {getattr(item.field, "field", None) for item in count.group_by}
+        if len(dated) != 1 or dated[0] in grouped:
+            return None
+
+        return dated[0]
+
+    #
+    # Invierte el sort de un extremo que ordena la variable al revés de lo pedido («la turbiedad mínima»).
+    #
+    @staticmethod
+    def _misdirected_extremes(decision, requested):
+        if decision.status != "plannable" or len(requested.extreme_orders) != 1:
+            return decision
+
+        order = next(iter(requested.extreme_orders))
+        changed = decision.model_copy(deep=True)
+        steps = {step.id: step for step in changed.steps}
+        reversed_steps = [
+            PlanQueryService._reversed_order(steps.get(key), steps, requested.variables, order, limited=True)
+            for key in changed.output_steps
+        ]
+        return changed if any(reversed_steps) else decision
+
+    #
+    # Devuelve el sort por el único cálculo de un aggregate agrupado que mide la variable pedida.
+    #
+    @staticmethod
+    def _ordered_aggregate(step, steps, requested):
+        unordered = step is not None and step.operation == "aggregate" and step.group_by and not step.order_by
+        if not unordered or len(step.calculations) != 1 or step.id in {
+            key for other in steps.values() for key in other.depends_on
+        }:
+            return None
+
+        calculation = step.calculations[0]
+        read = _passthrough_origin(steps.get(step.depends_on[0]), steps)
+        asked = (requested.variables or {}).get(read.columns[0].dataset_id, set()) if read and read.columns else set()
+        operands = {item.field if isinstance(item, ResultRef) else item.column for item in calculation.inputs}
+        if calculation.function in _TEXT_CALCULATIONS or not operands & asked:
+            return None
+
+        return SortPlanStep(
+            id=f"{step.id[: _MAX_STEP_ID_LENGTH - len(_ORDER_SUFFIX)]}{_ORDER_SUFFIX}",
+            tool="sql",
+            operation="sort",
+            depends_on=[step.id],
+            order_by=[
+                OrderingSpec(
+                    field=ResultRef(kind="result", step_id=step.id, field=calculation.output_name),
+                    direction=requested.order,
+                )
+            ],
+            purpose="Ordenar el resultado en el sentido que pide la consulta.",
+        )
 
     #
     # Devuelve la columna de la variable pedida en un read sin orden ni límite, si es inequívoca.

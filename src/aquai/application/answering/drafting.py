@@ -1,9 +1,10 @@
 import json
+import re
 from dataclasses import dataclass, field
 from hashlib import sha256
 
 from aquai.application.answering.measures import measured_results, shown_value
-from aquai.application.answering.readings import number_readings, sentences, without_numbers
+from aquai.application.answering.readings import folded, number_readings, sentences, without_numbers
 from aquai.application.answering.references import documented_guidelines
 from aquai.application.answering.verification import (
     DraftEvidence,
@@ -60,6 +61,10 @@ _LISTING_MARKS = 3
 _MAX_RESTORED_COMPARISONS = 2
 _MAX_FACT_VALUES = 400
 _MAX_PREVIOUS_ANSWER = 1500
+_WORD = re.compile(r"[^\W\d_]+")
+_STEM = 5
+_SHORT_WORD = 3
+_REPEATED_SHARE = 0.7
 _CORRECTIONS = {
     "unsupported_place": "el fragmento no nombra ese lugar: atribuí el dato al estudio o sistema que sí nombra",
     "unsupported_unit": "copiá la unidad tal como figura junto a ese número en la evidencia",
@@ -410,11 +415,13 @@ def _retaken_facts(analyses, fragments) -> dict:
 
 
 #
-# Devuelve el hecho de un párrafo retomado: un resultado, o un contraste con su documento a la vista.
+# Devuelve el hecho de un párrafo retomado: un resultado (también el párrafo determinista que cita evidencia),
+# o un contraste con su documento a la vista.
 #
 def _retaken_entry(segment, documents):
     text = segment.get("text", "")
-    if segment.get("role") == "result":
+    deterministic = segment.get("role") is None and segment.get("kind", "paragraph") == "paragraph"
+    if segment.get("role") == "result" or (deterministic and segment.get("evidence_ids")):
         return {"kind": "result", "direct": text, "evidence_ids": [], "attachment": None}
 
     written = [name for name, pattern in COMPARISON_DIRECTIONS.items() if pattern.search(text)]
@@ -745,10 +752,25 @@ def _segment(item, catalog, language) -> AnswerSegment:
     return AnswerSegment(
         role=item.role,
         text=text,
-        items=[entry.strip() for entry in item.items if entry.strip()],
+        items=[entry.strip() for entry in item.items if entry.strip() and not _repeats(entry, text)],
         evidence_ids=list(dict.fromkeys(evidence_ids)),
         document_ids=list(dict.fromkeys(item.document_ids)),
     )
+
+
+#
+# Indica si una viñeta sólo repite su párrafo: mismos números y casi todas sus palabras ya dichas.
+#
+def _repeats(entry, text) -> bool:
+    values = {value for reading in number_readings(text) for value in reading.values}
+    numbers = [reading.values for reading in number_readings(entry)]
+    if any(not found & values for found in numbers):
+        return False
+
+    said = {word[:_STEM] for word in _WORD.findall(folded(text))}
+    words = [word[:_STEM] for word in _WORD.findall(folded(entry)) if len(word) > _SHORT_WORD]
+
+    return bool(words) and sum(word in said for word in words) >= _REPEATED_SHARE * len(words)
 
 
 #

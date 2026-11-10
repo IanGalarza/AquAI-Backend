@@ -9,6 +9,7 @@ from aquai.application.contracts.planning import (
 )
 from aquai.application.contracts.retrieval import VerifiedDataset
 from aquai.application.matching import (
+    aligned_span,
     contains_any_phrase,
     contains_phrase,
     normalize_text,
@@ -17,14 +18,17 @@ from aquai.application.matching import (
     period_text,
 )
 from aquai.application.Rules.vocabulary import (
+    ASCENDING_ORDER_CUES,
     CHART_WORDS,
     COUNT_BOUNDS,
+    DESCENDING_ORDER_CUES,
     FULL_ORDER_CUES,
     HIGHEST_CUES,
     LOWEST_CUES,
     NUMBER_WORDS,
     OBSERVATION_NOUNS_EN,
     OBSERVATION_NOUNS_ES,
+    ORDER_KEY,
     RECENT_INTERVAL_NOUNS,
     RECENT_WORDS,
     REQUESTED_STATISTICS,
@@ -65,6 +69,8 @@ _LATEST = re.compile(
     re.IGNORECASE,
 )
 _SUPERLATIVE = re.compile(SUPERLATIVE_WORDS)
+_ORDER_KEY = re.compile(ORDER_KEY, re.IGNORECASE)
+_VALUE_WORDS = {"valor", "valores", "value", "values", "magnitud", "concentracion", "nivel", "niveles"}
 _COUNT_BOUND = re.compile(COUNT_BOUNDS)
 
 
@@ -97,6 +103,35 @@ def extreme_orders(question: str) -> set[str]:
     }
 
     return {order for order, found in asked.items() if found}
+
+
+#
+# Devuelve el sentido del orden completo que pide la pregunta por la variable («de mayor a menor»), o None si
+# no lo dice o si ordena por otra cosa («ordenada por fecha de menor a mayor»).
+#
+def requested_order(question: str, variables=()) -> str | None:
+    key = _ORDER_KEY.search(question)
+    if key is not None and not _names_value(key.group("key"), variables):
+        return None
+
+    found = {
+        "desc": contains_any_phrase(question, DESCENDING_ORDER_CUES),
+        "asc": contains_any_phrase(question, ASCENDING_ORDER_CUES),
+    }
+    directions = [direction for direction, asked in found.items() if asked]
+
+    return directions[0] if len(directions) == 1 else None
+
+
+#
+# Indica si la clave de un orden nombra el valor medido o una de las variables pedidas.
+#
+def _names_value(key, variables) -> bool:
+    word = normalize_text(key)
+    if word in _VALUE_WORDS:
+        return True
+
+    return any(aligned_span(key, variable) for variable in variables)
 
 
 #

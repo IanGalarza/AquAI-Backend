@@ -3,7 +3,7 @@ from datetime import date
 from decimal import Decimal
 
 from aquai.application.answering.presentation import format_number
-from aquai.application.answering.wording import date_text, join_words
+from aquai.application.answering.wording import date_text, file_stem, join_words
 from aquai.application.execution import execution_records
 
 _CHARTS = {
@@ -90,7 +90,7 @@ def blocked_explanations(state, language) -> list[str]:
         if record.status not in _FAILED_STATUSES or step is None:
             continue
 
-        text = _explanation(step, record, records, language)
+        text = _explanation(step, record, records, language, _chart_file(step, steps, state))
         if text is None:
             unexplained = True
         else:
@@ -105,10 +105,10 @@ def blocked_explanations(state, language) -> list[str]:
 #
 # Elige la explicación de una operación fallida según su código de error.
 #
-def _explanation(step, record, records, language):
+def _explanation(step, record, records, language, file=None):
     code = record.error.code if record.error else None
     if step.operation == "visualize" and code in _CHART_REASONS[language]:
-        return _chart_explanation(step, code, records, language)
+        return _chart_explanation(step, code, records, language, file)
     if code in _GROUPS:
         return _REASONS[language][_GROUPS[code]]
 
@@ -116,9 +116,33 @@ def _explanation(step, record, records, language):
 
 
 #
+# Devuelve el archivo del que lee un gráfico, sólo si el plan lee varios archivos y hace falta distinguirlo.
+#
+def _chart_file(step, steps, state):
+    files = {
+        item.dataset_id: file_stem(item.provenance.original_filename)
+        for item in (state.retrieval.candidates if state.retrieval else [])
+    }
+    read_files = {
+        files.get(ref.dataset_id)
+        for item in steps.values()
+        if item.operation == "read"
+        for ref in item.columns[:1]
+    }
+    if step.operation != "visualize" or len(read_files) < 2:
+        return None
+
+    current = step
+    while current is not None and current.operation != "read" and current.depends_on:
+        current = steps.get(current.depends_on[0])
+
+    return files.get(current.columns[0].dataset_id) if current is not None and current.columns else None
+
+
+#
 # Explica por qué no se pudo armar un gráfico, con ejemplos de categorías repetidas si aplica.
 #
-def _chart_explanation(step, code, records, language):
+def _chart_explanation(step, code, records, language, file=None):
     examples = _repeated(step, records, language) if code == "ambiguous_chart_granularity" else ""
     lead = (
         "No pude armar {chart} porque "
@@ -126,6 +150,8 @@ def _chart_explanation(step, code, records, language):
         else "I could not build {chart} because "
     )
     chart = _CHARTS[language][step.visualization.chart_type]
+    if file:
+        chart += f" del archivo {file}" if language == "es" else f" for the file {file}"
 
     return lead.format(chart=chart) + _CHART_REASONS[language][code].format(examples=examples)
 

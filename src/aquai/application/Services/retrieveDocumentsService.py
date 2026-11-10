@@ -17,9 +17,12 @@ from aquai.application.interfaces.documents import (
     DocumentQueries,
 )
 from aquai.application.matching import names_subject, variable_name, variable_variants
+from aquai.application.planning.context import extreme_requested
 from aquai.application.Rules.documents import normalized_text
 from aquai.application.Rules.evidence import (
+    INTERPRETATION_CUES,
     PRINTED_FIGURE_TEXT,
+    REFERENCE_LINE_CUES,
     REFERENCE_REQUEST_CLAUSE,
 )
 from aquai.application.units import counts_organisms
@@ -253,12 +256,13 @@ def _question_request(state) -> _Request:
 
     context = _conversation_context(state)
     focus = f"{state.question} (contexto: {' | '.join(context)})" if context else state.question
+    cited = _cited_requests(state)
 
     return _Request(
         purpose="question",
-        requests=[state.question],
+        requests=[state.question, *cited],
         focus=focus[:_MAX_FOCUS_CHARS],
-        lexical=[0],
+        lexical=list(range(len(cited) + 1)),
         context=context,
         document_ids=routing.document_ids,
         subject=_cited_variables(state),
@@ -302,6 +306,23 @@ def _conversation_context(state) -> list[str]:
 
 
 #
+# Devuelve las búsquedas del análisis que retoma un seguimiento («¿Eso es mucho?»): la variable en su sitio y
+# sus valores de referencia, para no depender de que el modelo conserve el lugar al reformular.
+#
+def _cited_requests(state) -> list[str]:
+    cited = set(state.routing.history_message_ids)
+    scope = [mention for item in state.conversation_history if item.message_id in cited for mention in item.scope]
+    variables = list(dict.fromkeys(variable_name(item.text) for item in scope if item.kind == "variable"))
+    places = " ".join(dict.fromkeys(item.text for item in scope if item.kind == "value"))
+    requests = []
+    for variable in variables[:_MAX_VARIABLES]:
+        requests.append(f"{variable} {places}".strip())
+        requests.append(f"{variable}: valores de referencia, guías o límites")
+
+    return requests
+
+
+#
 # Devuelve las variables del análisis que un seguimiento retoma, con sus nombres equivalentes.
 #
 def _cited_variables(state) -> list[str]:
@@ -315,6 +336,22 @@ def _cited_variables(state) -> list[str]:
     ]
 
     return [name for mention in mentions for name in variable_variants(variable_name(mention))]
+
+
+#
+# Indica si el resultado sólo lista registros, sin cálculos ni gráficos: no hay nada que interpretar.
+#
+def _lists_records(results, charted) -> bool:
+    return not charted and all(getattr(item, "function", None) is None for item in results)
+
+
+#
+# Indica si la pregunta pide interpretar el resultado, compararlo con valores de referencia o un extremo.
+#
+def _asks_meaning(question) -> bool:
+    asked = INTERPRETATION_CUES.search(question) or REFERENCE_LINE_CUES.search(question)
+
+    return bool(asked) or extreme_requested(question)
 
 
 #
@@ -335,6 +372,8 @@ def _result_request(state) -> _Request | None:
     results = measured_results(state, language)
     charted = state.python_execution is not None and state.python_execution.visualizations
     if not results or not (charted or any(item.values for item in results)):
+        return None
+    if _lists_records(results, charted) and not _asks_meaning(state.routing.original_question):
         return None
 
     variables = list(dict.fromkeys(_searched_name(item) for item in results))[:_MAX_VARIABLES]

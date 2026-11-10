@@ -8,7 +8,7 @@ from aquai.application.contracts.planning import (
     ValidationIssue,
 )
 from aquai.application.contracts.retrieval import RetrievedColumn
-from aquai.application.matching import contains_phrase
+from aquai.application.matching import abbreviates, contains_phrase
 
 _MAX_EXPANDED_VALUES = 30
 _EQUALITY_OPERATORS = {"eq", "ieq", "in"}
@@ -29,6 +29,7 @@ def _overlaps(value, mention) -> bool:
         value.casefold() == mention.casefold()
         or contains_phrase(value, mention)
         or contains_phrase(mention, value)
+        or abbreviates(value, mention)
     )
 
 
@@ -173,9 +174,31 @@ class _FilterValueResolver:
                         resolved=matches[0],
                     )
                 )
-            return [matches[0]]
+            return [matches[0], *await self._abbreviated_siblings(target, value, matches[0])]
 
         return await self._resolve_by_containment(target, value)
+
+    #
+    # Devuelve las otras grafías abreviadas del mismo valor en la columna («Pta Lara» junto a «Punta Lara»),
+    # que también se filtran y quedan registradas como resolución.
+    #
+    async def _abbreviated_siblings(self, target: _FilterTarget, value: str, exact) -> list:
+        mention = _mention_for(value, self._requested) or value
+        siblings = [
+            item
+            for item in await self._containing_values(target, mention)
+            if item != exact and abbreviates(item, mention)
+        ]
+        self._resolutions.extend(
+            FilterValueResolution(
+                dataset_id=target.ref.dataset_id,
+                column=target.ref.column,
+                requested=value,
+                resolved=item,
+            )
+            for item in siblings
+        )
+        return siblings
 
     #
     # Devuelve los valores almacenados de la columna que igualan al valor, usando caché.
@@ -268,7 +291,7 @@ class _FilterValueResolver:
         return [
             item
             for item in dict.fromkeys(candidates)
-            if isinstance(item, str) and contains_phrase(item, mention)
+            if isinstance(item, str) and (contains_phrase(item, mention) or abbreviates(item, mention))
         ]
 
     #

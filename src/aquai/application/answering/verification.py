@@ -57,6 +57,7 @@ _BOUNDS = {"<", ">", "≤", "≥"}
 _LABEL_WINDOW = 8
 _MIN_ROOT = 4
 _FLEXION_CHARS = 2
+_COUNTED_SAMPLES = re.compile(r"(?:\d[\d.,]*|\buna?)\s+(?:muestras?|samples?)\b", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -436,8 +437,20 @@ class DraftVerifier:
             if _root(word) not in known
         ]
         rejections = [Rejection("unsupported_result_word", word) for word in dict.fromkeys(unknown)]
+        rejections += self._unsupported_samples(text, cited)
 
         return [*rejections, *self._misaligned(text, list(dict.fromkeys([*cited, *rivals])))]
+
+    #
+    # Rechaza llamar muestras a lo que los hechos cuentan como registros o fechas: una fila por taxón o por
+    # parámetro no es una muestra, aunque la pregunta diga «muestras».
+    #
+    @staticmethod
+    def _unsupported_samples(text, cited) -> list[Rejection]:
+        if any(_COUNTED_SAMPLES.search(fact) for fact in cited):
+            return []
+
+        return [Rejection("unsupported_count_noun", match.group()) for match in _COUNTED_SAMPLES.finditer(text)]
 
     #
     # Revisa que cada número de un resultado acompañe a la variable o el lugar que le corresponde.

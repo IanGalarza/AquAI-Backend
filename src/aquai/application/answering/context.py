@@ -28,6 +28,7 @@ from aquai.application.answering.wording import (
     period,
     place_text,
     sentence,
+    spoken_label,
     unit_suffix,
     with_article,
 )
@@ -434,7 +435,7 @@ class _Writer:
             return None
 
         named = _column_metadata(dataset, column.derived_from) or column
-        label = column_label(named.original_name, named.unit)
+        label = spoken_label(column_label(named.original_name, named.unit))
 
         return label if len(label) <= _MAX_LABEL_LENGTH else column.sql_name
 
@@ -1554,11 +1555,14 @@ class _Writer:
         else:
             label = humanize(column.derived_from)
         excluded = column.excluded_count
+        censored = min(getattr(column, "censored_count", None) or 0, excluded)
+        if censored:
+            return self._censored_projection(label, excluded, censored)
 
         if self.es:
             unreadable = self.count(
                 excluded,
-                "un valor que no se pudo leer como número queda",
+                "valor que no se pudo leer como número queda",
                 "valores que no se pudieron leer como número quedan",
             )
             return (
@@ -1573,6 +1577,35 @@ class _Writer:
         )
 
         return f"{label} is used in its numeric version: in the source table, {unreadable} empty."
+
+    #
+    # Redacta la nota de una columna con valores bajo el límite de detección: no entran en los cálculos, así
+    # que un mínimo o un promedio describen sólo los valores detectados.
+    #
+    def _censored_projection(self, label, excluded, censored):
+        others = excluded - censored
+        if self.es:
+            below = self.count(
+                censored,
+                "valor está informado como menor que un límite de detección o cuantificación («<…»)",
+                "valores están informados como menores que un límite de detección o cuantificación («<…»)",
+            )
+            rest = f" y {self.count(others, 'valor más no se pudo leer', 'valores más no se pudieron leer')}" if others else ""
+            return (
+                f"En la columna {label}, {below}{rest}: no entran en los cálculos, así que el mínimo y el "
+                "promedio describen sólo los valores cuantificados."
+            )
+
+        below = self.count(
+            censored,
+            "value is reported as below a detection or quantification limit («<…»)",
+            "values are reported as below a detection or quantification limit («<…»)",
+        )
+        rest = f" and {self.count(others, 'more value could not be read', 'more values could not be read')}" if others else ""
+        return (
+            f"In {label}, {below}{rest}: they are left out of the calculations, so the minimum and the mean "
+            "describe only the quantified values."
+        )
 
     #
     # Devuelve las notas sobre registros excluidos o divisiones por cero en los cálculos.
@@ -1879,6 +1912,8 @@ def _trace_origin(step, steps):
         elif ranking is None and origin.order_by:
             ranking = origin
         origin = steps[origin.depends_on[0]]
+    if ranking is None and origin.operation == "read" and origin.order_by:
+        ranking = origin
 
     return origin, latest, ranking
 

@@ -17,6 +17,7 @@ from aquai.application.Rules.variables import (
     WATER_WORDS,
 )
 from aquai.application.Rules.vocabulary import (
+    INNER_STATISTIC_WORDS,
     COMPARED_STATISTICS,
     COMPARISON_ARTICLES,
     COMPARISON_BOUNDARIES,
@@ -50,6 +51,11 @@ from aquai.application.Rules.evidence import (
 _SHORT_TERM = 4
 _MIN_TERM_ROOT = 4
 _TERM_FLEXION_CHARS = 2
+_MIN_PREFIX = 4
+_MIN_CONTRACTION = 3
+_MAX_CONTRACTION = 4
+_MIN_TYPO_WORD = 5
+_LONG_WORD = 8
 from aquai.application.units import comparable_unit, unit_key, unitless_name
 
 _LETTER_DIGIT_BOUNDARY = re.compile(r"(?<=\d)(?=[^\W\d_])|(?<=[^\W\d_])(?=\d)")
@@ -382,7 +388,7 @@ def secondary_quantity(name: str, unit: str | None, phrase: str) -> bool:
 # Devuelve la variable normalizada sin las estadísticas que la acompañan.
 #
 def variable_core(phrase: str) -> str:
-    words = normalize_text(phrase).split()
+    words = _without_inner_statistics(normalize_text(phrase).split())
 
     while words and words[0] in STATISTIC_WORDS:
         words.pop(0)
@@ -393,10 +399,22 @@ def variable_core(phrase: str) -> str:
 
 
 #
+# Quita las estadísticas escritas entre las palabras de la variable: «temp max del agua».
+#
+def _without_inner_statistics(words: list[str]) -> list[str]:
+    inner = [
+        word
+        for index, word in enumerate(words)
+        if not (0 < index < len(words) - 1 and normalize_text(word) in INNER_STATISTIC_WORDS)
+    ]
+    return inner if inner else words
+
+
+#
 # Devuelve la variable como la escribió el usuario, sin su estadística.
 #
 def variable_name(phrase: str) -> str:
-    words = phrase.split()
+    words = _without_inner_statistics(phrase.split())
 
     while words and normalize_text(words[0]) in STATISTIC_WORDS:
         words.pop(0)
@@ -690,6 +708,115 @@ def contains_any_phrase(text: str, phrases) -> bool:
 
 
 #
+# Devuelve el tramo del texto que escribe la mención aunque tenga una errata o esté abreviado («conductivdad»,
+# «temp», «pta»), alineando cada palabra con una palabra consecutiva; None si no se alinea.
+#
+def aligned_span(mention: str, text: str) -> str | None:
+    target = normalize_text(mention).split()
+    words = normalize_text(text).split()
+    for start in range(len(words) - len(target) + 1 if target else 0):
+        window = words[start : start + len(target)]
+        if all(_same_word(written, said) for written, said in zip(target, window)):
+            return " ".join(window)
+
+    return None
+
+
+#
+# Indica si un valor guardado de varias palabras escribe la mención con abreviaturas: «Pta Lara», «Punta Lara».
+#
+def abbreviates(value: str, mention: str) -> bool:
+    words = normalize_text(value).split(), normalize_text(mention).split()
+
+    return len(words[0]) == len(words[1]) > 1 and aligned_span(mention, value) is not None
+
+
+#
+# Indica si dos palabras son la misma: iguales, abreviada una de la otra o con una errata. Dos términos
+# conocidos sólo son la misma palabra si son sinónimos: nitrato y nitrito nunca se confunden.
+#
+def _same_word(first: str, second: str) -> bool:
+    if first == second:
+        return True
+    if any(char.isdigit() for char in first + second):
+        return False
+
+    groups = _KNOWN_WORDS.get(first), _KNOWN_WORDS.get(second)
+    if groups[0] and groups[1]:
+        return bool(groups[0] & groups[1])
+
+    short, long = sorted((first, second), key=len)
+    if len(short) >= _MIN_PREFIX and long.startswith(short):
+        return True
+    if _contracted(short, long):
+        return True
+
+    return short[0] == long[0] and _edit_distance(first, second) <= _allowed_edits(len(short))
+
+
+#
+# Indica si una palabra corta es la contracción de otra: misma inicial y final, letras en orden («pta», «punta»).
+#
+def _contracted(short: str, long: str) -> bool:
+    if not _MIN_CONTRACTION <= len(short) <= _MAX_CONTRACTION or len(long) < len(short) + 2:
+        return False
+    if short[0] != long[0] or short[-1] != long[-1]:
+        return False
+
+    letters = iter(long)
+    return all(char in letters for char in short)
+
+
+#
+# Devuelve cuántas ediciones admite una palabra según su largo: ninguna si es corta.
+#
+def _allowed_edits(length: int) -> int:
+    if length >= _LONG_WORD:
+        return 2
+
+    return 1 if length >= _MIN_TYPO_WORD else 0
+
+
+#
+# Devuelve la distancia de edición entre dos palabras, contando la transposición de letras vecinas.
+#
+def _edit_distance(first: str, second: str) -> int:
+    previous, current = None, list(range(len(second) + 1))
+    for row, char in enumerate(first, start=1):
+        before, previous, current = previous, current, [row] + [0] * len(second)
+        for column, other in enumerate(second, start=1):
+            current[column] = min(
+                previous[column] + 1,
+                current[column - 1] + 1,
+                previous[column - 1] + (char != other),
+            )
+            swapped = row > 1 and column > 1 and char == second[column - 2] and first[row - 2] == other
+            if swapped:
+                current[column] = min(current[column], before[column - 2] + 1)
+
+    return current[-1]
+
+
+#
+# Devuelve los grupos de sinónimos de variables a los que pertenece cada palabra conocida. Una palabra de un
+# sinónimo compuesto es conocida pero sólo equivale a sí misma: «fósforo» no es «fosfato».
+#
+def _known_words() -> dict[str, set]:
+    known = {}
+    groups = [*VARIABLE_SYNONYMS, *((name,) for name in CHEMICAL_FORMULAS)]
+    for index, group in enumerate(groups):
+        for phrase in group:
+            words = normalize_text(phrase).split()
+            if len(words) == 1:
+                known.setdefault(words[0], set()).add(index)
+    for group in groups:
+        for word in (word for phrase in group for word in normalize_text(phrase).split()):
+            known.setdefault(word, {word})
+
+    return known
+
+
+#
 # Devuelve los documentos que la pregunta nombra por autor, sigla, año o título completo.
 #
 def named_documents(question: str, documents) -> list[dict]:
@@ -783,3 +910,6 @@ def reference_operator(question: str) -> str | None:
         return None
 
     return "gt" if above else "lt"
+
+
+_KNOWN_WORDS = _known_words()

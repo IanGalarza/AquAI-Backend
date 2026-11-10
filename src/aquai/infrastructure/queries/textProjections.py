@@ -95,7 +95,9 @@ def _read_projection(column: dict, values: list, columns: list[dict]) -> dict | 
     if numbers != [_stored_number(value) for value in values]:
         return None
 
-    return projection_column(column, projection_name(column["sql_name"], columns), numbers, excluded)
+    name = projection_name(column["sql_name"], columns)
+
+    return projection_column(column, name, numbers, excluded, values)
 
 
 #

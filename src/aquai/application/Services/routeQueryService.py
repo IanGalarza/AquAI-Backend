@@ -15,6 +15,7 @@ from aquai.application.errors import LLMProviderError
 from aquai.application.interfaces.routing import RoutingProvider
 from aquai.application.interfaces.sources import SourceQueries
 from aquai.application.matching import (
+    aligned_span,
     contains_any_phrase,
     contains_phrase,
     documented_reference,
@@ -34,6 +35,7 @@ from aquai.application.planning.context import chart_requested, requested_statis
 from aquai.application.planning.followUp import requested_period, requested_time_grain
 from aquai.application.Rules.evidence import (
     CITATION_QUESTION,
+    DEICTIC_PLACE,
     DOCUMENT_ANAPHORA,
     GUIDELINE_CUES,
     LAST_RESULT,
@@ -64,6 +66,11 @@ _NUMERIC_KINDS = {"value", "limit", "threshold"}
 _SCOPE_KINDS = {"value", "dimension", "threshold", "date"}
 _CONSERVED_KINDS = {"variable", "value", "dimension", "date"}
 _RECORD_SCOPE_KINDS = {"value", "date", "threshold"}
+_COUNTED_OBSERVATIONS = re.compile(
+    r"\b(?:cu[aá]nt[oa]s|how\s+many)\s+(?:muestras?|muestreos?|registros?|medici[oó]n(?:es)?|"
+    r"observaci[oó]n(?:es)?|lecturas?|samples?|records?|measurements?|observations?)\b",
+    re.IGNORECASE,
+)
 _CALCULATION_KINDS = {"variable", "value", "dimension", "threshold", "limit"}
 _ELLIPSIS_WORDS = {*MENTION_CONNECTORS, *(word for cue in CONTINUATION_CUES for word in cue.split())}
 _PLACE_NAMES = {normalize_text(word) for word in PLACE_WORDS}
@@ -209,6 +216,11 @@ class RouteQueryService:
             route = "data"
 
         route = self._documentary_route(route, asked, state.question, documents)
+        if route == "catalog" and self._counts_observations(state.question):
+            route = "data"
+            result.warnings.append(
+                "La pregunta cuenta muestras o registros: se consultaron los datos y no el inventario de fuentes."
+            )
         anchor = self._anchor(state.conversation_history, allowed)
         followed = self._documented_reply(last, asked, state.question, route, decision)
         subject = self._period_subject(state.question, asked, messages, anchor, route, decision)
@@ -231,6 +243,8 @@ class RouteQueryService:
             messages = self._with_context([anchor], provided)
         elif self._refers_to_last(route, messages, state.question, last):
             messages = self._with_context([last], provided)
+        elif anchor is not None and self._continues_anchor(route, asked, state.question, messages):
+            messages = self._with_context([anchor], provided)
         elif self._needs_implicit_reference(decision, route, asked, messages):
             target = last if route == "document" and self._cites_evidence(last) else anchor
             if target is not None:
@@ -397,6 +411,7 @@ class RouteQueryService:
                 "La pregunta acota registros por un valor, una fecha o un umbral: "
                 "se consultaron los datos y no el inventario de fuentes."
             )
+
         if route == "catalog":
             return self._catalog_result(result, bindings)
 
@@ -445,6 +460,14 @@ class RouteQueryService:
     @staticmethod
     def _restricts_records(result):
         return any(item.kind in _RECORD_SCOPE_KINDS for item in result.data_mentions)
+
+    #
+    # Indica si la pregunta cuenta observaciones («cuántas muestras hay»), que se cuentan en los datos:
+    # el inventario sólo sabe cuántas filas tiene cada tabla.
+    #
+    @staticmethod
+    def _counts_observations(question):
+        return _COUNTED_OBSERVATIONS.search(question) is not None
 
     #
     # Copia al resultado el modelo, los tokens, el idioma y el motivo de la respuesta del Router.
@@ -549,6 +572,21 @@ class RouteQueryService:
         )
 
     #
+    # Indica si una pregunta de datos sin variable ni valor propios empieza continuando («¿Y en la hoja…?»):
+    # sigue el último análisis aunque el modelo no lo haya citado.
+    #
+    @staticmethod
+    def _continues_anchor(route, asked, question, messages):
+        own = any(item.kind in {"variable", "value"} for item in asked)
+
+        return (
+            route == "data"
+            and not messages
+            and not own
+            and starts_with_phrase(question, CONTINUATION_CUES)
+        )
+
+    #
     # Indica si la pregunta es un fragmento que continúa el último análisis.
     #
     @staticmethod
@@ -594,9 +632,23 @@ class RouteQueryService:
             RouteQueryService._separated_variables(mentions), question
         )
         mentions = RouteQueryService._asked_dimensions(mentions, question)
+        mentions = RouteQueryService._without_source_values(mentions, decision.source_mentions, question)
         own, conserved = RouteQueryService._conserved_scope(mentions, question, messages)
         result.data_mentions = [*own, *conserved]
         result.conserved_mentions = conserved
+
+    #
+    # Quita los valores que la pregunta presenta como fuente («la hoja BASE CIANO»): no acotan registros y no
+    # deben reemplazar el valor que el seguimiento conserva.
+    #
+    @staticmethod
+    def _without_source_values(mentions, sources, question):
+        named = {
+            normalize_name(item)
+            for item in sources
+            if RouteQueryService._literal(item, question) and RouteQueryService._has_source_cue(item, question)
+        }
+        return [item for item in mentions if not (item.kind == "value" and normalize_name(item.text) in named)]
 
     #
     # Quita los valores que nombran la referencia con que se compara («OMS para uso recreativo», «el nivel
@@ -857,7 +909,8 @@ class RouteQueryService:
         return result
 
     #
-    # Indica si la pregunta cambia de fuente y de variable, lo que la hace un tema nuevo.
+    # Indica si la pregunta es un tema nuevo: cambia de fuente y de variable, o nombra su propia variable sin
+    # conservar nada del análisis citado ni remitir a él («¿Cuál es la turbidez promedio en Punta Lara?»).
     #
     @staticmethod
     def _changes_topic(result, question, messages, resolved):
@@ -868,8 +921,10 @@ class RouteQueryService:
         )
         answers_clarification = any(item.clarification for item in messages)
         continues = starts_with_phrase(question, CONTINUATION_CUES)
+        refers = REFERENTIAL_QUESTION.search(question) or DEICTIC_PLACE.search(question)
+        self_contained = not result.conserved_mentions and refers is None
 
-        return bool(messages and resolved and own_variable) and not (
+        return bool(messages and own_variable and (resolved or self_contained)) and not (
             answers_clarification or continues
         )
 
@@ -1084,8 +1139,21 @@ class RouteQueryService:
                 )
                 continue
 
+            RouteQueryService._note_interpretation(text, question, result)
             kept.setdefault((text.casefold(), item.kind), item.model_copy(update={"text": text}))
         return list(kept.values())
+
+    #
+    # Deja constancia de una mención que la pregunta escribe con una errata o abreviada.
+    #
+    @staticmethod
+    def _note_interpretation(text, question, result):
+        if normalize_text(text) in normalize_text(question):
+            return
+
+        written = aligned_span(text, question)
+        if written is not None:
+            result.warnings.append(f"Se interpretó «{written}» de la pregunta como «{text}».")
 
     #
     # Convierte los números comparados («mayor que 500») en umbrales y recupera su variable.
@@ -1245,7 +1313,7 @@ class RouteQueryService:
     @staticmethod
     def _literal(mention, text):
         target = normalize_text(mention)
-        return bool(target) and target in normalize_text(text)
+        return bool(target) and (target in normalize_text(text) or aligned_span(mention, text) is not None)
 
     #
     # Filtra las menciones de fuente que aparecen en la pregunta, descartando valores sin señal de fuente.
@@ -1293,16 +1361,18 @@ class RouteQueryService:
         return [match.group("name") for match in SOURCE_ALIAS.finditer(question)]
 
     #
-    # Devuelve las fuentes de nombre compuesto que la pregunta menciona.
+    # Devuelve las fuentes y hojas de nombre compuesto que la pregunta menciona («la hoja BASE CIANO»).
     #
     @staticmethod
     def _multiword_sources_in(question, catalog, known):
         found = []
         for source in catalog:
-            name = normalize_name(source["name"])
-            if len(name.split()) >= 2 and name not in known and contains_phrase(question, name):
-                found.append(source["name"])
-        return found
+            sheets = [_sheet(dataset["name"]) for dataset in source["datasets"]]
+            for original in dict.fromkeys([source["name"], *sheets]):
+                name = normalize_name(original)
+                if len(name.split()) >= 2 and name not in known and contains_phrase(question, name):
+                    found.append(original)
+        return list(dict.fromkeys(found))
 
     #
     # Devuelve las fuentes cuyo nombre o cuyas hojas contienen el valor.

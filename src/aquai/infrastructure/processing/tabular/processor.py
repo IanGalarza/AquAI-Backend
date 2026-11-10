@@ -18,6 +18,7 @@ from aquai.application.Rules.ingestion import NOTE_ROW, TOTAL_ROW_LABELS
 from aquai.application.Rules.units import STACKED_HEADER_SEPARATOR
 from aquai.infrastructure.config.tabular import TabularSettings
 from aquai.infrastructure.processing.tabular.normalization import (
+    censored_count,
     column_names,
     header_unit,
     infer_column,
@@ -744,7 +745,9 @@ def projection_name(sql_name: str, columns: list[dict]) -> str:
 #
 # Construye los metadatos de la columna de proyección numérica derivada de una de texto.
 #
-def projection_column(metadata: dict, name: str, values: list, excluded: int) -> dict:
+def projection_column(
+    metadata: dict, name: str, values: list, excluded: int, source_values: list | None = None
+) -> dict:
     return {
         **metadata,
         "original_name": metadata["original_name"] + " (representación numérica)",
@@ -754,6 +757,7 @@ def projection_column(metadata: dict, name: str, values: list, excluded: int) ->
         "derived_from": metadata["sql_name"],
         "representation": "numeric_projection",
         "excluded_count": excluded,
+        "censored_count": censored_count(source_values) if source_values is not None else None,
         "nonempty_count": sum(not is_empty(value) for value in values) + excluded,
     }
 
@@ -1332,14 +1336,15 @@ class SimpleTabularProcessor:
             if not projectable:
                 continue
 
-            projection = numeric_projection(metadata["original_name"], [row[index] for row in rows])
+            source_values = [row[index] for row in rows]
+            projection = numeric_projection(metadata["original_name"], source_values)
 
             if projection is None:
                 continue
 
             values, excluded = projection
             name = projection_name(metadata["sql_name"], columns)
-            columns.append(projection_column(metadata, name, values, excluded))
+            columns.append(projection_column(metadata, name, values, excluded, source_values))
             converted.append(values)
             table_warnings.append(
                 f"{metadata['original_name']}: representación numérica auxiliar; {excluded} valores no convertibles conservados en el texto original y excluidos de cálculos."

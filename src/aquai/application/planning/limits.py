@@ -1,5 +1,6 @@
 from aquai.application.contracts.planning import MAX_ROW_LIMIT
-from aquai.application.matching import mentioned_count
+from aquai.application.matching import contains_any_phrase, mentioned_count
+from aquai.application.Rules.vocabulary import FULL_ORDER_CUES
 
 _MEASURED_TYPES = {"NUMERIC", "BIGINT"}
 
@@ -8,11 +9,23 @@ _MEASURED_TYPES = {"NUMERIC", "BIGINT"}
 # Devuelve la cantidad de filas pedida en las menciones de límite, si es única y válida.
 #
 def requested_limit(mentions) -> int | None:
-    counts = [mentioned_count(item.text) for item in mentions if item.kind == "limit"]
+    counts = [mentioned_count(item.text) for item in _limits(mentions)]
     if not counts or None in counts or len(set(counts)) != 1:
         return None
 
     return counts[0] if counts[0] <= MAX_ROW_LIMIT else None
+
+
+#
+# Devuelve las menciones de límite, sin las que sólo piden un orden («ordenados de mayor a menor»).
+#
+def _limits(mentions) -> list:
+    return [
+        item
+        for item in mentions
+        if item.kind == "limit"
+        and (mentioned_count(item.text) is not None or not contains_any_phrase(item.text, FULL_ORDER_CUES))
+    ]
 
 
 #
@@ -28,7 +41,7 @@ def countable_mentions(mentions) -> list:
 # Devuelve los límites del resultado citado por clase de selección, salvo que se pida otro.
 #
 def conserved_limits(mentions, analysis) -> dict[tuple, int]:
-    if analysis is None or any(item.kind == "limit" for item in mentions):
+    if analysis is None or _limits(mentions):
         return {}
 
     steps = {item["id"]: item for item in analysis.operations}

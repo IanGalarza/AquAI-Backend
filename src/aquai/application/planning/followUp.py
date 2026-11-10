@@ -16,6 +16,7 @@ from aquai.application.Rules.vocabulary import (
     TIME_GRAIN_CUES,
 )
 
+_MAX_CHART_ID = 50
 _VALUE_OPERATORS = {"eq", "ieq", "in"}
 _TEMPORAL_TYPES = {"DATE", "TIMESTAMP"}
 _NUMERIC_TYPES = {"NUMERIC", "BIGINT"}
@@ -310,15 +311,22 @@ def reused_decision(analysis, catalog, question):
             if item.get("operation_id") in steps
         )
     )
-    if len(outputs) != 1:
+    if not outputs or (len(outputs) > 1 and not _distributions_asked(question)):
         return None
 
-    target = steps[outputs[0]]
-    chart = _chart(target, steps, question, catalog)
-    if chart is None:
-        return None
+    charts, published = [], []
+    for key in outputs:
+        target = steps[key]
+        chart = _chart(target, steps, question, catalog) or _distribution_chart(
+            target, steps, question, catalog, [*steps, *(item["id"] for item in charts)]
+        )
+        if chart is None:
+            return None
+        charts.append(chart)
+        published.extend([target["id"], chart["id"]])
 
-    chain = [steps[key] for key in steps if key in _ancestry(target["id"], steps)]
+    used = set().union(*(_ancestry(key, steps) for key in outputs))
+    chain = [steps[key] for key in steps if key in used]
     if any(item.get("limit") == 1 for item in chain):
         return None
 
@@ -326,8 +334,8 @@ def reused_decision(analysis, catalog, question):
         "status": "plannable",
         "reason": "Se grafica el resultado verificado anterior con sus mismas operaciones.",
         "datasets": _selections(chain, analysis.sources),
-        "steps": [*(_proposed(item) for item in chain), chart],
-        "output_steps": [target["id"], chart["id"]],
+        "steps": [*(_proposed(item) for item in chain), *charts],
+        "output_steps": published,
         "warnings": [
             "Se reutilizaron las operaciones verificadas del resultado anterior sin planificar de nuevo; "
             "los datos se consultaron otra vez sobre la versión vigente."
@@ -572,6 +580,55 @@ def _chart(target, steps, question, catalog):
             "y_label": y_label,
         },
         "purpose": "Graficar el resultado verificado anterior sin recalcularlo.",
+    }
+
+
+#
+# Indica si la pregunta sólo pide un gráfico sin elegir un tipo que no sea la distribución de los valores.
+#
+def _distributions_asked(question) -> bool:
+    asked = next(
+        (kind for kind, words in CHART_TYPE_WORDS.items() if contains_any_phrase(question, words)),
+        None,
+    )
+    return asked in {None, "histogram"}
+
+
+#
+# Construye el histograma de los registros que resume un único cálculo sin agrupar: un promedio por archivo
+# no se grafica como un punto, se muestra cómo se distribuyen los valores con que se calculó.
+#
+def _distribution_chart(target, steps, question, catalog, used):
+    origin = _origin(target, steps)
+    single = origin is not None and origin["operation"] == "aggregate" and not origin.get("group_by")
+    calculations = (origin or {}).get("calculations") or []
+    if not single or len(calculations) != 1 or not _distributions_asked(question):
+        return None
+
+    read = steps.get((origin.get("depends_on") or [None])[0])
+    inputs = calculations[0].get("inputs") or []
+    if read is None or read["operation"] != "read" or len(inputs) != 1 or inputs[0].get("kind") != "result":
+        return None
+
+    name = inputs[0]["field"]
+    field = next((item for item in read.get("output_fields") or [] if item["name"] == name), None)
+    if field is None or not field["numeric_eligible"]:
+        return None
+
+    label = _labels(catalog).get(_source(field), name)
+    return {
+        "id": _unused_id(f"histogram_{read['id']}"[:_MAX_CHART_ID], {key: None for key in used}),
+        "tool": "python",
+        "operation": "visualize",
+        "depends_on": [read["id"]],
+        "visualization": {
+            "chart_type": "histogram",
+            "title": f"Distribución de {label}",
+            "x": {"kind": "result", "step_id": read["id"], "field": name},
+            "x_label": label,
+            "y_label": "Cantidad de registros",
+        },
+        "purpose": "Mostrar cómo se distribuyen los valores con que se calculó el resultado anterior.",
     }
 
 

@@ -12,7 +12,10 @@ from aquai.infrastructure.providers.sources import SourceRuntime, create_source_
 from aquai.presentation.controllers.conversations import router as conversations_router
 from aquai.presentation.controllers.sources import router as sources_router
 from aquai.presentation.errors import register_exception_handlers
+from aquai.presentation.trustedOrigins import TrustedOrigins
 from aquai.presentation.uploadLimit import SourceUploadSizeLimit
+
+_FRONTEND_ORIGINS = ["http://localhost:3000", "http://127.0.0.1:3000"]
 
 
 #
@@ -61,10 +64,11 @@ def create_app(
     app.state.conversations = conversations
 
     app.add_middleware(SourceUploadSizeLimit, max_upload_bytes=max_upload_bytes)
+    app.add_middleware(TrustedOrigins, origins=_FRONTEND_ORIGINS)
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
-        allow_methods=["GET", "POST", "PATCH", "DELETE"],
+        allow_origins=_FRONTEND_ORIGINS,
+        allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
         allow_headers=["Content-Type"],
     )
     register_exception_handlers(app)

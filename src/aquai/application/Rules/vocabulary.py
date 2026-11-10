@@ -271,7 +271,7 @@ MENTION_CONNECTORS = {
 CATEGORY_CUES = {"cada", "que", "cual", "cuales", "por", "each", "which", "per"}
 
 REQUESTED_STATISTICS = {
-    "mean": ("promedio", "promedios", "media", "medias", "average", "mean"),
+    "mean": ("promedio", "promedios", "prom", "media", "medias", "average", "mean"),
     "median": ("mediana", "median"),
     "sum": ("suma", "sum"),
     "stddev": ("desvio estandar", "desviacion estandar", "standard deviation"),
@@ -425,6 +425,7 @@ CHART_TYPE_WORDS = {
 }
 
 HIGHEST_CUES = (
+    "max",
     "maximo",
     "maxima",
     "mas alto",
@@ -439,6 +440,7 @@ HIGHEST_CUES = (
     "maximum",
 )
 LOWEST_CUES = (
+    "min",
     "minimo",
     "minima",
     "mas bajo",
@@ -461,9 +463,40 @@ FULL_ORDER_CUES = (
     "from lowest to highest",
     "sorted",
 )
+DESCENDING_ORDER_CUES = (
+    "de mayor a menor",
+    "del mayor al menor",
+    "de mas alto a mas bajo",
+    "del mas alto al mas bajo",
+    "de la mas alta a la mas baja",
+    "de los mas altos a los mas bajos",
+    "de las mas altas a las mas bajas",
+    "descendente",
+    "decreciente",
+    "from highest to lowest",
+    "highest to lowest",
+    "descending",
+)
+ASCENDING_ORDER_CUES = (
+    "de menor a mayor",
+    "del menor al mayor",
+    "de mas bajo a mas alto",
+    "del mas bajo al mas alto",
+    "de la mas baja a la mas alta",
+    "de los mas bajos a los mas altos",
+    "de las mas bajas a las mas altas",
+    "ascendente",
+    "creciente",
+    "from lowest to highest",
+    "lowest to highest",
+    "ascending",
+)
 
 MEASURED_STATISTICS = (
     "promedio",
+    "prom",
+    "max",
+    "min",
     "media",
     "mediana",
     "maximo",
@@ -476,4 +509,10 @@ MEASURED_STATISTICS = (
     "median",
     "maximum",
     "minimum",
+)
+
+FULL_ORDER_CUES = (*FULL_ORDER_CUES, *DESCENDING_ORDER_CUES, *ASCENDING_ORDER_CUES)
+ORDER_KEY = r"\b(?:orden\w*|sort\w*)\b[^.?!]*?\b(?:por|by)\s+(?:la\s+|el\s+|the\s+)?(?P<key>[^\W\d_]+)"
+INNER_STATISTIC_WORDS = frozenset(
+    {"max", "min", "maximo", "maxima", "minimo", "minima", "promedio", "prom", "media", "mediana"}
 )
