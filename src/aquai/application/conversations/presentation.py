@@ -582,6 +582,8 @@ class _Presenter:
         raw = axis.field.unit
         if documented and raw and raw in label:
             return label.replace(raw, format_unit(raw))
+        if unit and unit in label:
+            return label
 
         return f"{label} ({unit})" if unit else label
 

@@ -3,7 +3,7 @@ from time import perf_counter
 
 from aquai.application.answering.context import response_language
 from aquai.application.answering.drafting import asks_interpretation
-from aquai.application.answering.hypotheses import unit_hypotheses
+from aquai.application.answering.hypotheses import declared_unit_doubts, unit_hypotheses
 from aquai.application.answering.measures import measured_results, reference_targets
 from aquai.application.answering.references import (
     ambiguity_notes,
@@ -62,21 +62,27 @@ class ContrastReferencesService:
         contrast.references = _distinct_references(
             [
                 *local_references(fragments, results, question, places),
-                *verified_references(drafts, fragments, results, question, places),
+                *verified_references(drafts, fragments, results, question, places, contrast.rejected),
             ]
         )
-        contrast.comparisons = comparison_facts(contrast.references, results, language)
+        doubts = declared_unit_doubts(results, fragments, language)
+        doubtful = {item.field for item in doubts}
+        trusted = [item for item in contrast.references if item.result_field not in doubtful]
+        contrast.comparisons = comparison_facts(trusted, results, language)
         contrast.hypotheses = unit_hypotheses(results, fragments, language)
-        contrast.lines, notes = chart_lines(state, contrast.references, results, question, language)
-        contrast.notes = notes or [
-            *incompatibility_notes(contrast.references, language),
-            *ambiguity_notes(contrast.references, results, language),
+        contrast.lines, notes = chart_lines(state, trusted, results, question, language)
+        uncompared = incompatibility_notes(contrast.references, results, language, doubtful)
+        contrast.notes = [
+            *(item.text for item in doubts),
+            *(notes or [*uncompared, *ambiguity_notes(trusted, results, language)]),
         ]
+        contrast.note_documents = {**{item.text: list(item.evidence_ids) for item in doubts}, **uncompared}
         contrast.duration_ms = round((perf_counter() - started) * 1000, 3)
         _logger.info(
-            "Contraste propuestas=%s verificadas=%s hipótesis=%s líneas=%s ms=%s",
+            "Contraste propuestas=%s verificadas=%s rechazadas=%s hipótesis=%s líneas=%s ms=%s",
             contrast.proposed,
             len(contrast.references),
+            len(contrast.rejected),
             len(contrast.hypotheses),
             len(contrast.lines),
             contrast.duration_ms,

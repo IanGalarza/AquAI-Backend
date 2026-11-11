@@ -10,6 +10,7 @@ from plotly.offline import get_plotlyjs_version
 from aquai.application.answering.presentation import (
     chart_axis_formats,
     chart_hover_templates,
+    format_number,
 )
 from aquai.application.contracts.execution import (
     ChartAxis,
@@ -23,6 +24,7 @@ _COLORS = ("#0072B2", "#D55E00", "#009E73", "#CC79A7", "#E69F00", "#56B4E9", "#0
 _MARKER_SYMBOLS = ("circle", "square", "diamond", "cross")
 _LINE_DASHES = ("solid", "dash", "dot", "dashdot")
 _X_AXIS_TYPES = {"DATE": "date", "TIMESTAMP": "date", "TEXT": "category", "BOOLEAN": "category"}
+_MAX_UNIT_TICKS = 12
 
 
 #
@@ -107,7 +109,7 @@ def build_plotly_figure(chart: VisualizationResult) -> PlotlyFigure:
 #
 def _trace(chart, series, index):
     color = _COLORS[index % len(_COLORS)]
-    name = escape(series.name) if series.name is not None else escape(chart.y_axis.label)
+    name = _series_name(chart, series)
 
     if chart.chart_type == "histogram":
         trace = _histogram_trace(series)
@@ -123,6 +125,17 @@ def _trace(chart, series, index):
     )
 
     return trace
+
+
+#
+# Devuelve el nombre de una serie en la leyenda: su valor, «Sin dato» para las filas sin categoría o, en un
+# gráfico de una sola serie, la variable graficada.
+#
+def _series_name(chart, series):
+    if series.name is not None:
+        return escape(series.name)
+
+    return "Sin dato" if chart.series_field is not None else escape(chart.y_axis.label)
 
 
 #
@@ -234,10 +247,21 @@ def _x_axis(chart, figure, x_type):
         categoryarray=categories,
         tickmode="array",
         tickvals=categories,
-        ticktext=[escape(str(value)) for value in categories],
+        ticktext=[_tick_text(chart, value) for value in categories],
     )
 
     return axis
+
+
+#
+# Devuelve el rótulo de una categoría del eje X: el valor de un histograma constante se muestra con la
+# precisión de presentación, aunque la traza conserve el número exacto.
+#
+def _tick_text(chart, value):
+    if chart.chart_type == "histogram":
+        return format_number(float(value))
+
+    return escape(str(value))
 
 
 #
@@ -280,8 +304,21 @@ def _apply_tick_formats(chart, x_type, x_axis, y_axis):
     if x_type == "linear" and "xaxis" in formats:
         x_axis["tickformat"] = formats["xaxis"]
 
+    if x_axis.get("tickformat") == "d" and _integer_span(chart) <= _MAX_UNIT_TICKS:
+        x_axis.update(tickmode="linear", dtick=1)
+
     if "yaxis" in formats:
         y_axis["tickformat"] = formats["yaxis"]
+
+
+#
+# Devuelve la amplitud de los valores enteros del eje X; con pocos valores, las marcas automáticas caen entre
+# enteros y el formato entero las repite (2021, 2021, 2022).
+#
+def _integer_span(chart):
+    values = [point.x for series in chart.series for point in series.points if type(point.x) in {int, float}]
+
+    return max(values) - min(values) if values else _MAX_UNIT_TICKS + 1
 
 
 #

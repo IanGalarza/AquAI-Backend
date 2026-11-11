@@ -161,7 +161,7 @@ COMPARISON_CUES = {
         r"super[aeoáó]\w*",
         r"sobrepas\w*",
         r"exced\w*",
-        r"por encima de",
+        r"por encima del?",
         r"greater than",
         r"more than",
         r"higher than",
@@ -173,7 +173,7 @@ COMPARISON_CUES = {
         r"menor(?:es)? (?:que|a)",
         r"menos (?:de|que)",
         r"inferior(?:es)? a",
-        r"por debajo de",
+        r"por debajo del?",
         r"less than",
         r"lower than",
         r"fewer than",
@@ -182,6 +182,11 @@ COMPARISON_CUES = {
     ),
 }
 COMPARISON_ARTICLES = r"(?:los|las|el|la|un|una|the)"
+COMPARISON_REFERENCE = (
+    r"(?:(?:el|la|los|las|the|a)\s+)?(?:(?:guideline|reference|alert)\s+)?"
+    r"(?:nivel(?:es)?|valor(?:es)?|umbral(?:es)?|l[ií]mites?|levels?|values?|"
+    r"thresholds?|limits?)(?:\s+(?:gu[ií]a|de\s+referencia|de\s+alerta|guideline|guidance|reference))?\s+(?:de|of)"
+)
 NUMBER = re.compile(r"-?\d+(?:[.,]\d+)*")
 COMPARED_STATISTICS = {
     "promedio",
@@ -269,6 +274,28 @@ MENTION_CONNECTORS = {
 }
 
 CATEGORY_CUES = {"cada", "que", "cual", "cuales", "por", "each", "which", "per"}
+
+GROUPING_CUES = ("por", "per", "by")
+
+NON_GROUPING_WORDS = {
+    "el",
+    "la",
+    "los",
+    "las",
+    "lo",
+    "un",
+    "una",
+    "the",
+    "a",
+    "an",
+    "debajo",
+    "encima",
+    "ciento",
+    "cent",
+    "favor",
+    "ejemplo",
+    "que",
+}
 
 REQUESTED_STATISTICS = {
     "mean": ("promedio", "promedios", "prom", "media", "medias", "average", "mean"),

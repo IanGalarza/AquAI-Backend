@@ -8,6 +8,7 @@ from uuid import UUID
 
 from aquai.application.answering.context import response_language
 from aquai.application.answering.measures import measured_results
+from aquai.application.answering.readings import number_readings
 from aquai.application.contracts.retrieval import DocumentFragment, DocumentRetrievalResult, SearchTerms
 from aquai.application.errors import LLMProviderError, SemanticIndexError
 from aquai.application.interfaces.documents import (
@@ -16,10 +17,11 @@ from aquai.application.interfaces.documents import (
     DocumentLexicalIndex,
     DocumentQueries,
 )
-from aquai.application.matching import names_subject, variable_name, variable_variants
+from aquai.application.matching import asked_reference, names_subject, variable_name, variable_variants
 from aquai.application.planning.context import extreme_requested
 from aquai.application.Rules.documents import normalized_text
 from aquai.application.Rules.evidence import (
+    GUIDELINE_CUES,
     INTERPRETATION_CUES,
     PRINTED_FIGURE_TEXT,
     REFERENCE_LINE_CUES,
@@ -36,6 +38,7 @@ _MAX_FOCUS_CHARS = 700
 _SHINGLE_WORDS = 5
 _DUPLICATE_OVERLAP = 0.8
 _CANDIDATE_SPREAD = 2
+_MAX_ADDED_GUIDELINES = 2
 _ASK_EDGES = re.compile(r"^[\s,;]*(?:y|e|con|and|with)?\s*")
 _RETRIEVAL_ERRORS = (SemanticIndexError, LLMProviderError, ValueError, OSError)
 
@@ -50,6 +53,7 @@ class _Request:
     document_ids: list[UUID] = field(default_factory=list)
     subject: list[str] = field(default_factory=list)
     strict_subject: bool = False
+    guidelines: bool = False
 
 
 class RetrieveDocumentsService:
@@ -133,17 +137,20 @@ class RetrieveDocumentsService:
         result.subject = list(dict.fromkeys(subject))
         ranked = await self._ranked(request, searches)
         usable = [item for item in ranked if _usable(item) and (not subject or _mentions(item, subject))]
+        stated = _stated_guidelines(usable, result.subject) if request.guidelines else []
         if request.purpose == "enrichment":
             usable = _distinct(usable, _CANDIDATE_SPREAD * self._per_document)
-        candidates = usable[: self._candidates]
+        candidates = [*usable[: self._candidates], *(item for item in stated if item not in usable[: self._candidates])]
         result.candidates = len(candidates)
         if not candidates:
             return
 
         selected = await self._selected(request, candidates, result)
+        selected = [*stated, *(item for item in selected if item not in stated)]
         per_document = self._fragments if request.document_ids else self._per_document
         chosen = _distinct(selected, per_document)[: self._fragments]
         result.discarded = len(candidates) - len(chosen)
+        result.unselected = [_traced(item) for item in candidates if item not in chosen]
         result.fragments = [_fragment(item, index) for index, item in enumerate(chosen, 1)]
         result.status = "found" if chosen else "no_relevant_evidence"
 
@@ -231,6 +238,36 @@ class RetrieveDocumentsService:
 
 
 #
+# Devuelve, de todo lo recuperado, los fragmentos confiables que enuncian una guía o un límite del tema con una
+# cifra, primero las tablas normativas: cuando la pregunta pide valores de referencia, no pueden quedar afuera
+# por el cupo de cada documento ni por el orden en que el selector enumera.
+#
+def _stated_guidelines(ranked, subject) -> list:
+    stated = [item for item in ranked if _states_guideline(item, subject)]
+    stated.sort(key=lambda item: not _normative_table(item))
+
+    return stated[:_MAX_ADDED_GUIDELINES]
+
+
+#
+# Indica si un fragmento es una tabla cuya leyenda la presenta como valores guía o límites.
+#
+def _normative_table(chunk) -> bool:
+    return str(chunk["kind"]) == "table" and bool(GUIDELINE_CUES.search(chunk["element_caption"] or ""))
+
+
+#
+# Indica si un candidato sin dudas dice una guía o un límite del tema y da una cifra.
+#
+def _states_guideline(chunk, subject) -> bool:
+    text = chunk["text"]
+    if chunk["doubts"] or not GUIDELINE_CUES.search(text) or (subject and not names_subject(text, subject)):
+        return False
+
+    return any(item.values for item in number_readings(text))
+
+
+#
 # Indica si un fragmento, su sección, su leyenda o su documento nombran el objeto preguntado.
 #
 def _mentions(chunk, subject) -> bool:
@@ -287,6 +324,7 @@ def _reference_request(state) -> _Request:
         lexical=[0],
         document_ids=routing.document_ids,
         subject=[name for mention in variables for name in variable_variants(variable_name(mention))],
+        guidelines=True,
     )
 
 
@@ -380,9 +418,10 @@ def _result_request(state) -> _Request | None:
     places = _places(state)
     requests, lexical = [], []
     asked = REFERENCE_REQUEST_CLAUSE.search(state.routing.original_question)
-    if asked is not None:
+    reference = _ASK_EDGES.sub("", asked.group()) if asked else asked_reference(state.routing.original_question)
+    if reference:
         lexical.append(0)
-        requests.append(f"{variables[0]}: {_ASK_EDGES.sub('', asked.group())}")
+        requests.append(f"{variables[0]}: {reference}")
     for variable in variables:
         lexical.append(len(requests))
         requests.append(f"{variable} {places}".strip())
@@ -400,6 +439,7 @@ def _result_request(state) -> _Request | None:
         lexical=[item for item in lexical if item < 6],
         subject=list(dict.fromkeys(name for item in results for name in item.names)),
         strict_subject=True,
+        guidelines=bool(reference),
     )
 
 
@@ -465,6 +505,18 @@ def _usable(chunk) -> bool:
         return False
 
     return not (chunk["kind"] == "figure" and PRINTED_FIGURE_TEXT.match(chunk["text"]))
+
+
+#
+# Describe un candidato que no se eligió, para la traza: documento, página, tipo y marcas de duda.
+#
+def _traced(chunk) -> dict:
+    return {
+        "file_name": chunk["original_filename"],
+        "page": chunk["page_start"],
+        "kind": str(chunk["kind"]),
+        "doubts": list(chunk["doubts"]),
+    }
 
 
 #

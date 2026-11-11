@@ -357,6 +357,7 @@ class ValidationIssue(PlanModel):
     severity: Literal["warning", "clarification"]
     message: str
     step_id: str | None = None
+    subject: str | None = None
 
 
 class SelectedDataset(VerifiedDataset):

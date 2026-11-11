@@ -584,14 +584,32 @@ def _chart(target, steps, question, catalog):
 
 
 #
-# Indica si la pregunta sólo pide un gráfico sin elegir un tipo que no sea la distribución de los valores.
+# Devuelve el tipo de gráfico que nombra la pregunta (barras, líneas, dispersión, histograma), o None.
 #
-def _distributions_asked(question) -> bool:
-    asked = next(
+def asked_chart_type(question) -> str | None:
+    return next(
         (kind for kind, words in CHART_TYPE_WORDS.items() if contains_any_phrase(question, words)),
         None,
     )
-    return asked in {None, "histogram"}
+
+
+#
+# Devuelve el tipo del único gráfico del análisis citado, o None si no tenía uno solo.
+#
+def conserved_chart_type(analysis) -> str | None:
+    kinds = {
+        item["visualization"]["chart_type"]
+        for item in (analysis.operations if analysis else [])
+        if item.get("operation") == "visualize" and item.get("visualization")
+    }
+    return kinds.pop() if len(kinds) == 1 else None
+
+
+#
+# Indica si la pregunta sólo pide un gráfico sin elegir un tipo que no sea la distribución de los valores.
+#
+def _distributions_asked(question) -> bool:
+    return asked_chart_type(question) in {None, "histogram"}
 
 
 #
@@ -660,10 +678,7 @@ def _category(fields, grouped):
 def _chart_type(question, x):
     temporal = x is not None and x["sql_type"] in _TEMPORAL_TYPES
     numeric = x is not None and x["sql_type"] in _NUMERIC_TYPES
-    asked = next(
-        (kind for kind, words in CHART_TYPE_WORDS.items() if contains_any_phrase(question, words)),
-        None,
-    )
+    asked = asked_chart_type(question)
     if asked is None:
         return "line" if temporal else "bar"
     if asked == "line" and not (temporal or numeric):

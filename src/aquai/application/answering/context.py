@@ -6,6 +6,7 @@ from hashlib import sha256
 from itertools import count as counter
 
 from aquai.application.answering.naming import FieldNames
+from aquai.application.answering.patterns import extremes, modal_bin, pearson, plotted_points
 from aquai.application.answering.presentation import format_number
 from aquai.application.answering.wording import (
     INLINE_FIELDS,
@@ -280,6 +281,25 @@ class _ContextBuilder:
             attach=True,
             required=True,
         )
+        self._add_chart_pattern(evidence, chart)
+
+    #
+    # Agrega lo que muestran los datos del gráfico cuando la oración de su tabla no los enumera: extremos,
+    # primer y último punto, intervalo más frecuente o correlación, con la definición que haga falta.
+    #
+    def _add_chart_pattern(self, evidence, chart):
+        origin, _latest, _ranking = _trace_origin(self._steps[chart.input_operation_ids[0]], self._steps)
+        grouping = {item.output_name: item for item in origin.group_by}
+        calculation = next(
+            (item for item in origin.calculations if item.output_name == chart.y_axis.field.name), None
+        )
+        pattern = self._writer.chart_pattern(chart, grouping, calculation, self._max_preview_rows)
+        if pattern is None:
+            return
+
+        self._add(evidence, pattern, required=True)
+        if chart.chart_type == "scatter":
+            self._add(evidence, self._writer.correlation_meaning(), kind="meaning")
 
     #
     # Agrega las oraciones de las tablas, primero los resultados derivados y luego las lecturas.
@@ -681,9 +701,14 @@ class _Writer:
                 else f"los {self.count(rows, 'resultado', 'resultados')}"
             )
             values = self.count(rows - excluded, "valor", "valores")
+            distribution = (
+                "El histograma muestra un único valor, así que no hay una distribución para comparar."
+                if rows - excluded == 1
+                else f"El histograma muestra cómo se distribuyen {values}: "
+                "cada barra indica cuántos valores caen dentro de un intervalo."
+            )
             descriptions = {
-                "histogram": f"El histograma muestra cómo se distribuyen {values}: "
-                "cada barra indica cuántos valores caen dentro de un intervalo.",
+                "histogram": distribution,
                 "bar": f"El gráfico de barras compara {shown}: "
                 "la altura de cada barra es su valor.",
                 "line": f"El gráfico de líneas muestra cómo cambian {shown} "
@@ -694,9 +719,14 @@ class _Writer:
         else:
             shown = self.count(rows, "result", "results")
             values = self.count(rows - excluded, "value is", "values are")
+            distribution = (
+                "The histogram shows a single value, so there is no distribution to compare."
+                if rows - excluded == 1
+                else f"The histogram shows how {values} distributed: "
+                "each bar counts the values that fall within an interval."
+            )
             descriptions = {
-                "histogram": f"The histogram shows how {values} distributed: "
-                "each bar counts the values that fall within an interval.",
+                "histogram": distribution,
                 "bar": f"The bar chart compares {shown}: the height of each bar is its value.",
                 "line": f"The line chart shows how {shown} change along the horizontal axis.",
                 "scatter": f"The scatter plot shows {shown} as points, "
@@ -704,6 +734,142 @@ class _Writer:
             }
 
         return descriptions[chart_type]
+
+    #
+    # Describe lo que muestran los puntos de un gráfico, o None si no agrega nada a lo ya dicho: la oración
+    # de la tabla enumera hasta inline_rows valores y un único valor no tiene patrón.
+    #
+    def chart_pattern(self, chart, grouping, calculation, inline_rows):
+        if chart.chart_type == "histogram":
+            return self._histogram_pattern(chart)
+
+        points = plotted_points(chart)
+        if chart.chart_type == "scatter":
+            return self._correlation(chart, points)
+        if len(points) <= inline_rows:
+            return None
+
+        return self._extremes(chart, points, grouping, calculation)
+
+    #
+    # Redacta el valor más alto y el más bajo del gráfico y, en una línea de una sola serie, el primer y el
+    # último punto.
+    #
+    def _extremes(self, chart, points, grouping, calculation):
+        found = extremes(points)
+        if found is None:
+            return None
+
+        measured = self.subject(calculation) if calculation else self.label(chart.y_axis.field)
+        highest, lowest = (self._plotted_value(chart, item, grouping) for item in found)
+        if self.es:
+            text = f"En el gráfico, el valor máximo {_of(measured)} fue {highest} y el mínimo fue {lowest}."
+        else:
+            text = f"In the chart, the maximum value of {measured} was {highest} and the minimum was {lowest}."
+
+        if chart.chart_type != "line" or len(chart.series) != 1:
+            return text
+
+        first, last = (self._plotted_value(chart, item, grouping) for item in (points[0], points[-1]))
+        if self.es:
+            return f"{text} Del primer al último punto pasó de {first} a {last}."
+
+        return f"{text} From the first to the last point it went from {first} to {last}."
+
+    #
+    # Devuelve el valor de un punto del gráfico con su unidad y su ubicación.
+    #
+    def _plotted_value(self, chart, point, grouping):
+        measured = self.measure(chart.y_axis.field, point.y)
+
+        return f"{measured} {self._plotted_at(chart, point, grouping)}"
+
+    #
+    # Devuelve dónde está un punto del gráfico: su serie y su posición en el eje horizontal.
+    #
+    def _plotted_at(self, chart, point, grouping):
+        field = chart.x_axis.field
+        value = _typed(field, point.x)
+        spec = grouping.get(field.name)
+        if self._period_kind(field) == "year":
+            place = at(str(value), "year", self.language)
+        elif spec is not None:
+            place = self.scope(spec, field, value)
+        else:
+            place = self.attribute(field, value)
+        if chart.series_field is None or point.series is None:
+            return place
+
+        series = self.attribute(chart.series_field, _typed(chart.series_field, point.series))
+
+        return f"{series}, {place}"
+
+    #
+    # Redacta el rango de un histograma y el intervalo con más valores.
+    #
+    def _histogram_pattern(self, chart):
+        bins = [item for series in chart.series for item in series.bins]
+        total = sum(item.count for item in bins)
+        if total < 2 or bins[0].lower == bins[-1].upper:
+            return None
+
+        field = chart.x_axis.field
+        label = self.label(field)
+        low, high = self.measure(field, bins[0].lower), self.measure(field, bins[-1].upper)
+        values = self.count(total, "valor", "valores") if self.es else self.count(total, "value", "values")
+        top = modal_bin(chart)
+        if self.es:
+            text = f"Los {values} de {label} van de {low} a {high}."
+            if top is None:
+                return text
+            bounds = f"de {self.measure(field, top.lower)} a {self.measure(field, top.upper)}"
+            return f"{text} El intervalo con más valores, {bounds}, reúne {top.count}."
+
+        text = f"The {values} of {label} range from {low} to {high}."
+        if top is None:
+            return text
+        bounds = f"from {self.measure(field, top.lower)} to {self.measure(field, top.upper)}"
+
+        return f"{text} The interval with the most values, {bounds}, holds {top.count}."
+
+    #
+    # Redacta el coeficiente de correlación de Pearson entre los ejes de una dispersión.
+    #
+    def _correlation(self, chart, points):
+        found = pearson(points)
+        if found is None:
+            return None
+
+        coefficient, total = found
+        x, y = (self.label(axis.field) for axis in (chart.x_axis, chart.y_axis))
+        shown = f"{coefficient:.2f}".replace(".", "," if self.es else ".")
+        if self.es:
+            return (
+                f"El coeficiente de correlación de Pearson entre {x} y {y} fue {shown}, "
+                f"calculado con {self.count(total, 'punto', 'puntos')}."
+            )
+
+        return (
+            f"The Pearson correlation coefficient between {x} and {y} was {shown}, "
+            f"computed from {self.count(total, 'point', 'points')}."
+        )
+
+    #
+    # Devuelve qué indica el coeficiente de correlación de Pearson.
+    #
+    def correlation_meaning(self):
+        if self.es:
+            return (
+                "La correlación de Pearson va de -1 a 1: cerca de 1, las dos variables aumentan juntas; "
+                "cerca de -1, una disminuye cuando la otra aumenta; y cerca de 0, no hay una relación lineal "
+                "entre ellas. No indica que una variable cause la otra."
+            )
+
+        return (
+            "Pearson correlation ranges from -1 to 1: near 1, both variables increase together; near -1, one "
+            "decreases as the other increases; near 0, there is no linear relationship between them. It does "
+            "not mean that one variable causes the other."
+        )
 
     #
     # Devuelve la nota de que la consulta se limitó a cierta cantidad de resultados.
@@ -1729,6 +1895,30 @@ def _unique(items):
 #
 def _lowercase_first(text):
     return f"{text[:1].lower()}{text[1:]}"
+
+
+#
+# Antepone «de» a un sujeto, contraído con su artículo masculino («del promedio»).
+#
+def _of(subject):
+    return f"del {subject[3:]}" if subject.startswith("el ") else f"de {subject}"
+
+
+#
+# Devuelve un valor de un eje del gráfico con su tipo: las fechas vuelven a ser fechas y los enteros, que el
+# gráfico guarda como float de presentación, vuelven a ser enteros.
+#
+def _typed(field, value):
+    if field.sql_type == "BIGINT" and type(value) is float and value.is_integer():
+        return int(value)
+    if not isinstance(value, str):
+        return value
+    if field.sql_type == "DATE":
+        return date.fromisoformat(value[:10])
+    if field.sql_type == "TIMESTAMP":
+        return datetime.fromisoformat(value)
+
+    return value
 
 
 #

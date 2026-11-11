@@ -75,6 +75,27 @@ _REASONS = {
 
 _FAILED_STATUSES = {"blocked", "error", "unsupported"}
 _CATEGORICAL_CHARTS = {"bar", "line"}
+_SOURCE_GAPS = {
+    "es": "No pude usar los datos de «{source}», que la consulta nombra: los resultados son sólo de las demás "
+    "fuentes, así que esa parte de la comparación queda sin responder.",
+    "en": "I could not use the data from «{source}», which the question names: the results come only from the "
+    "other sources, so that part of the comparison remains unanswered.",
+}
+
+
+#
+# Devuelve los avisos de las partes que el plan no cubrió: las fuentes nombradas que ninguna salida lee.
+#
+def request_gaps(state, language) -> list[str]:
+    issues = state.planning.validation_issues if state.planning else []
+
+    return list(
+        dict.fromkeys(
+            _SOURCE_GAPS[language].format(source=file_stem(item.subject))
+            for item in issues
+            if item.code == "missing_named_source" and item.subject
+        )
+    )
 
 
 #

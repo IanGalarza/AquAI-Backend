@@ -39,7 +39,8 @@ previous_attempt_feedback, si existe, explica por qué se rechazó tu plan anter
 corregí exactamente esos problemas.
 Agregá visualize sólo si la pregunta pide un gráfico; requested_chart=true exige uno.
 requested_time_grain (day, month, year) exige agrupar la fecha DATE/TIMESTAMP con ese
-time_grain ('promedio por mes' es group_by de la fecha con time_grain=month). Usá latest sólo si existe
+time_grain ('promedio por mes' es group_by de la fecha con time_grain=month); para year sin fecha
+DATE alcanza un group_by de la columna de año BIGINT, sin time_grain. Usá latest sólo si existe
 temporal_requirements o si verified_history_metadata ya lo usa; latest nunca publica
 un resultado. Un read y un latest son suficientes para la última medición de una
 variable en una localidad.
@@ -77,7 +78,8 @@ Reglas semánticas:
 - Las unidades desconocidas siguen desconocidas. Una media de una misma variable
   en un dataset es posible con esa limitación; no inventes unidades del nombre.
   Comparar/restar variables requiere compatibilidad documentada. No conviertas unidades.
-- Para agrupar por día/mes/año necesitás DATE/TIMESTAMP; TEXT y fechas parciales no
+- Para agrupar por día/mes/año necesitás DATE/TIMESTAMP (por año también sirve una columna de
+  año BIGINT); TEXT y fechas parciales no
   prueban una interpretación temporal. Pedí aclaración cuando el objetivo la requiera.
 - Localidades, estaciones, sitios, variables y fechas son columnas/valores para
   seleccionar y filtrar dentro de los candidatos; no exigen una fuente homónima.

@@ -20,6 +20,7 @@ from aquai.application.Rules.vocabulary import (
     INNER_STATISTIC_WORDS,
     COMPARED_STATISTICS,
     COMPARISON_ARTICLES,
+    COMPARISON_REFERENCE,
     COMPARISON_BOUNDARIES,
     COMPARISON_CUES,
     COMPARISON_FILLERS,
@@ -39,6 +40,7 @@ from aquai.application.Rules.vocabulary import (
     STATISTIC_WORDS,
     SURROUNDING_PUNCTUATION,
 )
+from aquai.application.units import is_ph_name
 from aquai.application.Rules.evidence import (
     COMPARISON_DIRECTIONS,
     DOCUMENT_AUTHOR_NAMES,
@@ -82,7 +84,7 @@ _DAY = timedelta(days=1)
 _COMPARISON = re.compile(
     r"\b(?:"
     + "|".join(f"(?P<{operator}>{'|'.join(cues)})" for operator, cues in COMPARISON_CUES.items())
-    + rf")\s+(?:{COMPARISON_ARTICLES}\s+)?(?P<number>{NUMBER.pattern})",
+    + rf")\s+(?:{COMPARISON_REFERENCE}\s+)?(?:{COMPARISON_ARTICLES}\s+)?(?P<number>{NUMBER.pattern})",
     re.IGNORECASE,
 )
 
@@ -258,6 +260,16 @@ def named_variable_groups(text: str) -> set[int]:
         for term in group
         if any(tuple(words[start : start + len(term)]) == term for start in range(len(words)))
     }
+
+
+#
+# Indica si la frase, sin estadísticas ni artículos, nombra una variable conocida («el pH», «la conductividad
+# promedio»): permite separar una lista de variables sin partir un nombre compuesto.
+#
+def names_known_variable(phrase: str) -> bool:
+    core = variable_core(phrase)
+
+    return bool(named_variable_groups(core)) or is_ph_name("".join(_content(singular_words(core))))
 
 
 #
@@ -499,7 +511,8 @@ def period_range(text: str) -> tuple[date | None, date | None] | None:
 #
 def period_ranges(text: str) -> list[tuple[date | None, date | None]]:
     text = str(text)
-    anchors = [] if contains_any_phrase(text, SEASON_WORDS) else _period_anchors(text)
+    seasonal = contains_any_phrase(text, SEASON_WORDS) and not _month_words(text)
+    anchors = [] if seasonal else _period_anchors(text)
     if not anchors:
         return []
 
@@ -548,11 +561,10 @@ def _period_anchors(text) -> list[tuple[date, date]]:
             if (month := _explicit_month(match))
         }
     )
-    named = sorted({MONTH_NAMES[word] for word in normalize_text(text).split() if word in MONTH_NAMES})
-    if named and len(years) == 1:
-        explicit = sorted({*explicit, *((years[0], month) for month in named)})
-    elif named:
+    named = _named_months(text, years)
+    if named is None:
         return []
+    explicit = sorted({*explicit, *named})
 
     if explicit:
         return [
@@ -560,6 +572,50 @@ def _period_anchors(text) -> list[tuple[date, date]]:
             for year, month in explicit
         ]
     return [(date(year, 1, 1), date(year, 12, 31)) for year in years]
+
+
+#
+# Indica si un texto nombra un período concreto con un año o un mes.
+#
+def names_period(text: str) -> bool:
+    return bool(REQUESTED_YEAR.search(str(text)) or _month_words(text))
+
+
+#
+# Devuelve las palabras de un texto que nombran meses, con su posición.
+#
+def _month_words(text) -> list[tuple[int, int]]:
+    words = normalize_text(text).split()
+
+    return [(index, MONTH_NAMES[word]) for index, word in enumerate(words) if word in MONTH_NAMES]
+
+
+#
+# Devuelve cada mes nombrado con su año: el que lo sigue («diciembre de 2021»), el único año del texto o, en un
+# rango de dos meses que cruza de año («verano 2021-2022, de diciembre a febrero»), el primero y el siguiente.
+# None si algún mes queda sin un año inequívoco.
+#
+def _named_months(text, years) -> set[tuple[int, int]] | None:
+    words = normalize_text(text).split()
+    months = _month_words(text)
+    following = [
+        next((int(word) for word in words[index + 1 : index + 3] if REQUESTED_YEAR.fullmatch(word)), None)
+        for index, _ in months
+    ]
+    crossing = (
+        len(months) == 2 and len(years) == 2 and years[1] == years[0] + 1 and months[0][1] > months[1][1]
+    )
+    named = set()
+    for position, ((_, month), year) in enumerate(zip(months, following, strict=True)):
+        if year is None and len(years) == 1:
+            year = years[0]
+        elif year is None and crossing:
+            year = years[position]
+        if year is None:
+            return None
+        named.add((year, month))
+
+    return named
 
 
 #
@@ -705,6 +761,16 @@ def starts_with_phrase(text: str, phrases) -> bool:
 #
 def contains_any_phrase(text: str, phrases) -> bool:
     return any(contains_phrase(text, phrase) for phrase in phrases)
+
+
+#
+# Indica si el texto escribe una frase de varias palabras como una sola («microcystinLR»), como queda cuando la
+# extracción de un PDF pierde el guion de un corte de línea.
+#
+def contains_joined_phrase(text: str, phrase: str) -> bool:
+    target = normalize_text(phrase).split()
+
+    return len(target) > 1 and "".join(target) in normalize_text(text).split()
 
 
 #
@@ -892,12 +958,20 @@ def _term_present(term, words) -> bool:
 # («superan el nivel guía de la OMS»), o None si no la hay o si la comparación ya trae un número.
 #
 def documented_reference(question: str) -> str | None:
-    cue = REFERENCE_LINE_CUES.search(question)
-    compared = reference_operator(question) is not None
-    if cue is None or not compared or numeric_comparisons(question):
+    if reference_operator(question) is None or numeric_comparisons(question):
         return None
 
-    return question[cue.start() :].strip(" ¿?¡!.") or None
+    return asked_reference(question)
+
+
+#
+# Devuelve la referencia documental que la pregunta nombra («los valores guía de la OMS para aguas
+# recreativas»), desde su primera mención hasta el final, haya o no un sentido de comparación.
+#
+def asked_reference(question: str) -> str | None:
+    cue = REFERENCE_LINE_CUES.search(question)
+
+    return (question[cue.start() :].strip(" ¿?¡!.") or None) if cue else None
 
 
 #

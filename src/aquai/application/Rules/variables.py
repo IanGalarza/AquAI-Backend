@@ -14,6 +14,7 @@ VARIABLE_SYNONYMS = (
     ("cianobacteria", "cyanobacteria", "cyanobacterial"),
     ("fitoplancton", "phytoplankton"),
     ("microcistina", "microcystina", "microcystin"),
+    ("microcistina lr", "microcystina lr", "microcystin lr", "mc lr"),
     ("nitrato", "nitrate"),
     ("nitrito", "nitrite"),
     ("amonio", "nitrogeno amoniacal", "ammonium", "ammoniacal nitrogen"),

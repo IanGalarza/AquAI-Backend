@@ -243,6 +243,12 @@ GUIDELINE_CUES = re.compile(
     r"permissible|threshold\w*|objective\w*)\b",
     re.IGNORECASE,
 )
+REFERENCE_LABELS = re.compile(
+    r"\b(?:valor(?:es)?\s+(?:de\s+referencia|gu[ií]a)|nivel(?:es)?\s+(?:gu[ií]a|de\s+referencia)|umbral(?:es)?|"
+    r"l[ií]mites?\s+(?:normativ\w*|permitid\w*|recomendad\w*|m[aá]xim\w*)|reference\s+values?|guideline\s+values?|"
+    r"guidance\s+levels?|thresholds?)\b",
+    re.IGNORECASE,
+)
 FREQUENCY_WORDS = re.compile(
     r"\b(?:habitual\w*|usual\w*|suelen?|sol[ií]an?|normalmente|generalmente|t[ií]pic\w*|frecuentemente|com[uú]nmente|"
     r"a\s+menudo|siempre|variabilidad\s+natural|usually|typically|typical|often|commonly|normally|generally|"
@@ -256,6 +262,9 @@ INTERNAL_TERMS = re.compile(
 ORGANIZATION_NAMES = re.compile(
     r"\b(?:OMS|WHO|Organizaci[oó]n\s+Mundial\s+de\s+la\s+Salud|World\s+Health\s+Organi[sz]ation)\b"
 )
+ORGANIZATION_AGENT = re.compile(
+    r"(?i:\b(?:by|por|seg[uú]n|according\s+to)\s+(?:(?:la|el|the)\s+)?)" + ORGANIZATION_NAMES.pattern
+)
 EVIDENCE_GAP = re.compile(
     r"\b(?:no\s+(?:se\s+)?(?:incluy\w*|figur\w*|aparec\w*|mencion\w*|especific\w*|contien\w*|indic\w*|aport\w*|"
     r"detall\w*|encontr\w*|describ\w*|informa\w*)|ning[uú]n\s+(?:fragmento|documento)|"
@@ -263,6 +272,17 @@ EVIDENCE_GAP = re.compile(
     re.IGNORECASE,
 )
 NEGATION = re.compile(r"\b(?:no|ni|sin|not|neither|without)\b", re.IGNORECASE)
+STATED_PERCENTILE = re.compile(
+    r"\b(?:\d{1,2}\s?(?:th|st|nd|rd|º|°|o)?\s?percentil\w*|percentil\w*\s?\d{1,2})\b",
+    re.IGNORECASE,
+)
+LITERATURE_CLAUSE = re.compile(
+    r"\b(?:bibliograf[ií]a|literatura|papers?|art[ií]culos\s+cient[ií]ficos|publicaciones|literature|"
+    r"published\s+studies|scientific\s+(?:articles|papers))\b"
+    r"(?:(?!\s(?:y|e|and)\s+(?:cu[aá]l|qu[eé]|c[oó]mo|cu[aá]nt|d[oó]nde|cu[aá]ndo|what|which|how|where|when)\b)"
+    r"[^.;:?!¿,])*",
+    re.IGNORECASE,
+)
 EVIDENCE_NOUNS = re.compile(
     r"\b(?:documentos?|fragmentos?|textos?|fuentes?|evidencia|bibliograf[ií]a|literatura|art[ií]culos?|"
     r"documents?|fragments?|texts?|sources?|evidence|literature|articles?)\b",
@@ -359,12 +379,16 @@ DETECTION_LIMIT = re.compile(
     r"limits?\s+of\s+(?:detection|quantification)|quantification\s+limits?|LOD|LOQ)\b",
     re.IGNORECASE,
 )
+_EXPLANATION = (
+    r"qu[eé]\s+(?:significa|implica|indica|representa|quiere\s+decir)|interpret\w*|explic\w*|por\s+qu[eé]|"
+    r"a\s+qu[eé]\s+se\s+debe|what\s+does\s+(?:it|this|that)\s+mean|explain\w*|why"
+)
+EXPLANATION_CUES = re.compile(rf"\b(?:{_EXPLANATION})\b", re.IGNORECASE)
 INTERPRETATION_CUES = re.compile(
-    r"\b(?:qu[eé]\s+(?:significa|implica|indica|representa|quiere\s+decir)|es\s+(?:normal|alto|alta|bajo|baja|"
-    r"mucho|poco|preocupante|habitual|esperable|bueno|malo)|interpret\w*|explic\w*|por\s+qu[eé]|"
-    r"a\s+qu[eé]\s+se\s+debe|compar\w*\s+con|en\s+comparaci[oó]n|respecto\s+(?:de|a)\s+(?:los|las|la|el)\s+"
-    r"(?:valor|nivel|l[ií]mite|norma|gu[ií]a)\w*|what\s+does\s+(?:it|this|that)\s+mean|is\s+(?:it|this|that)\s+"
-    r"(?:normal|high|low|a\s+lot)|interpret\w*|explain\w*|why|compare\w*\s+(?:with|to))\b",
+    rf"\b(?:{_EXPLANATION}|es\s+(?:normal|alto|alta|bajo|baja|mucho|poco|preocupante|habitual|esperable|bueno|"
+    r"malo)|compar\w*\s+con|en\s+comparaci[oó]n|respecto\s+(?:de|a)\s+(?:los|las|la|el)\s+"
+    r"(?:valor|nivel|l[ií]mite|norma|gu[ií]a)\w*|is\s+(?:it|this|that)\s+(?:normal|high|low|a\s+lot)|"
+    r"compare\w*\s+(?:with|to))\b",
     re.IGNORECASE,
 )
 PENDING_CONFIRMATION = re.compile(

@@ -26,6 +26,7 @@ from aquai.application.units import comparable_unit, presentation_unit_status
 _EQUALITY_OPERATORS = {"eq", "ieq", "in"}
 _RANGE_OPERATORS = {"lt", "le", "gt", "ge"}
 _NUMERIC_TYPES = {"BIGINT", "NUMERIC"}
+INCOMPLETE_REQUEST_CODES = frozenset({"missing_named_source"})
 _TEMPORAL_TYPES = {"DATE", "TIMESTAMP"}
 _TEXT_PERIOD_KINDS = {None: "text", True: "text-dmy", False: "text-mdy"}
 _DATE_WORDS = {"fecha", "date", "ano", "anio", "year", "mes", "month", "dia", "day"}
@@ -181,6 +182,26 @@ def validate_text_orderings(operations, variables) -> list[ValidationIssue]:
 
 
 #
+# Valida que alguna salida lea cada fuente que la pregunta nombra. No bloquea el plan: comparar dos fuentes
+# leyendo sólo una es una respuesta incompleta, que se publica como parcial y dice qué fuente faltó.
+#
+def validate_named_sources(operations, output_steps, named) -> list[ValidationIssue]:
+    steps = {step.id: step for step in operations}
+    read = {dataset for key in output_steps if key in steps for dataset in _read_datasets(steps[key], steps)}
+
+    return [
+        ValidationIssue(
+            code="missing_named_source",
+            severity="warning",
+            message=f"La consulta nombra la fuente «{name}», pero ninguna salida lee sus datos.",
+            subject=name,
+        )
+        for name, datasets in named.items()
+        if not datasets & read
+    ]
+
+
+#
 # Valida que los cálculos publicados midan las variables pedidas o conservadas: en un seguimiento el modelo
 # arrastra variables de pedidos anteriores ya reemplazados («¿Y la conductividad?» tras el pH).
 #
@@ -190,7 +211,8 @@ def validate_requested_variables(operations, output_steps, variables) -> list[Va
     issues = []
 
     for step in (item for item in operations if item.id in relevant and item.calculations):
-        for field in step.output_fields:
+        measured = {item.output_name for item in step.calculations if item.function not in _COUNT_FUNCTIONS}
+        for field in (item for item in step.output_fields if item.name in measured):
             asked = [variables.get(ref.dataset_id) for ref in field.sources]
             unrequested = (
                 field.numeric_eligible
@@ -369,7 +391,7 @@ def validate_requested_scope(
         )
 
     if time_grain:
-        issues.extend(_time_grain_issues(steps, output_steps, time_grain))
+        issues.extend(_time_grain_issues(steps, output_steps, time_grain, dated_columns or {}))
 
     if categories and "count" not in statistics:
         issues.extend(_dimension_issues(steps, output_steps, dimensions or {}))
@@ -636,12 +658,12 @@ def _interval_text(period) -> str:
 #
 # Devuelve las incidencias de las salidas que no agrupan la fecha con el período temporal pedido.
 #
-def _time_grain_issues(steps, output_steps, time_grain) -> list[ValidationIssue]:
+def _time_grain_issues(steps, output_steps, time_grain, dated_columns) -> list[ValidationIssue]:
     issues = []
     for key in output_steps:
         chain = [steps[item] for item in _reachable_step_ids(steps, [key])]
         calculates = any(step.operation == "aggregate" for step in chain)
-        grouped = {grouping.time_grain for step in chain for grouping in step.group_by}
+        grouped = _grouped_grains(chain, dated_columns)
         if calculates and time_grain not in grouped:
             issues.append(
                 ValidationIssue(
@@ -655,7 +677,7 @@ def _time_grain_issues(steps, output_steps, time_grain) -> list[ValidationIssue]
 
     published = [steps[key] for key in _reachable_step_ids(steps, output_steps)]
     calculated = any(step.operation == "aggregate" for step in published)
-    grouped = {grouping.time_grain for step in published for grouping in step.group_by}
+    grouped = _grouped_grains(published, dated_columns)
     if not calculated and time_grain not in grouped:
         issues.append(
             ValidationIssue(
@@ -670,11 +692,33 @@ def _time_grain_issues(steps, output_steps, time_grain) -> list[ValidationIssue]
 
 
 #
-# Devuelve las columnas no numéricas por las que se pregunta, por dataset.
+# Devuelve los períodos por los que agrupan los pasos: el time_grain de una fecha, o year cuando se agrupa
+# por una columna que ya registra el año de cada fila.
+#
+def _grouped_grains(chain, dated_columns) -> set[str]:
+    return {_grouping_grain(step, grouping, dated_columns) for step in chain for grouping in step.group_by}
+
+
+#
+# Devuelve el período por el que agrupa una agrupación de un paso.
+#
+def _grouping_grain(step, grouping, dated_columns) -> str:
+    if grouping.time_grain != "raw":
+        return grouping.time_grain
+
+    field = next((item for item in step.output_fields if item.name == grouping.output_name), None)
+    sources = field.sources if field is not None else []
+    year = any(dated_columns.get((ref.dataset_id, ref.column)) == "year" for ref in sources)
+
+    return "year" if year else "raw"
+
+
+#
+# Devuelve las columnas de categorías por las que se pregunta, por dataset.
 #
 def requested_dimensions(evidence, datasets) -> dict[UUID, set[str]]:
-    types = {
-        (dataset.dataset_id, column.sql_name): column.sql_type
+    columns_by_name = {
+        (dataset.dataset_id, column.sql_name): column
         for dataset in datasets
         for column in dataset.columns_metadata
     }
@@ -682,16 +726,30 @@ def requested_dimensions(evidence, datasets) -> dict[UUID, set[str]]:
 
     for item in evidence.get("observed_evidence", []):
         dataset_id = UUID(item["dataset_id"])
+        variables = {column for names in item.get("variable_columns", {}).values() for column in names}
         columns = {
             column
             for names in item.get("requested_dimension_columns", {}).values()
             for column in names
-            if types.get((dataset_id, column)) not in {*_NUMERIC_TYPES, None}
+            if _groups_categories(columns_by_name.get((dataset_id, column)), variables)
         }
         if columns:
             dimensions[dataset_id] = columns
 
     return dimensions
+
+
+#
+# Indica si la columna agrupa categorías: una de texto o un código entero (una clase de alerta) que no es una
+# variable pedida ni un año, que se agrupa como período.
+#
+def _groups_categories(column, variables) -> bool:
+    if column is None:
+        return False
+    if column.sql_type == "BIGINT":
+        return column.sql_name not in variables and singular_words(column.original_name) not in YEAR_COLUMN_NAMES
+
+    return column.sql_type not in _NUMERIC_TYPES
 
 
 #
@@ -977,7 +1035,7 @@ def _dimension_issues(steps, output_steps, dimensions) -> list[ValidationIssue]:
             for dataset_id in _read_datasets(rows, steps)
             for column in dimensions.get(dataset_id, ())
         }
-        if requested and not _exposes(rows, requested):
+        if requested and not _exposes(rows, requested, steps):
             names = ", ".join(sorted({column for _, column in requested}))
             issues.append(
                 ValidationIssue(
@@ -1038,14 +1096,29 @@ def _read_datasets(step, steps) -> set[UUID]:
 
 
 #
-# Indica si el paso expone alguna columna no numérica de las pedidas.
+# Indica si el paso expone alguna de las columnas pedidas como categoría: un campo no numérico o uno que la
+# copia sin calcularla, como un código entero agrupado o leído (una clase de alerta).
 #
-def _exposes(step, requested) -> bool:
+def _exposes(step, requested, steps) -> bool:
+    copied = _copied_fields(step, steps)
+
     return any(
-        not field.numeric_eligible
+        (not field.numeric_eligible or field.name in copied)
         and {(ref.dataset_id, ref.column) for ref in field.sources} & requested
         for field in step.output_fields
     )
+
+
+#
+# Devuelve los campos que el paso copia de su origen sin calcularlos (agrupaciones de un aggregate o columnas
+# leídas), tras saltar los sort y latest.
+#
+def _copied_fields(step, steps) -> set[str]:
+    while step.operation in _PASSTHROUGH_OPERATIONS and step.depends_on and step.depends_on[0] in steps:
+        step = steps[step.depends_on[0]]
+    calculated = {calculation.output_name for calculation in step.calculations}
+
+    return {field.name for field in step.output_fields if field.name not in calculated}
 
 
 #

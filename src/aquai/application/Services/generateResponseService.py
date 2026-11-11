@@ -1,7 +1,7 @@
 import math
 from time import perf_counter
 
-from aquai.application.answering.blocked import blocked_explanations
+from aquai.application.answering.blocked import blocked_explanations, request_gaps
 from aquai.application.answering.context import (
     build_response_context,
     response_language,
@@ -13,6 +13,7 @@ from aquai.application.answering.coverage import (
     unit_notes,
 )
 from aquai.application.answering.drafting import (
+    ATTACHMENT_LEADS,
     analytical_request,
     apply_support,
     asks_interpretation,
@@ -48,9 +49,29 @@ from aquai.application.contracts.execution import ExecutionError
 from aquai.application.errors import LLMProviderError
 from aquai.application.execution import evidence_fingerprint
 from aquai.application.interfaces.answering import ResponseProvider, TextEmbeddings
-from aquai.application.matching import reference_operator
+from aquai.application.matching import (
+    asked_reference,
+    names_subject,
+    reference_operator,
+    variable_core,
+    variable_variants,
+    without_medium,
+)
+from aquai.application.Rules.evidence import EXPLANATION_CUES, LITERATURE_CLAUSE
 
 _MIN_SUPPORT = 0.7
+_UNCOVERED_LITERATURE = {
+    "es": "La consulta pide qué dice la bibliografía sobre {topic}, pero los documentos que pude verificar no tratan "
+    "ese tema, así que esa parte queda sin responder.",
+    "en": "The question asks what the literature says about {topic}, but the documents I could verify do not address "
+    "it, so that part remains unanswered.",
+}
+_UNANSWERED_REFERENCE = {
+    "es": "La consulta pide comparar con valores de referencia, pero no pude verificar en los documentos recuperados "
+    "un valor comparable con este resultado, así que esa comparación queda sin responder.",
+    "en": "The question asks for a comparison with reference values, but I could not verify in the retrieved "
+    "documents a value comparable with this result, so that comparison remains unanswered.",
+}
 _MIN_LISTED_SUPPORT = 0.45
 _ALIGNMENT_MARGIN = 0.03
 _PAIR_MARGIN = 0.03
@@ -150,6 +171,7 @@ class GenerateResponseService:
         _attach_context(response, context, language)
 
         contrast = state.document_contrast or DocumentContrast()
+        response.reference_values = contrast.references
         notes = [
             *unit_notes(state, language),
             *coverage_notes(state, language),
@@ -159,14 +181,25 @@ class GenerateResponseService:
         thresholds = _threshold_notes(state.routing, language)
         told = [*notes, *(item.text for item in thresholds)]
         written = await self._written(response, state, context, told, contrast, language)
-        body = written if written is not None else self._verified_text(context, refs)
+        body = written if written is not None else [*self._verified_text(context, refs), *_compared(contrast)]
         if validation.status == "partial":
-            missing = blocked_explanations(state, language) or [self._message("partial", language)]
+            missing = [*blocked_explanations(state, language), *request_gaps(state, language)]
+            missing = missing or [self._message("partial", language)]
             body = [*(AnswerSegment(kind="note", text=text) for text in missing), *body]
 
-        closing = [*notes, *_interpretation_notes(state, response, written, language, self._message)]
-        self._publish(response, [*body, *thresholds, *(AnswerSegment(kind="note", text=item) for item in closing)])
-        _cite_thresholds(response, state, thresholds)
+        interpretation = _interpretation_notes(state, body, language, self._message)
+        unanswered = [
+            *_unanswered_reference(state, contrast, thresholds, response, language),
+            *_uncovered_literature(state, body, language),
+        ]
+        closing = [
+            AnswerSegment(kind="note", text=item, document_ids=contrast.note_documents.get(item, []))
+            for item in [*notes, *unanswered, *interpretation]
+        ]
+        if response.status == "validated" and (unanswered or _unexplained(state, interpretation)):
+            response.status = "partial"
+        self._publish(response, [*body, *thresholds, *closing])
+        _cite_notes(response, state, [*([] if written is not None else body), *thresholds, *closing])
         _record_trace(response, state)
 
         return self._finish(response, started)
@@ -327,8 +360,12 @@ class GenerateResponseService:
                 continue
 
             lines = cited_lines(segment, request)
-            numbered = _numbered_lines(text, lines, request.evidence.language)
-            aligned = _closest(vectors, text, numbered) if numbered else _aligned_lines(vectors, text, lines)
+            numbered, contributing = _numbered_lines(text, lines, request.evidence.language)
+            aligned = (
+                [*_closest(vectors, text, numbered), *contributing]
+                if numbered
+                else _aligned_lines(vectors, text, lines)
+            )
             if not aligned:
                 continue
 
@@ -402,8 +439,9 @@ class GenerateResponseService:
     def _verified_text(self, context, refs):
         catalog = {item["sentence_id"]: item for item in context.evidence["sentence_catalog"]}
         entries = [(entry, entry["direct"]) for entry in self._ordered_entries(catalog, refs)]
+        lead = ATTACHMENT_LEADS[context.evidence["language"]]
 
-        return [*_introduction(context), *self._segments(entries)]
+        return [*_introduction(context), *self._segments(entries, lead)]
 
     #
     # Marca la respuesta como fallida porque la evidencia cambió después de validarse.
@@ -476,13 +514,21 @@ class GenerateResponseService:
         return sorted(catalog.values(), key=lambda entry: _position(entry, order))
 
     #
-    # Agrupa las oraciones consecutivas con la misma evidencia en segmentos de respuesta.
+    # Agrupa las oraciones consecutivas con la misma evidencia en segmentos de respuesta. Una oración que ya se
+    # publicó (dos salidas con el mismo resultado) no se repite: su tabla, si la tiene, va con el rótulo neutro.
     #
     @staticmethod
-    def _segments(entries):
+    def _segments(entries, lead):
         segments = []
 
         for entry, text in entries:
+            said = next((item for item in segments if text in item.text), None)
+            attachment = entry.get("attachment")
+            if said is not None and attachment and attachment != said.attachment:
+                segments.append(AnswerSegment(text=lead, evidence_ids=list(entry["evidence_ids"]), attachment=attachment))
+            if said is not None:
+                continue
+
             previous = segments[-1] if segments else None
             if previous is not None and previous.evidence_ids == entry["evidence_ids"]:
                 previous.text += " " + text
@@ -716,21 +762,90 @@ def _authorized_lines(response, contrast):
 #
 # Devuelve el aviso de un resultado que no se pudo interpretar con los documentos, sólo si se pidió.
 #
-def _interpretation_notes(state, response, written, language, message):
+def _interpretation_notes(state, segments, language, message):
     retrieval = state.document_retrieval
     question = state.routing.original_question if state.routing else state.question
     if retrieval is None or retrieval.purpose != "enrichment" or retrieval.status == "skipped":
         return []
-    if not asks_interpretation(question):
+    if not (asks_interpretation(question) or LITERATURE_CLAUSE.search(question)):
+        return []
+    if any(item.role in _ALIGNED_ROLES and item.document_ids for item in segments):
         return []
     if retrieval.status == "unavailable":
         return [message("interpretation_unavailable", language)]
-    if retrieval.status == "found" and (written is None or not response.document_references):
+    if retrieval.status == "found":
         return [message("interpretation_unverified", language)]
-    if not response.document_references:
-        return [message("no_interpretation", language)]
 
-    return []
+    return [message("no_interpretation", language)]
+
+
+#
+# Devuelve los contrastes verificados con referencias documentales como párrafos citados: si la redacción falla,
+# el texto determinístico no debe perderlos.
+#
+def _compared(contrast) -> list[AnswerSegment]:
+    return [
+        AnswerSegment(
+            kind="paragraph",
+            role="relation",
+            text=item.text,
+            evidence_ids=[item.evidence_id],
+            document_ids=[item.document_id],
+        )
+        for item in contrast.comparisons
+    ]
+
+
+#
+# Devuelve el aviso de un contraste con valores de referencia que la consulta pidió y la respuesta no hizo ni
+# explicó: sin él, una respuesta a medias se publicaría como completa.
+#
+def _unanswered_reference(state, contrast, thresholds, response, language) -> list[str]:
+    question = state.routing.original_question if state.routing else state.question
+    explained = contrast.comparisons or contrast.notes or thresholds or response.reference_lines
+    if asked_reference(question) is None or explained:
+        return []
+
+    return [_UNANSWERED_REFERENCE[language]]
+
+
+#
+# Devuelve el aviso de un pedido a la bibliografía sobre variables del análisis («qué dice la bibliografía
+# sobre el efecto de la turbidez en las cianobacterias») que ningún párrafo documentado trata: citar documentos
+# de otro tema no lo responde.
+#
+def _uncovered_literature(state, segments, language) -> list[str]:
+    question = state.routing.original_question if state.routing else state.question
+    clauses = [match.group() for match in LITERATURE_CLAUSE.finditer(question)]
+    mentions = [item.text for item in state.routing.data_mentions if item.kind == "variable"] if state.routing else []
+    terms = {text: _variable_terms(text) for text in mentions}
+    topic = [text for text, names in terms.items() if any(names_subject(clause, names) for clause in clauses)]
+    documented = [item.text for item in segments if item.role in _ALIGNED_ROLES]
+    if not topic or any(all(names_subject(text, terms[item]) for item in topic) for text in documented):
+        return []
+
+    return [_UNCOVERED_LITERATURE[language].format(topic=join_words(topic, language))]
+
+
+#
+# Devuelve los nombres con que un texto puede tratar una variable: sus sinónimos, sin el medio ni la
+# estadística, y los de su primera palabra («cianobacterias» por «cianobacterias totales»).
+#
+def _variable_terms(mention) -> list[str]:
+    core = without_medium(variable_core(mention)) or mention
+    head = core.split()[0] if core.split() else core
+
+    return list(dict.fromkeys([*variable_variants(core), *variable_variants(head)]))
+
+
+#
+# Indica si la consulta pidió explicar o interpretar con la bibliografía y no quedó ningún párrafo documentado:
+# los resultados se conservan, pero la respuesta es parcial.
+#
+def _unexplained(state, interpretation) -> bool:
+    question = state.routing.original_question if state.routing else state.question
+
+    return bool(interpretation) and bool(EXPLANATION_CUES.search(question) or LITERATURE_CLAUSE.search(question))
 
 
 #
@@ -759,8 +874,11 @@ def _record_trace(response, state):
         }
         for item in retrieval.fragments
     ]
+    trace.unselected = retrieval.unselected
     contrast = getattr(state, "document_contrast", None)
     trace.warnings = [*retrieval.warnings, *(contrast.warnings if contrast else [])]
+    if contrast is not None:
+        trace.rejected_segments.extend(contrast.rejected)
     response.document_trace = trace
 
 
@@ -828,21 +946,32 @@ def _aligned_lines(vectors, text, lines) -> list[tuple[str, str, tuple]]:
 
 
 #
-# Devuelve las oraciones de los fragmentos de donde salen las cifras de una oración: las que contienen
-# más de sus números, con su sección y los pares con sus vecinas.
+# Devuelve las oraciones de los fragmentos de donde salen las cifras de una oración, con su sección y los
+# pares con sus vecinas: las que contienen más de sus números y, aparte, las que aportan las cifras que esas
+# no tienen; una oración que funde dos frases debe conservar las acotaciones de ambas.
 #
-def _numbered_lines(text, lines, language) -> list[tuple[str, str, tuple]]:
+def _numbered_lines(text, lines, language) -> tuple[list, list]:
     wanted = [reading.values for reading in number_readings(text, language)]
     if not wanted:
-        return []
+        return [], []
 
-    counted = []
-    for _, line, heading, pairs in lines:
-        found = set().union(*(reading.values for reading in number_readings(line)))
-        counted.append((sum(bool(values & found) for values in wanted), line, heading, pairs))
-    most = max((item[0] for item in counted), default=0)
+    found = [set().union(*(reading.values for reading in number_readings(line))) for _, line, _, _ in lines]
+    counts = [sum(bool(values & numbers) for values in wanted) for numbers in found]
+    most = max(counts, default=0)
+    if not most:
+        return [], []
 
-    return [(line, heading, pairs) for count, line, heading, pairs in counted if most and count == most]
+    primary = [index for index, count in enumerate(counts) if count == most]
+    covered = {position for index in primary for position, values in enumerate(wanted) if values & found[index]}
+    contributing = []
+    for position, values in enumerate(wanted):
+        holder = next((index for index, numbers in enumerate(found) if values & numbers), None)
+        if position in covered or holder is None:
+            continue
+        contributing.append(holder)
+        covered |= {item for item, other in enumerate(wanted) if other & found[holder]}
+
+    return [lines[index][1:] for index in primary], [lines[index][1:] for index in contributing]
 
 
 #
@@ -967,15 +1096,17 @@ def _threshold_notes(routing, language) -> list[AnswerSegment]:
 
 
 #
-# Agrega a las referencias de la respuesta los fragmentos que dan los umbrales usados.
+# Agrega a las referencias de la respuesta los fragmentos que citan las notas: los umbrales usados y las
+# referencias que no se compararon.
 #
-def _cite_thresholds(response, state, thresholds):
+def _cite_notes(response, state, notes):
     retrieval = state.document_retrieval
-    if not thresholds or retrieval is None:
+    cited = [item for item in notes if item.document_ids]
+    if not cited or retrieval is None:
         return
 
     known = {item.evidence_id for item in response.document_references}
-    added = [item for item in cited_references(thresholds, retrieval.fragments) if item.evidence_id not in known]
+    added = [item for item in cited_references(cited, retrieval.fragments) if item.evidence_id not in known]
     response.document_references = [*response.document_references, *added]
 
 

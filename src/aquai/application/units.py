@@ -20,9 +20,11 @@ from aquai.application.Rules.units import (
     UNIT_WORDS,
 )
 from aquai.application.Rules.variables import NAME_SEPARATORS, PH_ALIASES
+from aquai.application.Rules.vocabulary import YEAR_COLUMN_NAMES
 
 _INVERSE_POWER = re.compile(r"\s+(\S+?)\^?-(\d)$")
 _SPACED_POWER = re.compile(r"\s*-\s*(\d)$")
+_PRODUCT_SIGN = re.compile(r"(?<=[^\W\d_])\s?[.·]\s?(?=[^\W\d_])")
 _GLUED_POWER = re.compile(r"(?<=[gGsS])(?=(?:[Ll]|c?m)-\d$)")
 _POWER_SIGNS = str.maketrans("⁰¹²³⁴⁵⁶⁷⁸⁹⁻−–", "0123456789---")
 _WORD = re.compile(r"[^\W\d_]+")
@@ -45,10 +47,18 @@ def is_ph_field(field) -> bool:
 
 
 #
-# Devuelve el estado de unidad a presentar, tratando el pH como adimensional.
+# Indica si todas las columnas de origen de un campo entero registran el año de cada fila.
+#
+def is_year_field(field) -> bool:
+    sources = field.sources
+    return field.sql_type == "BIGINT" and bool(sources) and all((ref.column,) in YEAR_COLUMN_NAMES for ref in sources)
+
+
+#
+# Devuelve el estado de unidad a presentar, tratando el pH y el año como adimensionales.
 #
 def presentation_unit_status(field):
-    return "dimensionless" if is_ph_field(field) else field.unit_status
+    return "dimensionless" if is_ph_field(field) or is_year_field(field) else field.unit_status
 
 
 #
@@ -94,7 +104,8 @@ def repaired_symbols(unit: str) -> str:
 #
 def unit_key(unit: str) -> str:
     without_basis = UNIT_BASIS.sub(lambda match: match.group("unit") or "", repaired_symbols(unit))
-    text = _SPACED_POWER.sub(r"-\1", without_basis.translate(_POWER_SIGNS).strip())
+    text = _PRODUCT_SIGN.sub(" ", without_basis.translate(_POWER_SIGNS).strip())
+    text = _SPACED_POWER.sub(r"-\1", text)
     text = _GLUED_POWER.sub(" ", text)
     text = unicodedata.normalize("NFKD", text)
     text = "".join(char for char in text if not unicodedata.combining(char))

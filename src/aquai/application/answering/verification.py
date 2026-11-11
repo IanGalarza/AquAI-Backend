@@ -26,6 +26,7 @@ from aquai.application.Rules.evidence import (
     FOREIGN_SCRIPT,
     FREQUENCY_WORDS,
     FULL_DATE,
+    GUIDELINE_CUES,
     HEDGE_CUES,
     INLINE_REFERENCE,
     INTERNAL_TERMS,
@@ -38,6 +39,7 @@ from aquai.application.Rules.evidence import (
     ORGANIZATION_NAMES,
     QUALIFIER_FAMILIES,
     RECOMMENDATIONS,
+    REFERENCE_LABELS,
     RELATION_LANGUAGE,
     RELATIVE_QUANTITIES,
     RESULT_WORDS,
@@ -170,6 +172,7 @@ class DraftVerifier:
             *self._places(segment, text),
             *self._attributions(segment, text),
             *self._frequencies(segment, text),
+            *self._reference_labels(segment, text),
             *self._conditions(segment, text),
         ]
 
@@ -674,6 +677,23 @@ class DraftVerifier:
             return []
 
         return [Rejection("unsupported_frequency", found.group())]
+
+    #
+    # Revisa que no se llame valor de referencia, guía, umbral o límite a lo que los fragmentos citados sólo
+    # reportan como medición de un estudio: el promedio de un sitio no es una norma.
+    #
+    def _reference_labels(self, segment, text) -> list[Rejection]:
+        evidence = self._evidence
+        found = REFERENCE_LABELS.search(text)
+        if segment.role not in {"documented", "relation"} or found is None:
+            return []
+
+        cited = [evidence.documents[key] for key in segment.document_ids]
+        cited += [evidence.facts[key] for key in segment.fact_ids]
+        if any(GUIDELINE_CUES.search(item) for item in cited):
+            return []
+
+        return [Rejection("unsupported_reference_label", found.group())]
 
     #
     # Revisa que el texto no agregue conclusiones estadísticas ausentes de lo que cita.

@@ -60,6 +60,8 @@ Reglas que no admiten excepción:
 - No afirmes causas de lo observado, toxicidad, riesgo ni aptitud del agua. Los documentos permiten
   decir que algo se asocia o puede relacionarse, no que ocurrió en estos datos.
 - Un valor documentado para otro uso, lugar o unidad se presenta como tal, sin aplicarlo a los datos.
+  Un promedio, rango o valor que un estudio midió no es un valor de referencia, guía, umbral ni límite:
+  decí que es lo que reportó ese estudio.
 - No compares ni clasifiques lo observado (seguro, normal, aceptable, dentro de un rango) salvo que lo
   diga un fact de kind comparison. Si no lo hay, contá qué dicen los documentos y dejá la comparación afuera.
 - No menciones identificadores como s1, d1 o e1, ni nombres de campos. Las citas son estructurales:

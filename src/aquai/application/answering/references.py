@@ -1,7 +1,7 @@
 import re
 from decimal import Decimal
 
-from aquai.application.answering.hypotheses import documented_values
+from aquai.application.answering.hypotheses import documented_values, unit_factor
 from aquai.application.answering.measures import shown_value
 from aquai.application.answering.presentation import format_unit
 from aquai.application.answering.readings import (
@@ -15,18 +15,24 @@ from aquai.application.answering.wording import calculation_noun, join_words
 from aquai.application.contracts.answering import ComparisonFact, ReferenceLine, ReferenceValue
 from aquai.application.contracts.retrieval import ReferenceDraft
 from aquai.application.matching import (
+    contains_joined_phrase,
     contains_phrase,
     named_variable_groups,
     names_subject,
+    normalize_text,
     requires_chemical_basis,
 )
 from aquai.application.Rules.documents import normalized_text
 from aquai.application.Rules.evidence import (
     DETECTION_LIMIT,
     DOCUMENT_YEAR,
+    FREQUENCY_WORDS,
     GUIDELINE_CUES,
     MEAN_WITH_DEVIATION,
+    ORGANIZATION_AGENT,
+    ORGANIZATION_NAMES,
     REFERENCE_LINE_CUES,
+    STATED_PERCENTILE,
     WATER_USES,
 )
 from aquai.application.units import comparable_unit, concentration_basis, counts_organisms, unit_key
@@ -38,6 +44,7 @@ _MIN_CONDITION_WORDS = 2
 _MAX_CONDITION_CHARS = 120
 _SECTION_NUMBER = re.compile(r"^\s*(?:\d+(?:\.\d+)*\.?|[IVX]+\.)\s+")
 _MAX_GUIDELINES = 4
+_MAX_TRACED_QUOTE = 90
 _CITED_NUMBER = re.compile(
     r"\b(?:tablas?|tables?|fig(?:ura|ure)?s?|cap[ií]tulos?|chapters?|secci[oó]n|sections?|p|pp|vol|n[º°o])\.?\s*$",
     re.IGNORECASE,
@@ -79,7 +86,33 @@ _KIND_LABELS = {
 }
 _COMPARABLE_KINDS = ("guideline", "limit", "typical_range")
 _LINE_KINDS = ("guideline", "limit")
-_INCOMPARABLE = ("other_unit", "other_basis")
+_INCOMPARABLE = ("other_unit", "other_basis", "other_statistic")
+_DOCUMENTED = {"es": "documentado para", "en": "documented for"}
+_IS = {"es": "es", "en": "is"}
+_UNCOMPARED = {
+    "es": {
+        "equivalent": ", que equivale a {value} {unit}",
+        "attributed": "El documento atribuye ese valor a la OMS",
+        "doubted": "No lo comparé con el resultado porque la unidad que declara el dato podría ser incorrecta.",
+        "scaled": "No lo comparé con el resultado: sólo comparo valores en la misma unidad que declara el dato, "
+        "sin convertirlos.",
+        "other": "Está en otra unidad o base química que el dato{unit} y no se puede convertir sin supuestos, así "
+        "que no lo comparé.",
+        "statistic": "El documento lo define sobre un percentil de las mediciones («{statistic}»), no sobre un "
+        "promedio ni sobre valores sueltos, así que no lo comparé con el resultado.",
+    },
+    "en": {
+        "equivalent": ", equivalent to {value} {unit}",
+        "attributed": "The document attributes that value to the WHO",
+        "doubted": "I did not compare it with the result because the unit declared for the data may be wrong.",
+        "scaled": "I did not compare it with the result: I only compare values in the unit the data declares, "
+        "without converting them.",
+        "other": "It is in a different unit or chemical basis than the data{unit} and cannot be converted without "
+        "assumptions, so I did not compare it.",
+        "statistic": "The document defines it on a percentile of the measurements («{statistic}»), not on a mean or "
+        "on single values, so I did not compare it with the result.",
+    },
+}
 
 
 #
@@ -175,22 +208,75 @@ def _read_draft(value, result) -> ReferenceDraft:
 #
 # Conserva las referencias propuestas que se comprueban contra su fragmento y su resultado.
 #
-def verified_references(drafts, fragments, results, question, places=()) -> list[ReferenceValue]:
+def verified_references(drafts, fragments, results, question, places=(), rejected=None) -> list[ReferenceValue]:
     documents = {item.evidence_id: item for item in fragments}
     asked = water_uses(question)
     verified = {}
     for draft in drafts:
         fragment = documents.get(draft.document_id)
-        if fragment is None or fragment.doubts:
-            continue
-        draft = _with_stated_mean(_with_counted_unit(draft))
-        if not _literal(draft, fragment) or _detection_limit(draft, fragment):
+        draft = _with_quoted_unit(_with_stated_mean(_with_counted_unit(draft)))
+        reason = _unverified(draft, fragment, results)
+        if reason is not None:
+            if rejected is not None:
+                rejected.append(_rejection(draft, reason))
             continue
         for result in _targets(draft, results):
             if _names_variable(draft, fragment, result) and _in_variable_cell(draft, fragment, result):
                 _keep(verified, _reference(draft, fragment, result, asked, places))
 
     return _headed_conditions(list(verified.values()), documents)
+
+
+#
+# Usa la unidad que la cita escribe junto a sus cotas cuando la propuesta trae otra: el modelo suele copiar la
+# unidad del resultado, y vale la del documento. Si la cita no escribe ninguna junto a las cotas, no cambia.
+#
+def _with_quoted_unit(draft):
+    bounds = [item for item in (draft.low, draft.high) if item is not None]
+    if not bounds or (draft.unit is not None and all(_bound_has_unit(item, draft) for item in bounds)):
+        return draft
+
+    for unit in dict.fromkeys(reading.unit for reading in number_readings(draft.quote) if reading.unit):
+        quoted = draft.model_copy(update={"unit": unit})
+        if all(_bound_has_unit(item, quoted) for item in bounds):
+            return quoted
+
+    return draft
+
+
+#
+# Devuelve por qué una referencia propuesta no se verifica contra su fragmento y los resultados, o None.
+#
+def _unverified(draft, fragment, results) -> str | None:
+    if fragment is None:
+        return "unknown_fragment"
+    if fragment.doubts:
+        return "doubtful_fragment"
+    literal = _literal_problem(draft, fragment)
+    if literal is not None:
+        return literal
+    if _detection_limit(draft, fragment):
+        return "detection_limit"
+
+    targets = _targets(draft, results)
+    if not targets:
+        return "other_variable"
+    if not any(_names_variable(draft, fragment, result) for result in targets):
+        return "variable_not_named"
+    if not any(_in_variable_cell(draft, fragment, result) for result in targets):
+        return "outside_variable_cell"
+
+    return None
+
+
+#
+# Describe una referencia rechazada para la traza: motivo, fragmento, cita, valor, unidad y variable.
+#
+def _rejection(draft, reason) -> dict:
+    quote = " ".join(draft.quote.split())[:_MAX_TRACED_QUOTE]
+    detail = f"{draft.document_id} «{quote}» {draft.low}-{draft.high} {draft.unit or ''} ({draft.variable})"
+
+    return {"role": "reference", "code": reason, "detail": detail}
 
 
 #
@@ -312,31 +398,33 @@ def _cell_of_variable(row, first_row, draft, result) -> bool:
 # porque archivos distintos pueden medirla en unidades distintas.
 #
 def _targets(draft, results):
-    wanted = normalized_text(draft.variable)
+    wanted = normalize_text(draft.variable)
     named = [
         result
         for result in results
-        if any(normalized_text(name) == wanted for name in (result.variable, result.column, result.label))
+        if any(normalize_text(name) == wanted for name in (result.variable, result.column, result.label, *result.names))
     ]
 
     return named or (results[:1] if len(results) == 1 else [])
 
 
 #
-# Indica si la cita, sus números y su unidad figuran tal cual en el fragmento.
+# Devuelve qué falla para que la cita, sus números y su unidad figuren tal cual en el fragmento, o None.
 #
-def _literal(draft, fragment) -> bool:
+def _literal_problem(draft, fragment) -> str | None:
     quote = normalized_text(draft.quote)
     if not quote or quote not in normalized_text(fragment.text):
-        return False
+        return "quote_not_in_fragment"
 
     readings = number_readings(draft.quote)
     shown = {value for reading in readings for value in reading.values}
     bounds = [item for item in (draft.low, draft.high) if item is not None]
     if not bounds or any(_decimal(item) not in shown for item in bounds):
-        return False
+        return "value_not_in_quote"
+    if draft.unit is not None and not all(_bound_has_unit(item, draft) for item in bounds):
+        return "unit_not_with_value"
 
-    return draft.unit is None or all(_bound_has_unit(item, draft) for item in bounds)
+    return None
 
 
 #
@@ -389,7 +477,9 @@ def _lead_in(quote, text) -> str:
 # Indica si un texto contiene alguno de los nombres de una variable.
 #
 def _names_any(text, names) -> bool:
-    return any(contains_phrase(text, name, plural_insensitive=True) for name in names)
+    return any(
+        contains_phrase(text, name, plural_insensitive=True) or contains_joined_phrase(text, name) for name in names
+    )
 
 
 #
@@ -399,7 +489,7 @@ def _reference(draft, fragment, result, asked, places) -> ReferenceValue:
     context = " ".join([*fragment.section, fragment.element_caption or "", fragment.title or ""])
     around = f"{draft.quote} {context}"
     uses = _value_uses(draft, fragment, context)
-    status, detail = _compatibility(draft, result, uses, asked)
+    status, detail = _compatibility(draft, result, uses, asked, _stated_statistic(draft, fragment))
 
     return ReferenceValue(
         evidence_id=fragment.evidence_id,
@@ -477,21 +567,28 @@ def _reports_place(draft, fragment, place, around) -> bool:
 
 
 #
-# Devuelve el tipo de referencia: una guía o un límite tienen que decirse como tales en el texto.
+# Devuelve el tipo de referencia: una guía o un límite tienen que decirse como tales en el texto, o la cita
+# tiene que atribuir el valor a un organismo que los fija («indicated by the WHO», «según la OMS»); un rango
+# típico tiene que decir que es lo habitual. Si no, es lo que el documento observó.
 #
 def _stated_kind(draft, fragment) -> str:
+    around = " ".join([draft.quote, *fragment.section[-2:], fragment.element_caption or ""])
+    if draft.kind == "typical_range":
+        return draft.kind if FREQUENCY_WORDS.search(around) else "observed"
     if draft.kind not in _LINE_KINDS:
         return draft.kind
 
-    around = " ".join([draft.quote, *fragment.section[-2:], fragment.element_caption or ""])
+    stated = GUIDELINE_CUES.search(around) or ORGANIZATION_AGENT.search(draft.quote)
 
-    return draft.kind if GUIDELINE_CUES.search(around) else "observed"
+    return draft.kind if stated else "observed"
 
 
 #
 # Decide si un valor se puede contrastar con el resultado, en orden de requisitos.
 #
-def _compatibility(draft, result, uses, asked):
+def _compatibility(draft, result, uses, asked, statistic=None):
+    if statistic is not None and result.function != "quantile":
+        return "other_statistic", statistic
     status, detail = _unit_compatibility(draft, result)
     if status != "compatible":
         return status, detail
@@ -499,6 +596,18 @@ def _compatibility(draft, result, uses, asked):
         return "other_use", ", ".join(sorted(uses)) or None
 
     return status, detail
+
+
+#
+# Devuelve el percentil sobre el que el documento define el valor («95th percentile»), dicho en la cita, en su
+# oración, en la leyenda o en el encabezado de su tabla; None si no dice ninguno.
+#
+def _stated_statistic(draft, fragment) -> str | None:
+    header = next((line for line in fragment.text.splitlines() if _TABLE_CELL in line), "")
+    around = " ".join([draft.quote, _lead_in(draft.quote, fragment.text), fragment.element_caption or "", header])
+    found = STATED_PERCENTILE.search(around)
+
+    return found.group() if found else None
 
 
 #
@@ -769,30 +878,59 @@ def _bounds_text(reference, language) -> str:
 
 
 #
-# Explica qué guías o límites documentados no se compararon por estar en otra unidad o base química.
+# Presenta las guías y límites documentados que no se compararon con el resultado, con su valor, uso y
+# condición: están en otra unidad o base química, o la unidad que declara el dato es dudosa. Si la unidad sólo
+# cambia de escala da la equivalencia, pero no compara. Devuelve cada nota con los fragmentos que la respaldan.
 #
-def incompatibility_notes(references, language) -> list[str]:
-    units = sorted(
-        {
-            format_unit(item.unit)
-            for item in references
-            if item.unit and item.kind in _COMPARABLE_KINDS and item.status in _INCOMPARABLE
-        }
+def incompatibility_notes(references, results, language, doubtful=frozenset()) -> dict[str, list[str]]:
+    units = {item.field: item.unit for item in results}
+    notes = {}
+    for reference in references:
+        doubted = reference.result_field in doubtful
+        if reference.kind not in _COMPARABLE_KINDS or not (doubted or reference.status in _INCOMPARABLE):
+            continue
+        text = _uncompared(reference, units.get(reference.result_field), doubted, language)
+        notes.setdefault(text, []).append(reference.evidence_id)
+
+    return {text: list(dict.fromkeys(ids)) for text, ids in list(notes.items())[:_MAX_GUIDELINES]}
+
+
+#
+# Redacta una referencia que no se comparó: qué dice el documento, su equivalencia si la hay y por qué no.
+#
+def _uncompared(reference, result_unit, doubted, language) -> str:
+    kind = _KIND_LABELS[language][reference.kind]
+    stated = f"{kind[:1].upper()}{kind[1:]} {_DOCUMENTED[language]} {reference.variable} {_IS[language]} " + (
+        reference_option(reference, language)
     )
-    if not units:
-        return []
+    factor = unit_factor(reference.unit, result_unit) if reference.status == "other_unit" and result_unit else None
+    if factor is not None and factor != 1:
+        stated += _UNCOMPARED[language]["equivalent"].format(
+            value=_converted_bounds(reference, factor, language), unit=format_unit(result_unit)
+        )
+    if ORGANIZATION_NAMES.search(reference.quote):
+        stated += f". {_UNCOMPARED[language]['attributed']}"
+    if doubted:
+        reason = "doubted"
+    elif reference.status == "other_statistic":
+        reason = "statistic"
+    elif factor is not None and factor != 1:
+        reason = "scaled"
+    else:
+        reason = "other"
+    unit = f" ({format_unit(result_unit)})" if result_unit else ""
 
-    named = join_words(units, language)
-    if language == "en":
-        return [
-            f"I did not compare this result with the documented reference values: they are in {named}, "
-            "a different unit or chemical basis, and I did not convert them."
-        ]
+    return f"{stated}. {_UNCOMPARED[language][reason].format(unit=unit, statistic=reference.detail)}"
 
-    return [
-        f"No comparé este resultado con los valores de referencia documentados: están en {named}, otra "
-        "unidad o base química, y no los convertí."
-    ]
+
+#
+# Devuelve los extremos de una referencia convertidos a la escala del resultado.
+#
+def _converted_bounds(reference, factor, language) -> str:
+    values = [Decimal(str(item)) * factor for item in (reference.low, reference.high) if item is not None]
+    low, high = min(values), max(values)
+
+    return shown_value(low, language) if low == high else f"{shown_value(low, language)}-{shown_value(high, language)}"
 
 
 #

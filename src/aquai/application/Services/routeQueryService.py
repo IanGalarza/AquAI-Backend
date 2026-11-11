@@ -21,6 +21,7 @@ from aquai.application.matching import (
     documented_reference,
     mentioned_count,
     named_documents,
+    names_known_variable,
     normalize_name,
     normalize_text,
     numeric_comparisons,
@@ -39,18 +40,23 @@ from aquai.application.Rules.evidence import (
     DOCUMENT_ANAPHORA,
     GUIDELINE_CUES,
     LAST_RESULT,
+    LITERATURE_CLAUSE,
     OBSERVED_COMPARISON,
     ORGANIZATION_NAMES,
     REFERENTIAL_QUESTION,
     REPEAT_REQUEST,
 )
+from aquai.application.Rules.units import SIMPLE_UNIT
+from aquai.application.units import spelled_symbol
 from aquai.application.Rules.vocabulary import (
     ADDITIVE_CUES,
     CATEGORY_CUES,
     CHART_WORDS,
     CONTINUATION_CUES,
+    GROUPING_CUES,
     MEASURED_STATISTICS,
     MENTION_CONNECTORS,
+    NON_GROUPING_WORDS,
     PLACE_WORDS,
     SOURCE_ALIAS_CUES,
     SOURCE_CUE_WINDOW,
@@ -76,6 +82,17 @@ _ELLIPSIS_WORDS = {*MENTION_CONNECTORS, *(word for cue in CONTINUATION_CUES for 
 _PLACE_NAMES = {normalize_text(word) for word in PLACE_WORDS}
 _CHART_FILLERS = {*MENTION_CONNECTORS, "un", "una", "a", "an"}
 _CHART_WORD = re.compile(rf"\b{CHART_WORDS}\b", re.IGNORECASE)
+_GROUPING_CLAUSE = re.compile(rf"\s+(?:(?:y|e|and)\s+|,\s*)?({'|'.join(GROUPING_CUES)})\s+", re.IGNORECASE)
+_CLAUSE_END = re.compile(r"\s+(?:en|in)\s+", re.IGNORECASE)
+_ENUMERATED_CATEGORY = re.compile(r"(?P<category>[^(),]+?)\s*\((?P<levels>[^()]+,[^()]+)\)")
+_PRESENCE_GROUPS = re.compile(
+    r"\b(?:con|with)\s+(?:(?:y|e|o|u|and|or)\s+(?:sin|without)\s+(?P<shared>[^\W\d_][\w-]*)"
+    r"|(?P<category>[^\W\d_][\w-]*(?:\s+[^\W\d_][\w-]*){0,2}?)\s+(?:y|e|o|u|and|or)\s+(?:sin|without)\s+"
+    r"(?P=category)\b)",
+    re.IGNORECASE,
+)
+_LIST_SEPARATOR = re.compile(r"\s*,\s*(?:(?:y|e|and)\s+)?|\s+(?:y|e|and)\s+", re.IGNORECASE)
+_TIME_GRAIN_PHRASES = {cue for cues in TIME_GRAIN_CUES.values() for cue in cues}
 SOURCE_ALIAS = re.compile(
     rf"\b(?:{'|'.join(SOURCE_ALIAS_CUES)})\s+(?:(?:{'|'.join(SOURCE_NAME_CONNECTORS)})\s+)*"
     r"(?P<name>[^\W_][\w-]*)",
@@ -628,6 +645,8 @@ class RouteQueryService:
         )
         mentions = RouteQueryService._without_chart_phrases(mentions)
         mentions = RouteQueryService._without_reference_values(mentions)
+        mentions = RouteQueryService._without_literature_values(mentions, question)
+        mentions = RouteQueryService._listed_variables(RouteQueryService._grouped_variables(mentions))
         mentions = RouteQueryService._qualified_variables(
             RouteQueryService._separated_variables(mentions), question
         )
@@ -649,6 +668,32 @@ class RouteQueryService:
             if RouteQueryService._literal(item, question) and RouteQueryService._has_source_cue(item, question)
         }
         return [item for item in mentions if not (item.kind == "value" and normalize_name(item.text) in named)]
+
+    #
+    # Quita los valores que la pregunta sólo nombra dentro de lo que le pide a la bibliografía («qué dice la
+    # bibliografía sobre las cianobacterias del Río de la Plata»): dan el tema de la búsqueda documental, no
+    # registros que filtrar. Si también se nombran fuera de ese pedido, siguen acotando los datos.
+    #
+    @staticmethod
+    def _without_literature_values(mentions, question):
+        clauses = [match.span() for match in LITERATURE_CLAUSE.finditer(question)]
+        if not clauses:
+            return mentions
+
+        return [
+            item
+            for item in mentions
+            if not (item.kind == "value" and RouteQueryService._only_within(item.text, question, clauses))
+        ]
+
+    #
+    # Indica si todas las apariciones de un texto en la pregunta caen dentro de los tramos dados.
+    #
+    @staticmethod
+    def _only_within(text, question, spans) -> bool:
+        found = [match.start() for match in re.finditer(re.escape(text.strip()), question, re.IGNORECASE)]
+
+        return bool(found) and all(any(start <= position < end for start, end in spans) for position in found)
 
     #
     # Quita los valores que nombran la referencia con que se compara («OMS para uso recreativo», «el nivel
@@ -1216,8 +1261,14 @@ class RouteQueryService:
             if kind == "variable":
                 text = RouteQueryService._without_time_grain(text)
             words = normalize_text(text).split()
+            enumerated = _ENUMERATED_CATEGORY.fullmatch(text.strip()) if kind == "value" else None
+            presence = _PRESENCE_GROUPS.search(text) if kind == "value" else None
+            if enumerated:
+                text = enumerated["category"].strip()
+            elif presence:
+                text = presence["shared"] or presence["category"]
             names_category = kind == "value" and bool(words) and words[0] in CATEGORY_CUES
-            if names_category:
+            if names_category or enumerated or presence:
                 kind = "dimension"
             if kind == "dimension":
                 text = RouteQueryService._trimmed(text) or text
@@ -1225,6 +1276,77 @@ class RouteQueryService:
                 (text.casefold(), kind), item.model_copy(update={"text": text, "kind": kind})
             )
         return list(separated.values())
+
+    #
+    # Separa la variable que el modelo copió como una lista («temperatura, el pH y la conductividad»), sólo si
+    # cada parte nombra una variable conocida: un nombre compuesto («sólidos disueltos y totales») no se parte.
+    #
+    @staticmethod
+    def _listed_variables(mentions):
+        listed = []
+        for item in mentions:
+            parts = [RouteQueryService._trimmed(part) for part in _LIST_SEPARATOR.split(item.text)]
+            if item.kind != "variable" or len(parts) < 2 or not all(map(names_known_variable, parts)):
+                listed.append(item)
+                continue
+
+            listed += [item.model_copy(update={"text": part}) for part in parts]
+        return listed
+
+    #
+    # Separa de cada variable las agrupaciones que el modelo copió con ella («turbiedad por año y por sitio»):
+    # la temporal ya se lee de la pregunta y cada una de las otras pasa a ser una dimensión.
+    #
+    @staticmethod
+    def _grouped_variables(mentions):
+        known = {item.text.casefold() for item in mentions if item.kind == "dimension"}
+        grouped = []
+        for item in mentions:
+            variable = item.kind == "variable"
+            name, dimensions = RouteQueryService._grouping_clauses(item.text) if variable else (item.text, [])
+            if name == item.text:
+                grouped.append(item)
+                continue
+
+            grouped.append(item.model_copy(update={"text": name}))
+            for text in dimensions:
+                if text.casefold() not in known:
+                    known.add(text.casefold())
+                    grouped.append(DataMention(text=text, kind="dimension"))
+        return grouped
+
+    #
+    # Divide un texto en la variable y las dimensiones de sus cláusulas «por …», sin las temporales. Las
+    # cláusulas que no agrupan (una unidad, un número) antes de la primera agrupación siguen siendo parte de la
+    # variable; una después de ella («por la OMS», «por debajo») deja el texto sin dividir.
+    #
+    @staticmethod
+    def _grouping_clauses(text):
+        name, *parts = _GROUPING_CLAUSE.split(text)
+        grouped, dimensions = False, []
+        for cue, clause in zip(parts[::2], parts[1::2], strict=True):
+            clause = _CLAUSE_END.split(clause)[0]
+            words = clause.split()
+            if words and RouteQueryService._groups_by(words[0]):
+                grouped = True
+                if normalize_text(f"{cue} {clause}") not in _TIME_GRAIN_PHRASES:
+                    dimensions.append(RouteQueryService._trimmed(clause) or clause)
+            elif grouped or not words:
+                return text, []
+            else:
+                name = f"{name} {cue} {clause}"
+
+        return (name.strip(), dimensions) if grouped and variable_core(name) else (text, [])
+
+    #
+    # Indica si la palabra que sigue a «por» nombra una categoría y no una unidad, un número o una locución.
+    #
+    @staticmethod
+    def _groups_by(word):
+        plain = normalize_text(word)
+        unit = SIMPLE_UNIT.fullmatch(word) or spelled_symbol(word)
+
+        return bool(plain) and not plain[0].isdigit() and plain not in NON_GROUPING_WORDS and not unit
 
     #
     # Quita de una variable la agrupación temporal final («por mes»).
@@ -1341,10 +1463,11 @@ class RouteQueryService:
         known = {normalize_name(item) for item in explicit}
         found = self._multiword_sources_in(question, catalog, known)
         aliases = []
+        sources = [item for item in explicit if self._names_catalog_source(item, catalog)]
 
         values = [item.text for item in mentions if item.kind == "value"]
         for text in dict.fromkeys([*values, *self._cued_names(question)]):
-            if any(contains_phrase(name, text) for name in [*explicit, *found]):
+            if any(contains_phrase(name, text) for name in [*sources, *found]):
                 continue
 
             owners = self._value_owners(text, catalog)
@@ -1352,6 +1475,17 @@ class RouteQueryService:
                 found.append(next(iter(owners.values()))["name"])
                 aliases.append(text)
         return found, aliases
+
+    #
+    # Indica si una mención del modelo nombra por sí sola una fuente o una hoja del catálogo: un alias suelto
+    # («ABSA») no la nombra y no debe impedir que se resuelva la fuente que lo contiene.
+    #
+    @staticmethod
+    def _names_catalog_source(mention, catalog) -> bool:
+        target = normalize_name(mention)
+        identifier = RouteQueryService._as_identifier(mention)
+
+        return bool(target) and bool(RouteQueryService._catalog_matches(mention, target, identifier, catalog, False))
 
     #
     # Devuelve los nombres que siguen a expresiones como «los datos de» o «la base».

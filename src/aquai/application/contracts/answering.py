@@ -178,7 +178,7 @@ class ReferenceValue(BaseModel):
     condition: str | None = None
     same_place: bool = False
     quote: str
-    status: Literal["compatible", "other_unit", "other_basis", "unit_unknown", "other_use"]
+    status: Literal["compatible", "other_unit", "other_basis", "other_statistic", "unit_unknown", "other_use"]
     detail: str | None = None
 
 
@@ -223,6 +223,8 @@ class DocumentContrast(BaseModel):
     hypotheses: list[UnitHypothesis] = Field(default_factory=list)
     lines: list[ReferenceLine] = Field(default_factory=list)
     notes: list[str] = Field(default_factory=list)
+    note_documents: dict[str, list[str]] = Field(default_factory=dict)
+    rejected: list[dict[str, JsonValue]] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
     proposed: int = 0
     model: str | None = None
@@ -241,6 +243,7 @@ class DocumentTrace(BaseModel):
     discarded: int = 0
     fragments: int = 0
     selected: list[dict[str, JsonValue]] = Field(default_factory=list)
+    unselected: list[dict[str, JsonValue]] = Field(default_factory=list)
     rejected_segments: list[dict[str, JsonValue]] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
 

@@ -28,7 +28,8 @@ _UNIT = re.compile(
     r"(?:[µμunmkK]?(?:g[Ll]|Sc?m)\s?[-−–⁻]\s?[\d¹]|"
     rf"[µμunmkK]?(?:g{_BASIS}|S|L|l|mol|m)|NTU|UNT|UTN|FNU|FTU|ppm|ppb|UFC|NMP|CFU|MPN|"
     r"[Cc][ée]l(?:ulas)?\.?|[Cc]ells?|[Ii]nd\.?)"
-    r"(?:\s?[/·]\s?[\wµμ]+|\s[\wµμ]+\s?[-−–⁻]\s?[\d¹²³])*"
+    r"(?:\s?[/·]\s?[\wµμ]+(?:\s?[-−–⁻]\s?[\d¹²³])?|\.(?:[µμmcd]?[Ll]|c?m|[µμmk]?g|s|d|h)(?:\s?[-−–⁻]\s?[\d¹²³])?|"
+    r"\s[\wµμ]+\s?[-−–⁻]\s?[\d¹²³])*"
     r"(?:\s(?:como|as)\s(?:N|P|NO3|NO2|NH4|PO4)\b)?)(?![\wµμ/])"
 )
 _UNIT_WORD = re.compile(rf"\s?(?P<word>(?:{'|'.join(UNIT_WORD_STARTS)})\w*)", re.IGNORECASE)
@@ -40,6 +41,7 @@ _COMPARATOR = re.compile(r"([<>≤≥≈~])\s?$")
 _DIGIT_TOKEN = re.compile(r"\S*[\d⁰¹²³⁴-⁹]\S*")
 _TOKEN_EDGES = " .,;:()[]{}«»\"'¿?¡!"
 _NEARBY_CHARS = 60
+RANGE_JOINT = re.compile(r"\s*(?:y|a|al|hasta|and|to|-|–)\s*")
 _NEARBY_BEFORE = 30
 _TABLE_CELL = "|"
 _DEVIATION = "±"
@@ -267,11 +269,25 @@ def _same_unit_nearby(reading, item, source, start, following) -> bool:
         return True
     if item.unit and _numerator(item.unit) != _numerator(reading.unit):
         return False
+    if _shares_range_unit(reading, item, source, following):
+        return True
 
     stop = following[0].start if following else len(source)
     window = source[max(start, item.start - _NEARBY_BEFORE) : min(stop, item.end + _NEARBY_CHARS)]
 
     return names_unit(reading.unit, window)
+
+
+#
+# Indica si el número es la primera cota de un rango cuya segunda escribe la unidad: «entre 0,02 y 8,6 µg/L».
+#
+def _shares_range_unit(reading, item, source, following) -> bool:
+    if item.unit or not following or not following[0].unit:
+        return False
+    if not RANGE_JOINT.fullmatch(source[item.stop : following[0].start]):
+        return False
+
+    return comparable_unit("", following[0].unit) == comparable_unit("", reading.unit)
 
 
 #

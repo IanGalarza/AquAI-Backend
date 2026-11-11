@@ -20,7 +20,7 @@ from aquai.application.execution import (
     sql_result_fingerprint,
     validate_sql_transfer,
 )
-from aquai.application.planning.validation import validate_execution_plan
+from aquai.application.planning.validation import INCOMPLETE_REQUEST_CODES, validate_execution_plan
 from aquai.application.validation.visualizations import validate_visualization
 
 EXECUTED_STATUSES = {"executed", "executed_as_dependency"}
@@ -643,11 +643,16 @@ class _EvidenceEvaluation:
         ]
 
     #
-    # Determina si la evidencia queda validada, parcial o sin evidencia utilizable.
+    # Determina si la evidencia queda validada, parcial o sin evidencia utilizable. Lo que la consulta pidió y el
+    # plan no cubre deja la evidencia parcial, nunca la descarta.
     #
     def _resolve_status(self) -> None:
         if not self._result.usable_evidence:
             return
+
+        for item in self._plan.validation_issues:
+            if item.code in INCOMPLETE_REQUEST_CODES:
+                self._issue(item.code, item.message, item.step_id)
 
         self._result.status = "validated" if self._fully_validated() else "partial"
 

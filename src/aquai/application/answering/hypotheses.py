@@ -5,18 +5,34 @@ from decimal import Decimal
 
 from aquai.application.answering.measures import shown_value
 from aquai.application.answering.presentation import format_unit
-from aquai.application.answering.readings import number_readings
+from aquai.application.answering.readings import RANGE_JOINT, number_readings
 from aquai.application.contracts.answering import UnitHypothesis
-from aquai.application.Rules.evidence import MEAN_WITH_DEVIATION
+from aquai.application.Rules.evidence import GUIDELINE_CUES, MEAN_WITH_DEVIATION, ORGANIZATION_AGENT
 from aquai.application.Rules.units import UNIT_BASES, UNIT_PREFIXES
 from aquai.application.units import unit_key
 
 _MENTION_WINDOW = 90
 _BRACKET_UNIT = re.compile(r"^\s*[\[(]\s*(?P<unit>[^\[\]()]{1,16}?)\s*[\])]")
 _VALUE_BOUNDARY = re.compile(r"[|\n;]")
-_RANGE_JOINT = re.compile(r"\s*(?:y|a|al|hasta|and|to|-|–)\s*")
 _MAX_UNITS = 3
 _MAX_QUOTE = 110
+_NAME_SEPARATOR = re.compile(r"[\s\-‐–]+")
+_DOUBT_RATIO = Decimal(100)
+_SAME_ORDER = Decimal(10)
+_DOUBT_TEXT = {
+    "es": "La unidad declarada de {label} ({declared_unit}) podría ser incorrecta: leídos en esa unidad, sus valores "
+    "(hasta {observed} {declared_unit}, es decir {converted} {unit}) quedan más de cien veces {side} los "
+    "{documented} {unit} que informa la bibliografía recuperada para la misma variable, y leídos en {unit} quedan "
+    "en su mismo orden. No cambié la unidad del dato y no hice comparaciones numéricas con esos valores.",
+    "en": "The unit declared for {label} ({declared_unit}) may be wrong: read in that unit, its values (up to "
+    "{observed} {declared_unit}, that is {converted} {unit}) are more than a hundred times {side} the {documented} "
+    "{unit} that the retrieved literature reports for the same variable, while read in {unit} they are in the same "
+    "range. I did not change the data's unit and made no numerical comparison with these values.",
+}
+_DOUBT_SIDES = {
+    "es": {"above": "por encima de", "below": "por debajo de"},
+    "en": {"above": "above", "below": "below"},
+}
 _POSITIONS = {
     "es": {
         "above": "quedaría por encima de",
@@ -29,6 +45,15 @@ _POSITIONS = {
         "within": "would be within",
     },
 }
+
+
+@dataclass(frozen=True)
+class DeclaredUnitDoubt:
+    """Indicio documental de que la unidad declarada de un resultado no corresponde a sus valores."""
+
+    field: str
+    text: str
+    evidence_ids: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -66,7 +91,7 @@ def unit_hypotheses(results, fragments, language) -> list[UnitHypothesis]:
 def documented_values(result, fragments) -> list[DocumentedValue]:
     pattern = re.compile(
         r"(?<![^\W\d_])(?:"
-        + "|".join(re.escape(_plain(name)) for name in result.names if name)
+        + "|".join(_name_pattern(name) for name in result.names if name)
         + r")(?![^\W\d_])",
         re.IGNORECASE,
     )
@@ -80,6 +105,83 @@ def documented_values(result, fragments) -> list[DocumentedValue]:
                 found.append(value)
 
     return found
+
+
+#
+# Devuelve el patrón de un nombre que acepta sus palabras separadas por espacio o guion, o juntas, como quedan
+# al cortar una línea en un PDF: «microcystin-LR», «microcystin LR», «microcystinLR».
+#
+def _name_pattern(name) -> str:
+    words = [word for word in _NAME_SEPARATOR.split(_plain(name)) if word]
+
+    return r"[\s\-‐–]?".join(re.escape(word) for word in words)
+
+
+#
+# Devuelve los resultados cuya unidad declarada podría ser incorrecta: leídos en esa unidad quedan cien veces o
+# más fuera de lo que los fragmentos informan de la misma variable en otra escala de la misma magnitud, y
+# leídos en esa escala quedan en su mismo orden. Las guías y los límites citados no cuentan como observaciones.
+#
+def declared_unit_doubts(results, fragments, language) -> list[DeclaredUnitDoubt]:
+    doubts = {}
+    for result in results:
+        if result.field in doubts or result.unit_status != "documented" or not result.unit or not result.values:
+            continue
+
+        observed = [
+            item
+            for item in documented_values(result, fragments)
+            if item.unit and not (GUIDELINE_CUES.search(item.quote) or ORGANIZATION_AGENT.search(item.quote))
+        ]
+        for values in _by_unit(observed).values():
+            doubt = _scale_doubt(result, values, language)
+            if doubt is not None:
+                doubts[result.field] = doubt
+                break
+
+    return list(doubts.values())
+
+
+#
+# Agrupa los valores documentados por unidad, juntando sus grafías equivalentes.
+#
+def _by_unit(found) -> dict[str, list[DocumentedValue]]:
+    grouped = {}
+    for item in found:
+        grouped.setdefault(unit_key(item.unit), []).append(item)
+
+    return grouped
+
+
+#
+# Devuelve el indicio de que el resultado está en la escala de los valores documentados y no en la declarada.
+#
+def _scale_doubt(result, values, language) -> DeclaredUnitDoubt | None:
+    unit = values[0].unit
+    factor = unit_factor(result.unit, unit)
+    if factor is None or Decimal(1) / _DOUBT_RATIO < factor < _DOUBT_RATIO:
+        return None
+
+    low, high = min(item.low for item in values), max(item.high for item in values)
+    observed = max(result.values)
+    declared = observed * factor
+    if low <= 0 or observed <= 0 or low / _DOUBT_RATIO <= declared <= high * _DOUBT_RATIO:
+        return None
+    if not low / _SAME_ORDER <= observed <= high * _SAME_ORDER:
+        return None
+
+    documented = shown_value(low, language) if low == high else f"{shown_value(low, language)}-{shown_value(high, language)}"
+    text = _DOUBT_TEXT[language].format(
+        label=result.label,
+        declared_unit=format_unit(result.unit),
+        observed=shown_value(observed, language),
+        converted=shown_value(declared, language),
+        unit=format_unit(unit),
+        documented=documented,
+        side=_DOUBT_SIDES[language]["above" if declared > high else "below"],
+    )
+
+    return DeclaredUnitDoubt(result.field, text, tuple(dict.fromkeys(item.evidence_id for item in values)))
 
 
 #
@@ -116,10 +218,10 @@ def _values_of(readings, text, unit) -> list[Decimal]:
     first = readings[chosen]
     previous = readings[chosen - 1] if chosen else None
     following = readings[chosen + 1] if chosen + 1 < len(readings) else None
-    if previous is not None and not previous.unit and _RANGE_JOINT.fullmatch(text[previous.end : first.start]):
+    if previous is not None and not previous.unit and RANGE_JOINT.fullmatch(text[previous.end : first.start]):
         return _unambiguous([previous, first])
     if following is not None and following.unit == first.unit:
-        if _RANGE_JOINT.fullmatch(text[first.stop : following.start]):
+        if RANGE_JOINT.fullmatch(text[first.stop : following.start]):
             return _unambiguous([first, following])
 
     return _unambiguous([first])

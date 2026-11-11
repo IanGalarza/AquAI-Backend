@@ -122,6 +122,7 @@ class DocumentRetrievalResult(BaseModel):
     candidates: int = Field(default=0, ge=0)
     discarded: int = Field(default=0, ge=0)
     fragments: list[DocumentFragment] = Field(default_factory=list)
+    unselected: list[dict[str, JsonValue]] = Field(default_factory=list)
     model: str | None = None
     input_tokens: int | None = None
     output_tokens: int | None = None

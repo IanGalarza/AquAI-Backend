@@ -43,6 +43,12 @@ _MAX_EXCERPT = 600
 _MISSING_INTERPRETATION = (
     "falta un párrafo documented: parafraseá de cerca lo que dicen los fragmentos sobre esta variable"
 )
+_UNEXPLORED_DOCUMENTS = (
+    "documented: la interpretación usa un solo fragmento; revisá también estos y usá los que expliquen qué "
+    "representa la variable, con qué factores se relaciona o cómo varía en el mismo sitio o sistema, cada uno "
+    "en su párrafo y sólo si aporta"
+)
+_MIN_INTERPRETING_DOCUMENTS = 2
 _MISSING_HYPOTHESIS = (
     "falta un párrafo hypothesis: con las lecturas de ambiguities, en condicional, citando sus documentos"
 )
@@ -93,11 +99,15 @@ _CORRECTIONS = {
     "unsupported_causality": "no afirmes causas de lo observado",
     "unsupported_attribution": "atribuí cada dato sólo a la fuente del fragmento que lo contiene",
     "unsupported_frequency": "no agregues frecuencia ni generalidad: decí de qué estudio y sitio es el dato",
+    "unsupported_reference_label": (
+        "ese valor es lo que midió o reportó el estudio, no un valor de referencia, guía, umbral ni límite: "
+        "presentalo como el valor que reporta ese estudio"
+    ),
     "internal_term": "no uses términos internos de la evidencia",
     "dangling_reference": "ese párrafo remitía a otro que se quitó: escribilo de forma autónoma",
 }
 _ROLE_LABELS = {"es": "Hipótesis, no confirmada:", "en": "Unconfirmed hypothesis:"}
-_ATTACHMENT_LEADS = {"es": "Detalle de ese resultado:", "en": "Detail of that result:"}
+ATTACHMENT_LEADS = {"es": "Detalle de ese resultado:", "en": "Detail of that result:"}
 
 
 @dataclass
@@ -118,8 +128,8 @@ class ReviewedDraft:
 
     #
     # Indica si conviene publicar el borrador sin otro intento: resultados completos, los valores de
-    # referencia documentados presentados, nada perdido en la verificación y la interpretación o la
-    # hipótesis que hagan falta.
+    # referencia documentados presentados, nada perdido en la verificación y la interpretación (con más de
+    # un fragmento, si los hay) o la hipótesis que hagan falta.
     #
     def sufficient(self, evidence: DraftEvidence) -> bool:
         return (
@@ -128,8 +138,20 @@ class ReviewedDraft:
             and not self.missing_values(evidence)
             and not self.lost
             and (self.interprets or not evidence.documents_required)
+            and not self.unexplored(evidence)
             and (self.reads_ambiguity or not evidence.allows_hypotheses)
         )
+
+    #
+    # Devuelve los fragmentos sin usar cuando la interpretación pedida se apoya en uno solo habiendo varios.
+    #
+    def unexplored(self, evidence: DraftEvidence) -> list[str]:
+        cited = {key for item in self.accepted if item.role in _INTERPRETING_ROLES for key in item.document_ids}
+        enough = min(len(evidence.documents), _MIN_INTERPRETING_DOCUMENTS)
+        if not evidence.documents_required or not cited or len(cited) >= enough:
+            return []
+
+        return [key for key in evidence.documents if key not in cited]
 
     #
     # Devuelve los valores de referencia documentados que el borrador no presentó.
@@ -260,11 +282,12 @@ def analytical_request(state, context, language, budget, *, notes=(), comparison
     catalog = {item["sentence_id"]: item for item in context.evidence["sentence_catalog"]}
     question = state.routing.original_question if state.routing else state.question
     requested = asks_interpretation(question)
+    analyzed = requested or _charted(state)
     body = {
         "question": question,
         "language": language,
         "status": context.evidence["status"],
-        "interpretation_requested": requested,
+        "interpretation_requested": analyzed,
         "facts": _facts(catalog),
         "ambiguities": [item.model_dump(mode="json") for item in ambiguities],
         "notes": list(notes),
@@ -294,7 +317,7 @@ def analytical_request(state, context, language, budget, *, notes=(), comparison
         question=question,
         result_names=[name for item in measured_results(state, language) for name in item.names],
         allows_hypotheses=bool(legible),
-        documents_required=requested and bool(kept),
+        documents_required=analyzed and bool(kept),
         required_values=required,
         language=language,
         places=_asked_places(state),
@@ -309,6 +332,14 @@ def analytical_request(state, context, language, budget, *, notes=(), comparison
 #
 def asks_interpretation(question: str) -> bool:
     return bool(INTERPRETATION_CUES.search(question) or REFERENCE_LINE_CUES.search(question))
+
+
+#
+# Indica si la respuesta publica un gráfico: mostrar un patrón pide explicar qué significa, como una
+# interpretación, con los documentos que lo respalden.
+#
+def _charted(state) -> bool:
+    return any(item.kind == "visualization" for item in state.validation.usable_evidence)
 
 
 #
@@ -612,6 +643,9 @@ def retry_record(request: WriterRequest, reviewed: ReviewedDraft) -> ResponseCon
         problems += [f"documented: falta {item.shown} ({item.evidence_id}): «{item.sentence[:160]}»" for item in missing]
     if request.evidence.documents_required and not reviewed.interprets:
         problems.append(_MISSING_INTERPRETATION)
+    unexplored = reviewed.unexplored(request.evidence)
+    if unexplored:
+        problems.insert(0, f"{_UNEXPLORED_DOCUMENTS}: {', '.join(unexplored)}")
     if request.evidence.allows_hypotheses and not reviewed.reads_ambiguity:
         problems.insert(0, _MISSING_HYPOTHESIS)
     body = {**request.record.evidence, "rejected_draft": problems[:12]}
@@ -826,7 +860,7 @@ def _after_results(segments) -> int:
 def _attachment_only(entry, language) -> AnswerSegment:
     return AnswerSegment(
         role="result",
-        text=_ATTACHMENT_LEADS[language],
+        text=ATTACHMENT_LEADS[language],
         evidence_ids=list(entry["evidence_ids"]),
         attachment=entry["attachment"],
     )

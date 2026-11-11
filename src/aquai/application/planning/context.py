@@ -12,6 +12,7 @@ from aquai.application.matching import (
     aligned_span,
     contains_any_phrase,
     contains_phrase,
+    names_period,
     normalize_text,
     numeric_comparisons,
     period_ranges,
@@ -72,6 +73,16 @@ _SUPERLATIVE = re.compile(SUPERLATIVE_WORDS)
 _ORDER_KEY = re.compile(ORDER_KEY, re.IGNORECASE)
 _VALUE_WORDS = {"valor", "valores", "value", "values", "magnitud", "concentracion", "nivel", "niveles"}
 _COUNT_BOUND = re.compile(COUNT_BOUNDS)
+_STATISTIC_WORDS = {
+    word for function, words in REQUESTED_STATISTICS.items() if function != "count" for word in words if " " not in word
+}
+_EXTREME_WORDS = {
+    *(word for cue in (*HIGHEST_CUES, *LOWEST_CUES) for word in cue.split() if word not in {"mas", "valor"}),
+    "mayor",
+    "menor",
+}
+_CLAUSE_BREAKS = ("y", "e", "o", "u", "and", "or", "pero", "but")
+_STATISTIC_EXTREME_WINDOW = 4
 
 
 #
@@ -132,6 +143,38 @@ def _names_value(key, variables) -> bool:
         return True
 
     return any(aligned_span(key, variable) for variable in variables)
+
+
+#
+# Indica si el extremo pedido es el de una estadística y no el de los registros: la estadística y el extremo
+# están en la misma cláusula y a pocas palabras («el pH promedio más alto», «la mayor mediana»), y no en
+# cláusulas distintas («el pH máximo y el promedio por sitio»).
+#
+def statistic_extreme(question: str) -> bool:
+    clause = []
+    for word in [*normalize_text(question).split(), _CLAUSE_BREAKS[0]]:
+        if word not in _CLAUSE_BREAKS:
+            clause.append(word)
+            continue
+        statistics = [index for index, item in enumerate(clause) if item in _STATISTIC_WORDS]
+        extremes = _extreme_positions(clause)
+        if any(abs(left - right) <= _STATISTIC_EXTREME_WINDOW for left in statistics for right in extremes):
+            return True
+        clause = []
+
+    return False
+
+
+#
+# Devuelve las posiciones de las palabras de extremo de una cláusula, sin las comparaciones («mayor que»).
+#
+def _extreme_positions(clause) -> list[int]:
+    return [
+        index
+        for index, word in enumerate(clause)
+        if word in _EXTREME_WORDS
+        and not (word in {"mayor", "menor"} and clause[index + 1 : index + 2] in (["que"], ["a"], ["al"], ["de"], ["o"]))
+    ]
 
 
 #
@@ -203,6 +246,18 @@ def requested_periods(mentions) -> list[RequestedPeriod]:
             periods[(start, end)] = RequestedPeriod(text=text, start=start, end=end)
 
     return list(periods.values())
+
+
+#
+# Devuelve las fechas pedidas que nombran un año o un mes pero no se pueden convertir en un período: calcular
+# sin ellas respondería por todo el registro como si se hubiera acotado.
+#
+def unread_periods(mentions) -> list[str]:
+    return [
+        item.text
+        for item in mentions
+        if item.kind == "date" and names_period(item.text) and not period_ranges(item.text)
+    ]
 
 
 #

@@ -15,6 +15,7 @@ from aquai.application.interfaces.retrieval import DatasetSemanticSearch
 from aquai.application.interfaces.sources import SourceQueries
 from aquai.application.matching import (
     abbreviates,
+    aligned_span,
     contains_phrase,
     formula_named,
     normalize_text,
@@ -125,11 +126,25 @@ def _match_reason(column, text):
 # Devuelve las columnas que identifican la dimensión preguntada, priorizando la de nombre exacto.
 #
 def _dimension_columns(dataset, text):
-    named = [column for column in dataset.columns_metadata if _column_named(column, text)]
+    named = _dimension_named(dataset, text)
     asked = _content_words(text)
     exact = [column for column in named if _content_words(column.original_name) == asked]
 
     return [column.sql_name for column in exact or named]
+
+
+#
+# Devuelve las columnas que nombran la dimensión: las que la contienen o, si ninguna, las que la escriben
+# abreviada, con una errata o con la misma raíz en otro idioma («alerta», «alert_class»).
+#
+def _dimension_named(dataset, text):
+    named = [column for column in dataset.columns_metadata if _column_named(column, text)]
+
+    return named or [
+        column
+        for column in dataset.columns_metadata
+        if any(aligned_span(text, name) for name in (column.original_name, column.sql_name))
+    ]
 
 
 #
@@ -541,7 +556,7 @@ class RetrieveDatasetsService:
         asked = [
             dimension
             for dimension in dimensions
-            if any(_named_columns(dataset, dimension) for dataset in with_variables)
+            if any(_dimension_named(dataset, dimension) for dataset in with_variables)
         ]
         result.dimension_mentions = list(dict.fromkeys([*reclassified, *asked]))
         if not result.dimension_mentions:
