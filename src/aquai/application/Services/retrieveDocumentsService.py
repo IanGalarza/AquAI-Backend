@@ -17,7 +17,13 @@ from aquai.application.interfaces.documents import (
     DocumentLexicalIndex,
     DocumentQueries,
 )
-from aquai.application.matching import asked_reference, names_subject, variable_name, variable_variants
+from aquai.application.matching import (
+    asked_reference,
+    names_subject,
+    normalize_text,
+    variable_name,
+    variable_variants,
+)
 from aquai.application.planning.context import extreme_requested
 from aquai.application.Rules.documents import normalized_text
 from aquai.application.Rules.evidence import (
@@ -348,8 +354,7 @@ def _conversation_context(state) -> list[str]:
 # sus valores de referencia, para no depender de que el modelo conserve el lugar al reformular.
 #
 def _cited_requests(state) -> list[str]:
-    cited = set(state.routing.history_message_ids)
-    scope = [mention for item in state.conversation_history if item.message_id in cited for mention in item.scope]
+    scope = _retaken_scope(state)
     variables = list(dict.fromkeys(variable_name(item.text) for item in scope if item.kind == "variable"))
     places = " ".join(dict.fromkeys(item.text for item in scope if item.kind == "value"))
     requests = []
@@ -364,16 +369,34 @@ def _cited_requests(state) -> list[str]:
 # Devuelve las variables del análisis que un seguimiento retoma, con sus nombres equivalentes.
 #
 def _cited_variables(state) -> list[str]:
-    cited = set(state.routing.history_message_ids)
-    mentions = [
-        scope.text
-        for item in state.conversation_history
-        if item.message_id in cited
-        for scope in item.scope
-        if scope.kind == "variable"
-    ]
+    mentions = [item.text for item in _retaken_scope(state) if item.kind == "variable"]
 
     return [name for mention in mentions for name in variable_variants(variable_name(mention))]
+
+
+#
+# Devuelve lo que el seguimiento retoma de los análisis citados: sólo lo que el Router conservó en este turno.
+# Lo que la pregunta nombra por sí misma ya está en su pedido, y el alcance que una respuesta documental heredó
+# de un análisis anterior no es un resultado que interpretar: esa continuidad la resuelve el modelo con el
+# contexto citado al reformular la búsqueda.
+#
+def _retaken_scope(state) -> list:
+    cited = set(state.routing.history_message_ids)
+    analyzed = {
+        _scope_key(mention)
+        for item in state.conversation_history
+        if item.message_id in cited and item.analysis is not None
+        for mention in item.scope
+    }
+
+    return [item for item in state.routing.conserved_mentions if _scope_key(item) in analyzed]
+
+
+#
+# Devuelve la clave de una mención de alcance, sin mayúsculas ni acentos.
+#
+def _scope_key(mention) -> tuple[str, str]:
+    return normalize_text(mention.text), mention.kind
 
 
 #

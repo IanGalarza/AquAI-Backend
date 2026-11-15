@@ -239,7 +239,7 @@ class RouteQueryService:
                 "La pregunta cuenta muestras o registros: se consultaron los datos y no el inventario de fuentes."
             )
         anchor = self._anchor(state.conversation_history, allowed)
-        followed = self._documented_reply(last, asked, state.question, route, decision)
+        followed = self._documented_reply(last, asked, state.question, route, decision, messages)
         subject = self._period_subject(state.question, asked, messages, anchor, route, decision)
         if self._asks_citations(state.question, last):
             route = "document"
@@ -325,18 +325,25 @@ class RouteQueryService:
         return measured or chart_requested(question) or (route == "data" and compared)
 
     #
-    # Devuelve la respuesta documental que continúa un fragmento («¿Y la turbiedad?»), si la hay.
+    # Devuelve la respuesta documental que continúa un seguimiento, si la hay: un fragmento («¿Y la turbiedad?») o
+    # una pregunta documental que el modelo marcó como seguimiento sin retomar un análisis. Su antecedente es la
+    # última respuesta, aunque el modelo haya citado otra anterior.
     #
     @staticmethod
-    def _documented_reply(last, asked, question, route, decision):
+    def _documented_reply(last, asked, question, route, decision, messages):
         documental = last is not None and last.documents and last.analysis is None
         fragment = RouteQueryService._elliptical(question, asked) and all(
             item.kind == "variable" for item in asked
         )
         measured = contains_any_phrase(question, MEASURED_STATISTICS)
         follows = route != "data" or decision.context_required
+        continues = (
+            route == "document"
+            and decision.context_required
+            and not any(item.analysis is not None for item in messages)
+        )
 
-        return last if documental and fragment and follows and not measured else None
+        return last if documental and (fragment and follows or continues) and not measured else None
 
     #
     # Indica si la pregunta pide de dónde salió la última respuesta, que citó documentos.
