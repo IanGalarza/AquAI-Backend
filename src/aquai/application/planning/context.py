@@ -22,6 +22,7 @@ from aquai.application.Rules.vocabulary import (
     ASCENDING_ORDER_CUES,
     CHART_WORDS,
     COUNT_BOUNDS,
+    COUNT_CUE,
     DESCENDING_ORDER_CUES,
     FULL_ORDER_CUES,
     HIGHEST_CUES,
@@ -30,11 +31,14 @@ from aquai.application.Rules.vocabulary import (
     OBSERVATION_NOUNS_EN,
     OBSERVATION_NOUNS_ES,
     ORDER_KEY,
+    PERIOD_SPAN_CUES,
+    RATE_COUNT,
     RECENT_INTERVAL_NOUNS,
     RECENT_WORDS,
     REQUESTED_STATISTICS,
     SUPERLATIVE_WORDS,
 )
+from aquai.application.Rules.language import INTERROGATIVE_WORDS
 from aquai.application.units import unitless_name
 
 _COLUMN_FIELDS = (
@@ -210,14 +214,45 @@ def chart_requested(question: str) -> bool:
 
 
 #
-# Devuelve las estadísticas que nombra la pregunta.
+# Indica si la pregunta pide las fechas que cubren los datos: por cómo lo dice (PERIOD_SPAN_CUES) o porque el
+# intérprete marcó como fecha una pregunta que no nombra ninguna («qué fechas abarcan»): no acota, pregunta.
 #
-def requested_statistics(question: str) -> list[str]:
+def asks_period_span(question: str, mentions) -> bool:
+    if PERIOD_SPAN_CUES.search(question):
+        return True
+
+    return any(
+        item.kind == "date" and not names_period(item.text) and not period_ranges(item.text)
+        and bool(set(normalize_text(item.text).split()) & INTERROGATIVE_WORDS)
+        for item in mentions
+        if not isinstance(item, str)
+    )
+
+
+#
+# Devuelve las estadísticas que nombra la pregunta. Un «cuántos» que sólo pide concentraciones («¿cuántas
+# cianobacterias por mililitro?») no pide un conteo.
+#
+def requested_statistics(question: str, counted=()) -> list[str]:
+    rates = {match.start() for match in RATE_COUNT.finditer(question)}
+    measured = all(
+        cue.start() in rates or _introduces(question[cue.end() :], counted) for cue in COUNT_CUE.finditer(question)
+    )
     return [
         function
         for function, words in REQUESTED_STATISTICS.items()
-        if any(contains_phrase(question, word) for word in words)
+        if any(contains_phrase(question, word) for word in words) and not (function == "count" and measured)
     ]
+
+
+#
+# Indica si el texto empieza por una de las variables: «cuántas cianobacterias informa la base» pregunta por la
+# variable que se mide contando organismos, no por cuántos registros hay.
+#
+def _introduces(text: str, variables) -> bool:
+    words = normalize_text(text).split()
+
+    return any((target := normalize_text(item).split()) and words[: len(target)] == target for item in variables)
 
 
 #

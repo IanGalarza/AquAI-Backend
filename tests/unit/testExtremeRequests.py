@@ -1,6 +1,10 @@
 import unittest
+from datetime import date
 
-from aquai.application.planning.context import extreme_requested
+from aquai.application.contracts.routing import DataMention
+from aquai.application.matching import period_ranges, reference_operator
+from aquai.application.planning.context import asks_period_span, extreme_requested, requested_statistics
+from aquai.application.Rules.vocabulary import TREND_CUES
 
 _EXTREMES = (
     "¿Cuál es la mayor abundancia absoluta (cél/ml)?",
@@ -47,6 +51,39 @@ class ExtremeRequestTests(unittest.TestCase):
         for question in _NOT_EXTREMES:
             with self.subTest(question=question):
                 self.assertFalse(extreme_requested(question))
+
+
+class RequestedWordingTests(unittest.TestCase):
+    def test_a_day_written_with_the_month_name_is_that_day(self) -> None:
+        day = (date(2021, 9, 22), date(2021, 9, 22))
+        for text in ("el 22 de septiembre de 2021", "22 sep. 2021", "September 22nd, 2021", "22/09/2021"):
+            with self.subTest(text=text):
+                self.assertEqual(period_ranges(text), [day])
+
+        self.assertEqual(period_ranges("entre el 12 y el 28 de enero de 2022"), [(date(2022, 1, 12), date(2022, 1, 28))])
+        self.assertEqual(period_ranges("septiembre de 2021"), [(date(2021, 9, 1), date(2021, 9, 30))])
+
+    def test_period_and_trend_requests_are_read_in_different_wordings(self) -> None:
+        for text in ("¿Qué fechas abarcan los datos?", "¿Desde cuándo hay registros?", "Indicá promedios y períodos"):
+            with self.subTest(text=text):
+                self.assertTrue(asks_period_span(text, []))
+        self.assertTrue(asks_period_span("promedio", [DataMention(text="qué fechas abarcan", kind="date")]))
+        self.assertFalse(asks_period_span("promedio", [DataMention(text="el último dato", kind="date")]))
+        self.assertFalse(asks_period_span("¿Cuál fue el promedio en el período 2012-2013?", []))
+        for text in ("¿la turbidez fue cambiando con los años?", "¿Cambió el pH en las últimas décadas?", "¿hay tendencia?"):
+            with self.subTest(text=text):
+                self.assertIsNotNone(TREND_CUES.search(text))
+        self.assertIsNone(TREND_CUES.search("¿Cuál fue la turbidez más baja en los años 2012 y 2013?"))
+
+    def test_a_reference_reached_or_exceeded_includes_the_limit(self) -> None:
+        self.assertEqual(reference_operator("¿Cuántos alcanzaron o superaron el nivel guía?"), "ge")
+        self.assertEqual(reference_operator("¿Cuántos superaron el nivel guía?"), "gt")
+        self.assertEqual(reference_operator("How many were at least the guideline or above it?"), "ge")
+        self.assertEqual(reference_operator("¿Cuántos quedaron por debajo del límite?"), "lt")
+
+    def test_how_many_per_unit_asks_for_a_concentration_not_a_count(self) -> None:
+        self.assertEqual(requested_statistics("¿Cuántas cianobacterias tóxicas por mililitro informa BASE FQ?"), [])
+        self.assertEqual(requested_statistics("¿Cuántas mediciones hay por sitio?"), ["count"])
 
 
 if __name__ == "__main__":

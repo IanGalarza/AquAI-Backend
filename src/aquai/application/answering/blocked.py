@@ -81,21 +81,72 @@ _SOURCE_GAPS = {
     "en": "I could not use the data from «{source}», which the question names: the results come only from the "
     "other sources, so that part of the comparison remains unanswered.",
 }
+_BRANCH_GAP = {
+    "es": "Una parte del análisis pedido no se pudo plantear de forma verificable y quedó afuera; lo que sigue es lo "
+    "que sí se pudo calcular.",
+    "en": "Part of the requested analysis could not be set up in a verifiable way and was left out; what follows is "
+    "what could be calculated.",
+}
+_UNMET_GAPS = {
+    "es": {
+        "missing_requested_chart": "No pude armar el gráfico pedido de forma verificable; lo que sigue son los "
+        "valores que sí se calcularon.",
+        "missing_requested_statistic": "No pude calcular {statistic} que pide la consulta, así que esa parte queda "
+        "sin responder.",
+        "missing_requested_threshold": "No pude aplicar el umbral pedido ({threshold}): los resultados que siguen no "
+        "están filtrados por él, así que no indican cuántos valores lo cumplen.",
+    },
+    "en": {
+        "missing_requested_chart": "I could not build the requested chart in a verifiable way; what follows are the "
+        "values that were calculated.",
+        "missing_requested_statistic": "I could not calculate the {statistic} the question asks for, so that part "
+        "remains unanswered.",
+        "missing_requested_threshold": "I could not apply the requested threshold ({threshold}): the results below "
+        "are not filtered by it, so they do not show how many values meet it.",
+    },
+}
+_STATISTIC_NAMES = {
+    "es": {
+        "mean": "el promedio",
+        "median": "la mediana",
+        "sum": "la suma",
+        "stddev": "el desvío estándar",
+        "count": "la cantidad",
+    },
+    "en": {"mean": "mean", "median": "median", "sum": "sum", "stddev": "standard deviation", "count": "count"},
+}
 
 
 #
-# Devuelve los avisos de las partes que el plan no cubrió: las fuentes nombradas que ninguna salida lee.
+# Devuelve los avisos de las partes que el plan no cubrió: las fuentes nombradas que ninguna salida lee, las ramas
+# del plan que no pasaron la verificación y lo pedido que ningún intento logró plantear (el gráfico, una
+# estadística o un umbral), que deja publicado sólo lo que sí se calculó.
 #
 def request_gaps(state, language) -> list[str]:
     issues = state.planning.validation_issues if state.planning else []
+    sources = [
+        _SOURCE_GAPS[language].format(source=file_stem(item.subject))
+        for item in issues
+        if item.code == "missing_named_source" and item.subject
+    ]
+    branches = [_BRANCH_GAP[language] for item in issues if item.code == "unverified_branch"]
+    unmet = [
+        _unmet_gap(item, language)
+        for item in issues
+        if item.code in _UNMET_GAPS[language] and item.severity == "warning"
+    ]
 
-    return list(
-        dict.fromkeys(
-            _SOURCE_GAPS[language].format(source=file_stem(item.subject))
-            for item in issues
-            if item.code == "missing_named_source" and item.subject
-        )
-    )
+    return list(dict.fromkeys([*sources, *branches, *unmet]))
+
+
+#
+# Redacta el aviso de una parte pedida que quedó sin plantear, con la estadística o el umbral que nombra.
+#
+def _unmet_gap(issue, language) -> str:
+    subject = issue.subject or ""
+    statistic = _STATISTIC_NAMES[language].get(subject, subject)
+
+    return _UNMET_GAPS[language][issue.code].format(statistic=statistic, threshold=f"«{subject}»")
 
 
 #

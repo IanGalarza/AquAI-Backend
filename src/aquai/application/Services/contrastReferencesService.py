@@ -174,7 +174,7 @@ class ContrastReferencesService:
 # Escribe el umbral de un valor documentado como una comparación que el Planner aplica tal cual.
 #
 def _threshold_text(operator, value) -> str:
-    words = {"gt": "mayor que", "lt": "menor que"}
+    words = {"gt": "mayor que", "lt": "menor que", "ge": "mayor o igual que", "le": "menor o igual que"}
 
     return f"{words[operator]} {format(value, 'f')}"
 

@@ -23,10 +23,12 @@ from aquai.application.Rules.vocabulary import (
     COMPARISON_REFERENCE,
     COMPARISON_BOUNDARIES,
     COMPARISON_CUES,
+    POSTFIX_COMPARISON_CUES,
     COMPARISON_FILLERS,
     FOLLOWING_STATISTIC_FILLERS,
     INTEGER,
     MENTION_CONNECTORS,
+    MONTH_ABBREVIATIONS,
     MONTH_NAMES,
     NUMBER,
     OPEN_END_WORDS,
@@ -44,6 +46,7 @@ from aquai.application.units import is_ph_name
 from aquai.application.Rules.evidence import (
     COMPARISON_DIRECTIONS,
     DOCUMENT_AUTHOR_NAMES,
+    INCLUSIVE_BOUND,
     DOCUMENT_YEAR,
     REFERENCE_LINE_CUES,
     REFERENCE_REQUEST_CLAUSE,
@@ -54,6 +57,10 @@ _SHORT_TERM = 4
 _MIN_TERM_ROOT = 4
 _TERM_FLEXION_CHARS = 2
 _MIN_PREFIX = 4
+_MIN_FUZZY_AUTHOR = 7
+_CITED_YEAR_WINDOW = 24
+_MAX_FILLER_LETTERS = 2
+_LEADING_NUMBER = re.compile(r"(-?\d[\d.,]*)\s*[^\d\s]{0,12}")
 _MIN_CONTRACTION = 3
 _MAX_CONTRACTION = 4
 _MIN_TYPO_WORD = 5
@@ -69,6 +76,17 @@ _EXPLICIT_DAY = re.compile(
     r"\b(?:(?P<iso>\d{4}-\d{1,2}-\d{1,2})|(?P<dmy>\d{1,2}/\d{1,2}/\d{4}))\b"
 )
 _EXPLICIT_MONTH = re.compile(r"\b(?:(?P<year>\d{4})-(?P<month>\d{1,2})|(?P<m>\d{1,2})/(?P<y>\d{4}))\b")
+_DAY_NUMBER = re.compile(r"(?:0?[1-9]|[12]\d|3[01])")
+_DAY_RANGE_WORDS = {"al", "a", "y", "hasta", "to", "and", "through", "until"}
+_DAY_ARTICLES = {"el", "los", "the"}
+_VALUE_CODE = re.compile(r"\d{5,}")
+_COORDINATION = re.compile(r"\s*,\s*|\s+(?:y|e|o|u|and|or)\s+", re.IGNORECASE)
+_ENUMERATED_CODE = re.compile(r"[A-Za-z]?\d{1,3}[A-Za-z]?|[A-Z]")
+_SEGMENT_CONNECTOR = re.compile(r"\s+(?:de|del|en|of|in)\s+", re.IGNORECASE)
+_PART_CONNECTORS = {
+    "de", "del", "la", "las", "el", "los", "en", "y", "e", "o", "u", "a", "al", "con", "por", "para",
+    "of", "the", "in", "and", "or", "at",
+}
 _FORMULA_NAMES = {
     formula.casefold(): name for name, formulas in CHEMICAL_FORMULAS.items() for formula in formulas
 }
@@ -81,6 +99,12 @@ _DATE_RANGE = re.compile(
     re.IGNORECASE,
 )
 _DAY = timedelta(days=1)
+_POSTFIX_COMPARISON = re.compile(
+    rf"(?<![\w.,])(?P<number>{NUMBER.pattern})(?:\s*[^\s\d,;:?¿!()]+){{0,3}}?\s+(?:"
+    + "|".join(f"(?P<{operator}>{'|'.join(cues)})" for operator, cues in POSTFIX_COMPARISON_CUES.items())
+    + r")\b",
+    re.IGNORECASE,
+)
 _COMPARISON = re.compile(
     r"\b(?:"
     + "|".join(f"(?P<{operator}>{'|'.join(cues)})" for operator, cues in COMPARISON_CUES.items())
@@ -211,6 +235,32 @@ def variable_variants(phrase: str) -> list[str]:
     variants = [phrase, *_synonym_variants(phrase), *_synonym_variants(_formula_names(phrase))]
 
     return list(dict.fromkeys(variants))
+
+
+#
+# Devuelve los términos con que un texto nombra una variable: sus variantes completas y, si la variable incluye un
+# nombre conocido («cianobacterias potencialmente tóxicas»), ese nombre en cada idioma («cyanobacteria»): un texto
+# en otro idioma rara vez repite los calificativos palabra por palabra.
+#
+def subject_terms(phrase: str) -> list[str]:
+    known = [" ".join(term) for index in sorted(named_variable_groups(phrase)) for term in _SYNONYM_GROUPS[index]]
+
+    return list(dict.fromkeys([*variable_variants(variable_name(phrase)), *known]))
+
+
+#
+# Devuelve la frase con cada palabra abreviada escrita como en el encabezado de su columna («cianos potencialmente
+# tóxicas» con «Recuento total de cianobacterias potencialmente tóxicas» es «cianobacterias potencialmente
+# toxicas»): los documentos nombran la variable completa.
+#
+def spelled_as(phrase: str, header: str) -> str:
+    written = normalize_text(header).split()
+    words = [
+        next((item for item in written if len(item) > len(word) and _same_word(_singular(word), item)), word)
+        for word in normalize_text(phrase).split()
+    ]
+
+    return " ".join(words)
 
 
 #
@@ -473,6 +523,17 @@ def numeric_comparisons(text: str) -> list[Comparison]:
         compares = statistic is not None or following is not None
         comparisons.append(Comparison(text[start:end], operator, value, compares))
 
+    taken = [(item.start(), item.end()) for item in _COMPARISON.finditer(str(text))]
+    for match in _POSTFIX_COMPARISON.finditer(str(text)):
+        value = _comparison_number(match.group("number"))
+        if value is None or any(start < match.end() and match.start() < end for start, end in taken):
+            continue
+
+        operator = next(name for name in POSTFIX_COMPARISON_CUES if match.group(name))
+        statistic = _compared_statistic(text, match.start())
+        start = match.start() if statistic is None else statistic
+        comparisons.append(Comparison(text[start : match.end()], operator, value, statistic is not None))
+
     return comparisons
 
 
@@ -549,11 +610,16 @@ def _bounded(anchor, sides) -> list[tuple[date | None, date | None]]:
 # Devuelve las fechas que nombra el texto como días, meses o años, en orden.
 #
 def _period_anchors(text) -> list[tuple[date, date]]:
-    days = sorted({day for match in _EXPLICIT_DAY.finditer(text) if (day := _explicit_day(match))})
+    years = sorted({int(year) for year in REQUESTED_YEAR.findall(text)})
+    days = sorted(
+        {
+            *(day for match in _EXPLICIT_DAY.finditer(text) if (day := _explicit_day(match))),
+            *_named_days(text, years),
+        }
+    )
     if days:
         return [(day, day) for day in days]
 
-    years = sorted({int(year) for year in REQUESTED_YEAR.findall(text)})
     explicit = sorted(
         {
             (int(match.group("year") or match.group("y")), month)
@@ -572,6 +638,56 @@ def _period_anchors(text) -> list[tuple[date, date]]:
             for year, month in explicit
         ]
     return [(date(year, 1, 1), date(year, 12, 31)) for year in years]
+
+
+#
+# Devuelve los días que el texto escribe con el nombre del mes («22 de septiembre de 2021», «September 22, 2021»,
+# «22 sep. 2021»), y el otro extremo de un rango de días del mismo mes («del 12 al 28 de enero de 2022»). El año es
+# el que sigue al mes o el único del texto; una abreviatura cuenta sólo entre un día y un año.
+#
+def _named_days(text, years) -> list[date]:
+    words = normalize_text(text).split()
+    days = []
+    for index, word in enumerate(words):
+        month = MONTH_NAMES.get(word) or _abbreviated_month(words, index)
+        following = next((int(item) for item in words[index + 1 : index + 4] if REQUESTED_YEAR.fullmatch(item)), None)
+        year = following or (years[0] if len(years) == 1 else None)
+        if month is None or year is None:
+            continue
+
+        for day in _month_days(words, index):
+            try:
+                days.append(date(year, month, day))
+            except ValueError:
+                continue
+    return days
+
+
+#
+# Devuelve el mes de una abreviatura escrita entre un día y un año («22 sep 2021»), o None.
+#
+def _abbreviated_month(words, index) -> int | None:
+    month = MONTH_ABBREVIATIONS.get(words[index])
+    dated = 0 < index < len(words) - 1 and _DAY_NUMBER.fullmatch(words[index - 1])
+    if month is None or not dated or not any(REQUESTED_YEAR.fullmatch(item) for item in words[index + 1 : index + 3]):
+        return None
+
+    return month
+
+
+#
+# Devuelve los números de día que acompañan a un mes: el que lo precede («22 de septiembre»), el que lo sigue
+# («September 22») y el primero de un rango de días que termina en el precedente («del 12 al 28 de enero»).
+#
+def _month_days(words, index) -> list[int]:
+    start = index - 2 if index >= 2 and words[index - 1] in {"de", "del"} else index - 1
+    if start >= 0 and _DAY_NUMBER.fullmatch(words[start]):
+        before = [word for word in words[max(0, start - 4) : start] if word not in _DAY_ARTICLES]
+        ranged = len(before) >= 2 and before[-1] in _DAY_RANGE_WORDS and _DAY_NUMBER.fullmatch(before[-2])
+        return [int(before[-2]), int(words[start])] if ranged else [int(words[start])]
+
+    after = words[index + 1] if index + 1 < len(words) else ""
+    return [int(after)] if _DAY_NUMBER.fullmatch(after) else []
 
 
 #
@@ -690,6 +806,127 @@ def _explicit_day(match) -> date | None:
 
 
 #
+# Indica si un texto puede buscarse como valor guardado: tiene una palabra de al menos tres letras o es un
+# código numérico largo («03122004»); un número suelto («2») figura en casi cualquier registro.
+#
+def searchable_value(text: str) -> bool:
+    words = normalize_text(text).split()
+
+    return any(len(word) >= 3 and word.isalpha() for word in words) or bool(_VALUE_CODE.fullmatch(text.strip()))
+
+
+#
+# Devuelve las partes en que se puede dividir la mención de un valor: los elementos de una enumeración («Pta Lara
+# y Balandra»), los tramos entre conectores («La Balandra» y «Berisso») y cada frase de al menos dos palabras,
+# menor que la mención, que no empieza ni termina en un conector («cruda superficial», «Punta Lara»).
+#
+def value_parts(text: str) -> list[str]:
+    words = _value_words(text)
+    phrases = [
+        " ".join(words[start:end])
+        for start in range(len(words))
+        for end in range(start + 2, len(words) + 1)
+        if end - start < len(words)
+        and words[start].casefold() not in _PART_CONNECTORS
+        and words[end - 1].casefold() not in _PART_CONNECTORS
+    ]
+    segments = [segment.strip() for segment in _SEGMENT_CONNECTOR.split(" ".join(words))]
+    segments = [segment for segment in segments if segment and segment != " ".join(words)]
+
+    return list(dict.fromkeys([*coordinated_parts(text), *segments, *phrases]))
+
+
+#
+# Devuelve los elementos de una enumeración («A y B», «A, B o C»); en una enumeración de códigos con un nombre común
+# («estaciones 1, 2 y 3»), cada código con el nombre en singular («estacion 1», «estacion 2», «estacion 3»). Nada si
+# no es una enumeración o algún elemento no se puede buscar como valor.
+#
+def coordinated_parts(text: str) -> list[str]:
+    parts = [part.strip(f"{SURROUNDING_PUNCTUATION} ") for part in _COORDINATION.split(text)]
+    parts = [part for part in parts if part]
+    if len(parts) < 2:
+        return []
+    if all(searchable_value(part) for part in parts):
+        return parts
+
+    *head, first = parts[0].split()
+    codes = [first, *parts[1:]]
+    if not head or not all(_ENUMERATED_CODE.fullmatch(code) for code in codes):
+        return []
+
+    noun = " ".join([*head[:-1], _singular(head[-1])])
+    return [f"{noun} {code}" for code in codes]
+
+
+#
+# Elige las partes guardadas que reemplazan a la mención de un valor, a partir de dónde figura cada una (columnas
+# por dataset): la enumeración entera si todos sus elementos figuran o, si no, las frases guardadas más largas que no
+# se superponen. Partes guardadas en columnas distintas se combinan («Cruda Superficial» es un lugar y «Punta Lara»
+# una localidad); si comparten columna, la que sigue sólo describe a la primera («La Balandra de Berisso») y se
+# deja. None si no hay ninguna o si lo que queda afuera incluye un nombre propio (salvo la mayúscula inicial).
+#
+def stored_parts(text: str, parts: list[str], stored: dict) -> list[str] | None:
+    coordinated = coordinated_parts(text)
+    if coordinated and all(part in stored for part in coordinated):
+        return coordinated
+
+    words = _value_words(text)
+    chosen = []
+    for phrase in sorted((part for part in parts if part in stored), key=lambda part: -len(part.split())):
+        span = _word_span(words, phrase.split())
+        if span is not None and not any(span[0] < end and start < span[1] for start, end in chosen):
+            chosen.append(span)
+    if not chosen:
+        return None
+
+    covered = {index for start, end in chosen for index in range(start, end)}
+    left = [
+        word
+        for index, word in enumerate(words)
+        if index not in covered and word.casefold() not in _PART_CONNECTORS
+    ]
+    if any(word[:1].isupper() for word in left if word is not words[0]):
+        return None
+
+    kept, columns = [], set()
+    for start, end in sorted(chosen):
+        part = " ".join(words[start:end])
+        if not stored[part] & columns:
+            kept.append(part)
+            columns |= stored[part]
+    return kept
+
+
+#
+# Devuelve las palabras de la mención de un valor sin la puntuación que las rodea.
+#
+def _value_words(text) -> list[str]:
+    return [word for word in (item.strip(SURROUNDING_PUNCTUATION) for item in str(text).split()) if word]
+
+
+#
+# Devuelve dónde empieza y termina una frase entre las palabras de un texto, o None.
+#
+def _word_span(words, phrase) -> tuple[int, int] | None:
+    size = len(phrase)
+
+    return next(
+        ((start, start + size) for start in range(len(words) - size + 1) if words[start : start + size] == phrase),
+        None,
+    )
+
+
+#
+# Devuelve el número con que empieza un texto («20.000», «25 °C», «24,5»), leído como en una comparación, o
+# None si no empieza con un número.
+#
+def parsed_number(text: str) -> int | float | None:
+    found = _LEADING_NUMBER.fullmatch(str(text).strip())
+
+    return _comparison_number(found.group(1)) if found else None
+
+
+#
 # Convierte el número de una comparación, distinguiendo miles de decimales.
 #
 def _comparison_number(token: str) -> int | float | None:
@@ -789,12 +1026,42 @@ def aligned_span(mention: str, text: str) -> str | None:
 
 
 #
-# Indica si un valor guardado de varias palabras escribe la mención con abreviaturas: «Pta Lara», «Punta Lara».
+# Indica si un valor guardado escribe una mención de varias palabras con abreviaturas («Pta Lara», «Punta Lara») o
+# con iniciales, conectores o símbolos entre sus palabras («AVENIDA ALTE G BROWN N° 419» escribe «almirante brown
+# 419»): cada palabra de la mención se alinea, en orden, con una del valor y entre ellas sólo puede haber palabras
+# de una o dos letras; un número nunca se saltea.
 #
 def abbreviates(value: str, mention: str) -> bool:
     words = normalize_text(value).split(), normalize_text(mention).split()
+    if len(words[0]) == len(words[1]) > 1 and aligned_span(mention, value) is not None:
+        return True
 
-    return len(words[0]) == len(words[1]) > 1 and aligned_span(mention, value) is not None
+    return len(words[1]) > 1 and any(
+        _aligned_from(words[0], start, words[1]) for start in range(len(words[0]))
+    )
+
+
+#
+# Indica si la mención se alinea con el valor desde una posición, salteando sólo palabras de relleno.
+#
+def _aligned_from(words, start, target) -> bool:
+    position = start
+    for index, said in enumerate(target):
+        while index and position < len(words) and _filler(words[position]) and not _same_word(words[position], said):
+            position += 1
+        if position >= len(words) or not _same_word(words[position], said):
+            return False
+        position += 1
+
+    return True
+
+
+#
+# Indica si una palabra de un valor guardado es relleno entre las de un nombre: una inicial, un conector corto o un
+# símbolo (como «n» de «N°»), nunca un número.
+#
+def _filler(word) -> bool:
+    return len(word) <= _MAX_FILLER_LETTERS and word.isalpha()
 
 
 #
@@ -887,16 +1154,14 @@ def _known_words() -> dict[str, set]:
 #
 def named_documents(question: str, documents) -> list[dict]:
     available = [item for item in documents if item.get("document_id") and item.get("is_active", True)]
-    named = [item for item in available if _names_document(question, item)]
-    years = set(DOCUMENT_YEAR.findall(question))
-    if not years:
-        return named
 
-    return [item for item in named if not _document_years(item) or _document_years(item) & years]
+    return [item for item in available if _names_document(question, item)]
 
 
 #
-# Indica si la pregunta nombra un documento por su autor, su sigla o su título.
+# Indica si la pregunta nombra un documento por su título completo o por su autor o sigla, aun con una errata
+# en un apellido largo («Giannuzzi» por «Gianuzzi»). Un año escrito junto al autor («Sathicq et al. (2014)»)
+# elige entre sus documentos; los demás años de la pregunta son del período consultado, no de la cita.
 #
 def _names_document(question: str, document) -> bool:
     title = document.get("title") or ""
@@ -904,8 +1169,38 @@ def _names_document(question: str, document) -> bool:
         return True
 
     names = [name for pattern in DOCUMENT_AUTHOR_NAMES for name in pattern.findall(document["name"])]
+    ends = [end for name in names if len(name) >= 3 for end in _author_mentions(question, name)]
+    if not ends:
+        return False
 
-    return any(contains_phrase(question, name) for name in names if len(name) >= 3)
+    cited = {year for end in ends for year in DOCUMENT_YEAR.findall(question[end : end + _CITED_YEAR_WINDOW])}
+    own = _document_years(document)
+
+    return not cited or not own or bool(own & cited)
+
+
+#
+# Devuelve dónde termina cada mención de un autor en la pregunta: escrito igual o, si el apellido es largo, con
+# una sola errata («Giannuzzi» por «Gianuzzi»). No se admiten abreviaturas ni contracciones: «agua» no es
+# «Aguilera».
+#
+def _author_mentions(question: str, name: str) -> list[int]:
+    target = normalize_text(name)
+    words = [(normalize_text(match.group()), match.end()) for match in _WORD.finditer(question)]
+    exact = [end for word, end in words if word == target]
+    if exact or len(target) < _MIN_FUZZY_AUTHOR:
+        return exact
+
+    return [end for word, end in words if _misspells(word, target)]
+
+
+#
+# Indica si una palabra es un apellido escrito con una sola errata: misma inicial y una edición de distancia.
+#
+def _misspells(word: str, name: str) -> bool:
+    close = abs(len(word) - len(name)) <= 1 and word[:1] == name[:1]
+
+    return close and _edit_distance(word, name) <= 1
 
 
 #
@@ -975,7 +1270,8 @@ def asked_reference(question: str) -> str | None:
 
 
 #
-# Devuelve el sentido de la comparación pedida con una referencia: por encima (gt) o por debajo (lt).
+# Devuelve el sentido de la comparación pedida con una referencia: por encima (gt) o por debajo (lt), o incluido el
+# límite («alcanzaron o superaron»: ge; «como máximo»: le).
 #
 def reference_operator(question: str) -> str | None:
     above = COMPARISON_DIRECTIONS["above"].search(question) is not None
@@ -983,7 +1279,10 @@ def reference_operator(question: str) -> str | None:
     if above == below:
         return None
 
-    return "gt" if above else "lt"
+    inclusive = INCLUSIVE_BOUND.search(question) is not None
+    if above:
+        return "ge" if inclusive else "gt"
+    return "le" if inclusive else "lt"
 
 
 _KNOWN_WORDS = _known_words()

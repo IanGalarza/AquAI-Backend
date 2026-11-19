@@ -69,7 +69,7 @@ class ConversationMessage(BaseModel):
 
 
 class ResponseContextRecord(BaseModel):
-    prompt_version: str = "aquai-response-v5"
+    prompt_version: str = "aquai-response-v6"
     evidence: dict[str, JsonValue]
     sha256: str
     size_bytes: int

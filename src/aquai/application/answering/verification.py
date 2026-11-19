@@ -11,18 +11,22 @@ from aquai.application.answering.readings import (
     unread_tokens,
     written_nearby,
 )
-from aquai.application.matching import contains_phrase, normalize_text
+from aquai.application.matching import contains_phrase, named_variable_groups, normalize_text
 from aquai.application.Rules.documents import language_scores
 from aquai.application.Rules.evidence import (
+    ABSENCE_CLAIM,
+    ASSESSMENT_FAMILIES,
     ATTRIBUTED_SOURCE,
     BOUND_WORDS,
     CAUSAL_CLAIMS,
     CAUSAL_LINKS,
     CHEMICAL_NAME,
+    DATE_TOKEN,
     COMPARISON_DIRECTIONS,
     CONDITIONAL_CUES,
     DEICTIC_PLACE,
     DOCUMENT_YEAR,
+    EMPTY_RESULT,
     FOREIGN_SCRIPT,
     FREQUENCY_WORDS,
     FULL_DATE,
@@ -50,9 +54,19 @@ from aquai.application.Rules.evidence import (
     VERDICT_LIMITS,
     WATER_USES,
 )
+from aquai.application.Rules.variables import PH_ALIASES
 from aquai.application.units import comparable_unit, spelled_symbol
 
 _TABLE_CELL = "|"
+_NAME_STEM = 5
+_CAPITALIZED = re.compile(r"(?<![\w.°])[A-ZÁÉÍÓÚÑÜ][\w-]+")
+_FIRST_WORD = re.compile(r"\w")
+_NAMED_NUMBER = re.compile(r"[A-ZÁÉÍÓÚÑÜ][\w-]*\s+$")
+_CLAUSE_BREAK = re.compile(r"[,;:()\n]")
+_CLAUSE_WORD = 6
+_PROPER_NAME = re.compile(
+    r"[A-ZÁÉÍÓÚÑ][\wáéíóúñ]+(?:\s+(?:(?:de|del|la|las|el|los|of|the)\s+)*[A-ZÁÉÍÓÚÑ][\wáéíóúñ]+)*"
+)
 _HEDGE_WINDOW = 40
 _BOUND_WINDOW = 40
 _BOUNDS = {"<", ">", "≤", "≥"}
@@ -86,6 +100,7 @@ class DraftEvidence:
     doubtful_documents: set[str] = field(default_factory=set)
     document_labels: dict[str, str] = field(default_factory=dict)
     document_sources: dict[str, str] = field(default_factory=dict)
+    document_owners: dict[str, str] = field(default_factory=dict)
     hypothesis_values: list[str] = field(default_factory=list)
     question: str = ""
     result_names: list[str] = field(default_factory=list)
@@ -96,12 +111,15 @@ class DraftEvidence:
     language: str = "es"
     places: list[str] = field(default_factory=list)
     document_contexts: dict[str, str] = field(default_factory=dict)
+    variable_names: list[str] = field(default_factory=list)
+    source_names: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
 class Rejection:
     code: str
     detail: str
+    family: str | None = None
 
 
 @dataclass
@@ -160,12 +178,13 @@ class DraftVerifier:
             return structural
 
         text = _full_text(segment)
+        unnamed = _without_source_names(text, self._evidence.source_names)
 
         return [
             *self._form(text),
-            *self._numbers(segment, text),
+            *self._numbers(segment, unnamed),
             *self._sources(segment, text),
-            *self._result_wording(segment, text),
+            *self._result_wording(segment, unnamed),
             *self._verdicts(segment, text),
             *self._comparisons(segment, text),
             *self._statistics(segment, text),
@@ -339,12 +358,16 @@ class DraftVerifier:
         return symbol is not None and self._unit_matches(written, allowed, fragments)
 
     #
-    # Revisa que las cifras de cada oración documental salgan de un mismo fragmento, sin mezclar fuentes.
+    # Revisa que las cifras de cada oración documental salgan de un mismo documento, sin mezclar fuentes: los
+    # fragmentos de un mismo documento (dos secciones de la misma guía) son una sola fuente.
     #
     def _sources(self, segment, text) -> list[Rejection]:
         evidence = self._evidence
         cited = [key for key in segment.document_ids if key not in evidence.doubtful_documents]
-        if segment.role != "documented" or len(cited) < 2:
+        owners = {}
+        for key in cited:
+            owners.setdefault(evidence.document_owners.get(key, key), []).append(key)
+        if segment.role != "documented" or len(owners) < 2:
             return []
 
         shared = _Authorized()
@@ -352,7 +375,7 @@ class DraftVerifier:
             shared.add_fact(evidence.facts[key], evidence.language)
         for answer in evidence.previous_answers:
             shared.add(answer, evidence.language)
-        holders = [self._document_values(key) for key in cited]
+        holders = [set().union(*(self._document_values(key) for key in keys)) for keys in owners.values()]
 
         return [
             Rejection("mixed_sources", sentence[:80])
@@ -422,24 +445,27 @@ class DraftVerifier:
         return any(written_nearby(reading, source) for source in sources)
 
     #
-    # Revisa que un párrafo de resultado sólo use las palabras de sus hechos y los deje alineados.
+    # Revisa que un párrafo de resultado no agregue lo que sus hechos no dicen y deje cada cifra junto a lo que
+    # mide. La redacción es libre: sólo se rechazan las valoraciones de lo observado que los hechos citados no
+    # hacen, las variables y los nombres propios que no figuran en lo citado ni en la pregunta.
     #
     def _result_wording(self, segment, text) -> list[Rejection]:
         if segment.role != "result":
             return []
 
         cited = [self._evidence.facts[key] for key in segment.fact_ids]
-        known = {_root(word) for word in normalize_text(" ".join(cited)).split()}
         rivals = [self._evidence.facts[key] for key in self._evidence.required_facts]
-        known |= {_root(word) for word in normalize_text(self._evidence.question).split()}
-        known |= {_root(word) for word in normalize_text(" ".join(self._evidence.result_names)).split()}
-        known |= {_root(word) for word in RESULT_WORDS}
-        unknown = [
-            word
-            for word in normalize_text(_without_numbers(text)).split()
-            if _root(word) not in known
+        named = " ".join([*cited, self._evidence.question, *self._evidence.result_names])
+        words = _without_numbers(text)
+        unlicensed = [
+            *_unlicensed_assessments(words, " ".join(cited)),
+            *_unlicensed_variables(words, named),
+            *_unlicensed_names(words, named),
         ]
-        rejections = [Rejection("unsupported_result_word", word) for word in dict.fromkeys(unknown)]
+        rejections = [Rejection("unsupported_result_word", word) for word in dict.fromkeys(unlicensed)]
+        absent = ABSENCE_CLAIM.search(text)
+        if absent and not any(EMPTY_RESULT.search(fact) for fact in cited):
+            rejections.append(Rejection("unsupported_absence", absent.group()))
         rejections += self._unsupported_samples(text, cited)
 
         return [*rejections, *self._misaligned(text, list(dict.fromkeys([*cited, *rivals])))]
@@ -456,7 +482,8 @@ class DraftVerifier:
         return [Rejection("unsupported_count_noun", match.group()) for match in _COUNTED_SAMPLES.finditer(text)]
 
     #
-    # Revisa que cada número de un resultado acompañe a la variable o el lugar que le corresponde.
+    # Revisa que cada número de un resultado acompañe a la variable o el lugar que le corresponde. Las partes de
+    # una fecha («01/09/2021») no son valores con etiqueta: su presencia en los hechos ya la revisa _numbers.
     #
     def _misaligned(self, text, facts) -> list[Rejection]:
         language = self._evidence.language
@@ -464,8 +491,10 @@ class DraftVerifier:
         rejections = []
         for sentence in sentences(text):
             position = 0
+            dates = [match.span() for match in DATE_TOKEN.finditer(sentence)]
             for reading in number_readings(sentence, language):
-                if not _aligned(sentence[position : reading.start], reading, labels):
+                dated = any(start <= reading.start < end for start, end in dates)
+                if not dated and not _aligned(sentence[position : reading.start], reading, labels):
                     rejections.append(Rejection("misaligned_value", reading.text))
                 position = reading.stop
 
@@ -506,7 +535,8 @@ class DraftVerifier:
         ):
             found = pattern.search(sentence)
             limited = found and VERDICT_LIMITS.search(sentence[: found.start()])
-            if found and not limited and not self._quotes_facts(segment, found.group()):
+            quoted = found and (self._quotes_facts(segment, found.group()) or self._names_variable(sentence, found))
+            if found and not limited and not quoted:
                 rejections.append(Rejection(code, found.group()))
 
         cause = CAUSAL_CLAIMS.search(sentence)
@@ -518,6 +548,16 @@ class DraftVerifier:
             rejections.append(Rejection("unsupported_recommendation", advice.group()))
 
         return rejections
+
+    #
+    # Indica si la palabra hallada es parte del nombre de una variable pedida que la oración escribe con la palabra
+    # que la precede («cianobacterias potencialmente tóxicas»): nombrar la variable no es juzgar lo observado.
+    #
+    def _names_variable(self, sentence, found) -> bool:
+        before = normalize_text(sentence[: found.start()]).split()[-1:]
+        phrase = " ".join([*before, *normalize_text(found.group()).split()])
+
+        return len(phrase.split()) > 1 and any(contains_phrase(name, phrase) for name in self._evidence.variable_names)
 
     #
     # Indica si unas palabras repiten lo que dicen los hechos citados, como la condición de un valor guía.
@@ -540,14 +580,22 @@ class DraftVerifier:
             for key in segment.fact_ids
             if key in self._evidence.fact_directions
         ]
-        if segment.role == "result":
+        if segment.role in {"result", "relation"}:
             directions += self._filtered_directions(segment)
         rejections = []
         for sentence in sentences(text):
             compared = OBSERVED_COMPARISON.search(sentence)
-            if compared and not directions:
+            if compared is None:
+                continue
+            if directions:
+                if not _direction_agrees(sentence, directions):
+                    rejections.append(Rejection("wrong_direction", compared.group()))
+                continue
+
+            ordered = _ordered_values(sentence, compared, self._evidence.language) if segment.role == "result" else None
+            if ordered is None:
                 rejections.append(Rejection("unsupported_comparison", compared.group()))
-            elif compared and not _direction_agrees(sentence, directions):
+            elif not ordered:
                 rejections.append(Rejection("wrong_direction", compared.group()))
 
         return rejections
@@ -717,12 +765,25 @@ def _full_text(segment) -> str:
 
 
 #
+# Devuelve el texto sin los nombres de los archivos y hojas del análisis: sus dígitos («5MAR2024 (2)») no son cifras
+# ni sus mayúsculas, nombres de lugares.
+#
+def _without_source_names(text, names) -> str:
+    for name in names:
+        text = re.sub(re.escape(name), " ", text, flags=re.IGNORECASE)
+
+    return text
+
+
+#
 # Devuelve lo que una paráfrasis pierde o agrega respecto de la oración del fragmento que más se le parece:
 # una acotación (atenuación, alcance del estudio, condición, cuantificador, ambiente o uso del agua), una
 # relación causal, una generalidad o una conclusión estadística que el fragmento no expresa. Un párrafo que
 # relaciona lo observado con un valor documentado sólo debe conservar el ambiente y el uso del agua.
 #
-def paraphrase_drift(claim, passage, heading="", earlier="", question="", relation=False) -> Rejection | None:
+def paraphrase_drift(
+    claim, passage, heading="", earlier="", question="", relation=False, same_language=False
+) -> Rejection | None:
     situated = f"{passage} {heading}"
     for family, patterns in QUALIFIER_FAMILIES.items():
         if relation and family not in SITUATED_FAMILIES:
@@ -730,9 +791,14 @@ def paraphrase_drift(claim, passage, heading="", earlier="", question="", relati
 
         source = situated if family in SITUATED_FAMILIES else passage
         kept = _kept_text(family, claim, earlier, question)
-        found = patterns[0].search(source)
+        found = [
+            item
+            for item in patterns[0].finditer(source)
+            if not (same_language and _qualifies_another_clause(item, passage, claim))
+            and not _names_qualified_place(item, passage, heading, f"{earlier} {claim} {question}")
+        ]
         if found and not patterns[-1].search(kept):
-            return Rejection("lost_qualifier", f"{family} «{found.group()}»: {claim[:70]}")
+            return Rejection("lost_qualifier", f"{family} «{found[0].group()}»: {claim[:70]}", family)
 
     for use in _water_uses(situated) - _water_uses(f"{earlier} {claim} {question}"):
         return Rejection("lost_qualifier", f"uso del agua «{use}»: {claim[:70]}")
@@ -750,6 +816,48 @@ def paraphrase_drift(claim, passage, heading="", earlier="", question="", relati
             return Rejection(code, f"{found.group()}: {claim[:70]}")
 
     return None
+
+
+#
+# Indica si una acotación del encabezado describe un lugar que la oración nombra: en el título «… of a shallow
+# temperate estuary (Río de la Plata)», decir «la costa del Río de la Plata» conserva que se trata del estuario. No
+# cuenta la primera palabra del encabezado, que va en mayúscula sin ser un nombre.
+#
+def _names_qualified_place(found, passage, heading, said) -> bool:
+    if found.start() <= len(passage) or not heading:
+        return False
+
+    names = [item.group() for item in _PROPER_NAME.finditer(heading) if item.start() > 0]
+    return any(contains_phrase(said, name) for name in names)
+
+
+#
+# Indica si una acotación del fragmento pertenece a una cláusula que la paráfrasis no retoma: en «presentan una
+# gran diversidad de formas, …, y habitan aguas dulces y salobres», «aguas dulces» acota dónde habitan, no la
+# diversidad de formas. Sólo se usa con fragmentos en el idioma de la respuesta, porque compara palabras; una
+# acotación que forma sola su cláusula («En este estudio, …») sitúa toda la oración y sigue siendo exigible.
+#
+def _qualifies_another_clause(found, passage, claim) -> bool:
+    if found.start() >= len(passage):
+        return False
+
+    start = max((item.end() for item in _CLAUSE_BREAK.finditer(passage, 0, found.start())), default=0)
+    after = _CLAUSE_BREAK.search(passage, found.end())
+    clause = passage[start : after.start() if after else len(passage)]
+    qualifier = set(normalize_text(found.group()).split())
+    content = {_clause_stem(word) for word in normalize_text(clause).split() if len(word) >= _CLAUSE_WORD} - {
+        _clause_stem(word) for word in qualifier
+    }
+    said = {_clause_stem(word) for word in normalize_text(claim).split() if len(word) >= _CLAUSE_WORD}
+
+    return bool(content) and not content & said
+
+
+#
+# Devuelve la raíz con que se comparan las palabras de una cláusula y de una paráfrasis.
+#
+def _clause_stem(word) -> str:
+    return word[:_CLAUSE_WORD]
 
 
 #
@@ -930,3 +1038,101 @@ def _direction_agrees(sentence, directions) -> bool:
     written = {name for name, pattern in COMPARISON_DIRECTIONS.items() if pattern.search(sentence)}
 
     return not written or bool(written & set(directions))
+
+
+#
+# Indica si la comparación entre dos valores calculados respeta sus cifras («64,88 UNT en un sitio, superior a
+# 41,72 UNT en el otro»): True si el sentido coincide, False si lo invierte y None si la oración no da los dos
+# valores comparables, en la misma unidad, a cada lado de la comparación.
+#
+def _ordered_values(sentence, compared, language) -> bool | None:
+    above = COMPARISON_DIRECTIONS["above"].search(compared.group()) is not None
+    below = COMPARISON_DIRECTIONS["below"].search(compared.group()) is not None
+    if above == below:
+        return None
+
+    readings = [
+        item
+        for item in number_readings(sentence, language)
+        if not item.comparator and not _NAMED_NUMBER.search(sentence[: item.start])
+    ]
+    left = [item for item in readings if item.end <= compared.start()]
+    right = [item for item in readings if item.start >= compared.end()]
+    pairs = [*([(left[-1], right[0])] if left and right else []), *([(right[0], right[1])] if len(right) > 1 else [])]
+    same_unit = [
+        (first, second)
+        for first, second in pairs
+        if comparable_unit("", first.unit or "") == comparable_unit("", second.unit or "")
+    ]
+    if not same_unit:
+        return None
+
+    first, second = same_unit[0]
+    if above:
+        return min(first.values) > max(second.values)
+
+    return max(first.values) < min(second.values)
+
+
+#
+# Devuelve las valoraciones de lo observado (intensidad, nivel, cambio, tipicidad o relación) que el texto hace
+# y lo citado no autoriza: una familia de valoraciones sólo se puede usar si los hechos citados la usan.
+#
+def _unlicensed_assessments(text, licensed) -> list[str]:
+    allowed = {family for word in normalize_text(licensed).split() for family in _assessment_families(word)}
+
+    return [
+        word
+        for word in normalize_text(text).split()
+        if any(family not in allowed for family in _assessment_families(word))
+    ]
+
+
+#
+# Devuelve las familias de valoración a las que pertenece una palabra normalizada.
+#
+def _assessment_families(word) -> list[str]:
+    return [family for family, pattern in ASSESSMENT_FAMILIES.items() if pattern.fullmatch(word)]
+
+
+#
+# Devuelve las variables que el texto nombra y que no figuran en lo citado, la pregunta ni los resultados: un
+# párrafo de resultado no puede atribuir un valor a otra variable.
+#
+def _unlicensed_variables(text, licensed) -> list[str]:
+    extra = named_variable_groups(text) - named_variable_groups(licensed)
+    known = set(normalize_text(licensed).split())
+    words = normalize_text(text).split()
+    named = [word for word in words if named_variable_groups(word) & extra]
+    acidity = [word for word in words if word in PH_ALIASES and word not in known]
+
+    return [*(named or (["variable"] if extra else [])), *acidity]
+
+
+#
+# Devuelve los nombres propios (sitios, organismos, fuentes, instituciones) que el texto usa fuera del inicio de
+# una oración y que no figuran en lo citado, la pregunta ni los resultados.
+#
+def _unlicensed_names(text, licensed) -> list[str]:
+    known = set(normalize_text(licensed).split())
+    found = []
+    for item in sentences(text):
+        first = _FIRST_WORD.search(item)
+        for match in _CAPITALIZED.finditer(item):
+            if first is not None and match.start() <= first.start():
+                continue
+            parts = normalize_text(match.group()).split()
+            if any(not _known_name(part, known) for part in parts):
+                found.append(match.group())
+
+    return found
+
+
+#
+# Indica si una palabra de un nombre propio figura entre las conocidas, tal cual o con otra flexión.
+#
+def _known_name(part, known) -> bool:
+    if part in known or len(part) < _NAME_STEM:
+        return part in known or part.isdigit()
+
+    return any(word[:_NAME_STEM] == part[:_NAME_STEM] for word in known if len(word) >= _NAME_STEM)

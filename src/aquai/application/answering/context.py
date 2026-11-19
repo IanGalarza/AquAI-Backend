@@ -39,13 +39,22 @@ from aquai.application.planning.followUp import period_fields
 from aquai.application.planning.temporalText import period_bounds
 from aquai.application.matching import singular_words
 from aquai.application.Rules.language import ENGLISH_CUES, SPANISH_CUES, WORD
-from aquai.application.Rules.vocabulary import YEAR_COLUMN_NAMES
+from aquai.application.Rules.vocabulary import TREND_CUES, YEAR_COLUMN_NAMES
 
 _EQUALITY_OPERATORS = {"eq", "ieq", "in"}
 _RANGE_OPERATORS = {"lt", "le", "gt", "ge"}
 _GROUPED_DIGITS = 5
 _DATE_TYPES = {"DATE", "TIMESTAMP"}
 _ORDERING_OPERATIONS = {"sort", "latest"}
+_ANSWERING_CHARTS = {"histogram", "scatter"}
+_MAX_PATTERN_MEASURES = 3
+_MAX_LOCATOR_PARTS = 2
+_CORRELATION_BANDS = (
+    (0.1, "prácticamente nula", "virtually absent"),
+    (0.3, "débil", "weak"),
+    (0.5, "moderada", "moderate"),
+    (1.01, "fuerte", "strong"),
+)
 _MAX_LABEL_LENGTH = 200
 _SPANISH_RELATIONS = {
     "ne": "distinto de ",
@@ -118,6 +127,7 @@ class _ContextBuilder:
         self._summaries = {}
         self._omitted = {}
         self._meanings = {}
+        self._patterned = set()
 
     #
     # Arma el contexto completo de la respuesta y lo devuelve junto con el idioma.
@@ -131,9 +141,27 @@ class _ContextBuilder:
         if self._multi_source:
             self._body["introduction"] = self._writer.introduction(self._files)
         self._add_table_sentences()
+        self._add_source_comparison()
         self._add_meanings()
 
         return self._finish()
+
+    #
+    # Responde, cuando la pregunta busca una tendencia en el tiempo y los resultados vienen de archivos distintos,
+    # que la diferencia entre ellos no la muestra por sí sola.
+    #
+    def _add_source_comparison(self):
+        routing = self._state.routing
+        question = routing.original_question if routing else self._state.question
+        tables = [
+            item for item in self._validation.usable_evidence if item.kind == "table" and item.is_requested_output
+        ]
+        if not self._multi_source or len(tables) < 2 or TREND_CUES.search(question) is None:
+            return
+
+        entry = self._add(tables[-1], self._writer.source_comparison(), required=True, attribute=False)
+        if entry is not None:
+            entry["evidence_ids"] = [item.evidence_id for item in tables]
 
     #
     # Agrega las oraciones que responden con el período de cada resultado.
@@ -297,7 +325,9 @@ class _ContextBuilder:
         if pattern is None:
             return
 
-        self._add(evidence, pattern, required=True)
+        answers = chart.chart_type in _ANSWERING_CHARTS
+        self._add(evidence, pattern, kind="result" if answers else "pattern", required=True)
+        self._patterned.update(chart.input_operation_ids)
         if chart.chart_type == "scatter":
             self._add(evidence, self._writer.correlation_meaning(), kind="meaning")
 
@@ -336,8 +366,54 @@ class _ContextBuilder:
         if entry is None or attach:
             self._omitted[evidence.operation_id] = len(rows)
 
+        pattern = self._table_pattern(evidence, rows, fields, origin, latest, ranking)
+        if pattern is not None:
+            self._add(evidence, pattern, kind="pattern")
+        strength = self._correlation_fact(origin, rows)
+        if strength is not None:
+            self._add(evidence, strength, required=True)
         self._collect_meanings(origin, rows, evidence)
         self._add_details(evidence, record, origin, fields)
+
+    #
+    # Devuelve qué tan fuerte es una correlación calculada y con cuántos pares, que responden si hay una asociación:
+    # los pares se cuentan sólo si la lectura excluyó los nulos de ambas variables.
+    #
+    def _correlation_fact(self, origin, rows):
+        correlations = [item for item in origin.calculations if item.function == "correlation"]
+        if origin.operation != "calculate" or len(correlations) != 1 or len(rows) != 1:
+            return None
+        value = rows[0].get(correlations[0].output_name)
+        if value is None:
+            return None
+
+        source = self._steps.get(origin.depends_on[0]) if origin.depends_on else None
+        record = self._records.get(source.id) if source is not None else None
+        excluded = {
+            getattr(item.field, "column", None)
+            for item in (source.filters if source else [])
+            if item.operator == "is_not_null"
+        }
+        complete = record is not None and {ref.field for ref in correlations[0].inputs} <= excluded
+        return self._writer.correlation_summary(float(value), record.rows_returned if complete else None)
+
+    #
+    # Devuelve lo que destaca un resultado extenso que la tabla muestra completo: el rango de cada medición con
+    # dónde y cuándo se registraron sus extremos, o el grupo con el valor más alto y el más bajo. Así la
+    # respuesta puede sintetizar sin enumerar; None si la oración ya lo dice o un gráfico ya lo describe.
+    #
+    def _table_pattern(self, evidence, rows, fields, origin, latest, ranking):
+        if len(rows) <= self._max_preview_rows or latest is not None or evidence.operation_id in self._patterned:
+            return None
+
+        calculations = {item.output_name: item for item in origin.calculations}
+        grouping = {item.output_name: item for item in origin.group_by}
+        if grouping:
+            return self._writer.grouped_pattern(rows, fields, calculations, grouping)
+        if calculations or self._writer.ranks_values(ranking, fields):
+            return None
+
+        return self._writer.records_pattern(rows, fields)
 
     #
     # Elige y redacta la oración que describe el resultado de una tabla.
@@ -366,7 +442,7 @@ class _ContextBuilder:
             if ranked is not None:
                 return ranked
 
-        direction = _sort_direction(ranking, fields)
+        direction = _sort_direction(ranking, fields) if writer.ranks_values(ranking, fields) else None
 
         return writer.rows(
             rows, fields, calculations, grouping, direction, self._max_preview_rows, chain
@@ -547,7 +623,7 @@ class _Writer:
     # Devuelve un valor tal como se muestra: texto tal cual o medida formateada.
     #
     def _displayed(self, field, value):
-        return value if isinstance(value, str) else self.measure(field, value)
+        return value.strip() if isinstance(value, str) else self.measure(field, value)
 
     #
     # Devuelve los atributos de una fila que la ubican, separados por comas.
@@ -640,6 +716,22 @@ class _Writer:
         return (
             f"I found information in {number_words(files, 'en')} different files, "
             "so I show the result of each one separately."
+        )
+
+    #
+    # Devuelve por qué la diferencia entre resultados de archivos distintos no muestra por sí sola una tendencia.
+    #
+    def source_comparison(self):
+        if self.es:
+            return (
+                "Como los resultados vienen de archivos distintos, la diferencia entre ellos no muestra por sí sola "
+                "una tendencia en el tiempo: también puede deberse a diferencias de período, de puntos de muestreo "
+                "o de método de medición."
+            )
+
+        return (
+            "Since the results come from different files, the difference between them does not by itself show a "
+            "trend over time: it can also come from differences in period, sampling points or measurement method."
         )
 
     #
@@ -823,14 +915,14 @@ class _Writer:
             if top is None:
                 return text
             bounds = f"de {self.measure(field, top.lower)} a {self.measure(field, top.upper)}"
-            return f"{text} El intervalo con más valores, {bounds}, reúne {top.count}."
+            return f"{text} El intervalo más frecuente, {bounds}, reúne {self.count(top.count, 'valor', 'valores')}."
 
         text = f"The {values} of {label} range from {low} to {high}."
         if top is None:
             return text
         bounds = f"from {self.measure(field, top.lower)} to {self.measure(field, top.upper)}"
 
-        return f"{text} The interval with the most values, {bounds}, holds {top.count}."
+        return f"{text} The most frequent interval, {bounds}, holds {self.count(top.count, 'value', 'values')}."
 
     #
     # Redacta el coeficiente de correlación de Pearson entre los ejes de una dispersión.
@@ -843,16 +935,44 @@ class _Writer:
         coefficient, total = found
         x, y = (self.label(axis.field) for axis in (chart.x_axis, chart.y_axis))
         shown = f"{coefficient:.2f}".replace(".", "," if self.es else ".")
+        strength = self._correlation_strength(coefficient)
         if self.es:
             return (
                 f"El coeficiente de correlación de Pearson entre {x} y {y} fue {shown}, "
-                f"calculado con {self.count(total, 'punto', 'puntos')}."
+                f"calculado con {self.count(total, 'punto', 'puntos')}: {strength}."
             )
 
         return (
             f"The Pearson correlation coefficient between {x} and {y} was {shown}, "
-            f"computed from {self.count(total, 'point', 'points')}."
+            f"computed from {self.count(total, 'point', 'points')}: {strength}."
         )
+
+    #
+    # Redacta qué tan fuerte es una correlación calculada y, si se conocen, con cuántos pares de valores.
+    #
+    def correlation_summary(self, coefficient, pairs):
+        strength = self._correlation_strength(coefficient)
+        if self.es:
+            counted = f"Se calculó con {self.count(pairs, 'par de valores', 'pares de valores')}: " if pairs else "Indica "
+            return sentence(f"{counted}{strength}") + "."
+
+        counted = f"It was computed from {self.count(pairs, 'pair of values', 'pairs of values')}: " if pairs else "It shows "
+        return sentence(f"{counted}{strength}") + "."
+
+    #
+    # Describe la fuerza de una correlación según su valor absoluto (convención de Cohen: menos de 0,1
+    # prácticamente nula, hasta 0,3 débil, hasta 0,5 moderada y desde 0,5 fuerte) y, si no es nula, su sentido.
+    #
+    def _correlation_strength(self, coefficient):
+        band = next(item for item in _CORRELATION_BANDS if abs(coefficient) < item[0])
+        absent = band is _CORRELATION_BANDS[0]
+        if self.es:
+            direction = "" if absent else f" y {'positiva' if coefficient > 0 else 'negativa'}"
+            return f"una relación lineal {band[1]}{direction}"
+        if absent:
+            return "virtually no linear relationship"
+
+        return f"a {band[2]} {'positive' if coefficient > 0 else 'negative'} linear relationship"
 
     #
     # Devuelve qué indica el coeficiente de correlación de Pearson.
@@ -1405,24 +1525,141 @@ class _Writer:
         order = step.order_by[0]
         name = _ref_name(order.field)
         field = fields.get(name)
-        if field is None or field.sql_type not in NUMERIC_TYPES or rows[0][name] is None:
+        if not self.ranks_values(step, fields) or rows[0][name] is None:
             return None
 
         highest = order.direction == "desc"
         top = rows[0][name]
         label = self.names.result(step.id, name, field) + self.qualifier(chain, _shown(fields))
         tied = [row for row in rows if row[name] == top]
-        contexts = [self.context(row, fields, {name}) for row in tied]
+        listed = len(tied) <= inline_rows
+        contexts = [self.context(row, fields, {name}) for row in tied] if listed else []
         places = [place for place in contexts if place]
         text = self._extreme(field, label, top, highest, len(tied), places)
 
         rest = [row for row in rows if row[name] != top]
         if not rest:
-            return text, False
+            return (text, False) if listed else (text + self._tied_table(), True)
         if len(rows) <= inline_rows:
             return text + self._following(rest, field, fields), False
 
         return text + self._ranked_table(len(rows), highest), True
+
+    #
+    # Indica si un orden clasifica por el valor de una medición: ordenar por año o por fecha no da un máximo.
+    #
+    def ranks_values(self, ranking, fields):
+        if ranking is None or not ranking.order_by:
+            return False
+
+        field = fields.get(_ref_name(ranking.order_by[0].field))
+
+        return field is not None and field.sql_type in NUMERIC_TYPES and self._period_kind(field) is None
+
+    #
+    # Devuelve la frase que remite a la tabla con los registros empatados en el extremo.
+    #
+    def _tied_table(self):
+        return " Podés ver esos registros en la tabla." if self.es else " Those records are listed in the table."
+
+    #
+    # Redacta lo que destaca un listado extenso: el rango de cada medición, con dónde y cuándo se registró cada
+    # extremo, o None si ninguna medición varía.
+    #
+    def records_pattern(self, rows, fields):
+        measures = [field for field in fields.values() if self._measured(field)][:_MAX_PATTERN_MEASURES]
+        varying = {name: field for name, field in fields.items() if len({row[name] for row in rows}) > 1}
+        spreads = [item for item in (self._spread(rows, field, varying) for field in measures) if item]
+        if not spreads:
+            return None
+
+        if self.es:
+            return f"En esos registros, {join_words(spreads, 'es')}."
+
+        return f"Across those records, {join_words(spreads, 'en')}."
+
+    #
+    # Redacta el grupo con el valor calculado más alto y el más bajo de un resultado agrupado extenso.
+    #
+    def grouped_pattern(self, rows, fields, calculations, grouping):
+        values = [name for name in fields if name not in grouping]
+        if len(values) != 1 or values[0] not in calculations:
+            return None
+
+        name = values[0]
+        valued = [row for row in rows if row[name] is not None]
+        if len(valued) < 2:
+            return None
+
+        high = max(valued, key=lambda row: row[name])
+        low = min(valued, key=lambda row: row[name])
+        if high[name] == low[name]:
+            return None
+
+        field, measured = fields[name], self.subject(calculations[name])
+        highest, lowest = (
+            f"{self.measure(field, row[name])} {self.group_scope(grouping, fields, row)}" for row in (high, low)
+        )
+        if self.es:
+            return f"El valor máximo {_of(measured)} fue {highest} y el mínimo fue {lowest}."
+
+        return f"The maximum value of {measured} was {highest} and the minimum was {lowest}."
+
+    #
+    # Indica si un campo es una medición numérica, no un año, una fecha ni un código.
+    #
+    def _measured(self, field):
+        return field.sql_type in NUMERIC_TYPES and field.numeric_eligible and self._period_kind(field) is None
+
+    #
+    # Redacta el rango de una medición con dónde y cuándo se registraron su mínimo y su máximo; los ubica sólo
+    # con los campos que varían entre las filas (un año común a todas no distingue nada).
+    #
+    def _spread(self, rows, field, fields):
+        valued = [row for row in rows if row[field.name] is not None]
+        if len(valued) < 2:
+            return None
+
+        low = min(valued, key=lambda row: row[field.name])
+        high = max(valued, key=lambda row: row[field.name])
+        if low[field.name] == high[field.name]:
+            return None
+
+        label = self.label(field)
+        lowest, highest = (self._located_measure(row, field, fields) for row in (low, high))
+        if self.es:
+            return f"{label} va de {lowest} a {highest}"
+
+        return f"{label} ranges from {lowest} to {highest}"
+
+    #
+    # Devuelve el valor de una medición en una fila con el lugar y el momento en que se registró.
+    #
+    def _located_measure(self, row, field, fields):
+        measured = self.measure(field, row[field.name])
+        where = self._locator(row, fields, field.name)
+
+        return f"{measured} ({where})" if where else measured
+
+    #
+    # Devuelve dónde y cuándo se registró una fila: su lugar y su fecha, período o año, sin otras mediciones.
+    #
+    def _locator(self, row, fields, skip):
+        parts = []
+        for name, field in fields.items():
+            value = row[name]
+            if name == skip or value is None:
+                continue
+
+            moment = self.when(field, value)
+            if moment is None and self._period_kind(field) == "year" and type(value) is int:
+                moment = (str(value), "year")
+            if moment is not None:
+                parts.append(at(*moment, self.language))
+            elif isinstance(value, str) and is_place(self.label(field)):
+                parts.append(self._located(place_text(value)))
+
+        return ", ".join(parts[:_MAX_LOCATOR_PARTS])
 
     #
     # Redacta el valor más alto o más bajo y dónde se registró.
@@ -1493,9 +1730,13 @@ class _Writer:
     def rows(self, rows, fields, calculations, grouping, direction, inline_rows, chain):
         values = [name for name in fields if name not in grouping]
         grouped = self.qualifier(chain, _shown({name: fields[name] for name in grouping}))
+        said = len(values) - len(_date_pairs(values, calculations, fields))
 
-        if len(rows) == 1 and len(values) <= INLINE_FIELDS:
+        if len(rows) == 1 and said <= INLINE_FIELDS:
             return self._single(rows[0], fields, values, calculations, grouping, grouped), False
+        shown = self._record_essentials(rows[0], fields, values) if len(rows) == 1 and not calculations else []
+        if shown:
+            return self._single(rows[0], fields, shown, calculations, grouping, grouped), True
 
         few_rows = 1 < len(rows) <= inline_rows
         numeric = [name for name in values if fields[name].sql_type in NUMERIC_TYPES]
@@ -1507,6 +1748,11 @@ class _Writer:
             name = values[0]
             text = self._grouped(rows, fields[name], calculations[name], grouping, fields, grouped)
             return text, False
+        several_calculations = bool(grouping) and len(values) <= INLINE_FIELDS and all(
+            name in calculations for name in values
+        )
+        if few_rows and several_calculations:
+            return self._grouped_values(rows, fields, values, calculations, grouping, grouped), False
         if few_rows and one_measure:
             qualifier = self.qualifier(chain, _shown(fields))
             return self._listed(rows, fields[numeric[0]], fields, qualifier), False
@@ -1514,6 +1760,18 @@ class _Writer:
         text = self._lead(rows, fields, values, calculations, grouping, direction, grouped)
 
         return text, True
+
+    #
+    # Devuelve los campos que dicen lo esencial de un registro con muchos campos: sus mediciones y su fecha, si
+    # caben en una oración; la tabla muestra el resto. Vacío si no tiene mediciones o son demasiadas.
+    #
+    def _record_essentials(self, row, fields, values):
+        measured = [name for name in values if self._measured(fields[name])]
+        dated = [name for name in values if name not in measured and self.when(fields[name], row[name]) is not None]
+        if not measured or len(measured) > INLINE_FIELDS:
+            return []
+
+        return [*dated[:1], *measured]
 
     #
     # Redacta un resultado de una sola fila, con cálculos o campos.
@@ -1528,8 +1786,14 @@ class _Writer:
             return f"I found one record with {listed}."
 
         parts = []
+        spans = _date_pairs(values, calculations, fields)
         for name in values:
             calculation = calculations.get(name)
+            if name in spans.values():
+                continue
+            if name in spans:
+                parts.append(self._records_span(row[name], row[spans[name]]))
+                continue
             if calculation is None:
                 parts.append(self.pair(fields[name], row[name]))
                 continue
@@ -1537,6 +1801,22 @@ class _Writer:
             parts.append(self._calculated(subject, fields[name], row[name]))
 
         return sentence(join_words(parts, self.language)) + "."
+
+    #
+    # Redacta el período de los registros con su primera y su última fecha.
+    #
+    def _records_span(self, first, last):
+        if first is None or last is None:
+            if self.es:
+                return "no se pudo obtener el período de los registros"
+            return "the period of the records could not be obtained"
+
+        start, end = _as_day(first), _as_day(last)
+        if start == end:
+            day = date_text(start, self.language)
+            return f"todos los registros son del {day}" if self.es else f"all records are from {day}"
+
+        return ("los registros van " if self.es else "the records go ") + self._day_span(start, end)
 
     #
     # Redacta el valor de un cálculo, o que no se pudo obtener.
@@ -1566,6 +1846,20 @@ class _Writer:
         return sentence(
             f"{self.subject(calculation)}{qualifier} {verb} {join_words(items, self.language)}."
         )
+
+    #
+    # Redacta los cálculos de cada grupo cuando son pocos grupos: una oración por grupo con sus valores.
+    #
+    def _grouped_values(self, rows, fields, values, calculations, grouping, qualifier):
+        texts = []
+        for row in rows:
+            scope = " ".join(filter(None, [self.group_scope(grouping, fields, row), qualifier.strip()]))
+            parts = [
+                self._calculated(self.subject(calculations[name]), fields[name], row[name]) for name in values
+            ]
+            texts.append(f"{sentence(scope)}, {join_words(parts, self.language)}.")
+
+        return " ".join(texts)
 
     #
     # Redacta la lista de registros de una medición con su contexto.
@@ -2070,6 +2364,22 @@ def _top_ranked(rows, ranking, fields):
 #
 def _as_day(value):
     return value.date() if isinstance(value, datetime) else value
+
+
+#
+# Empareja el mínimo y el máximo calculados sobre una misma fecha, que juntos dicen el período de los registros.
+#
+def _date_pairs(values, calculations, fields) -> dict[str, str]:
+    extremes = {}
+    for name in values:
+        calculation = calculations.get(name)
+        dated = fields[name].sql_type in _DATE_TYPES
+        if calculation is None or not dated or calculation.function not in {"min", "max"}:
+            continue
+        if len(calculation.inputs) == 1:
+            extremes.setdefault(calculation.inputs[0].field, {})[calculation.function] = name
+
+    return {pair["min"]: pair["max"] for pair in extremes.values() if pair.keys() == {"min", "max"}}
 
 
 #

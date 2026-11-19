@@ -258,13 +258,15 @@ def _scope_key(mention):
 
 
 #
-# Indica si una respuesta es analítica y fue validada.
+# Indica si una respuesta es analítica y fue validada con datos: una consulta mixta cuyo cálculo falló y sólo
+# respondió con documentos no es un análisis que un seguimiento pueda retomar.
 #
 def _is_verified_answer(row):
     return (
         row["schema_version"] == 1
         and row["answer_status"] in {"validated", "partial"}
         and row["response_type"] in {None, "analytical"}
+        and bool(row["sources"])
     )
 
 

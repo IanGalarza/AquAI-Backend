@@ -160,6 +160,8 @@ COMPARISON_CUES = {
         r"superior(?:es)? a",
         r"super[aeoáó]\w*",
         r"sobrepas\w*",
+        r"rebas\w*",
+        r"pas(?:a|an|ó|aron|e|en|ara|aran) (?:de|los|las|el|la)",
         r"exced\w*",
         r"por encima del?",
         r"greater than",
@@ -174,6 +176,7 @@ COMPARISON_CUES = {
         r"menos (?:de|que)",
         r"inferior(?:es)? a",
         r"por debajo del?",
+        r"no (?:lleg|alcanz)\w* (?:a|los|las)",
         r"less than",
         r"lower than",
         r"fewer than",
@@ -182,6 +185,25 @@ COMPARISON_CUES = {
     ),
 }
 COMPARISON_ARTICLES = r"(?:los|las|el|la|un|una|the)"
+# Comparaciones que se escriben después del número: «20.000 cél/mL o más», «25 grados o menos», «100 como mínimo».
+POSTFIX_COMPARISON_CUES = {
+    "ge": (
+        r"o m[aá]s",
+        r"o mayor(?:es)?",
+        r"o superior(?:es)?",
+        r"como m[ií]nimo",
+        r"or more",
+        r"or (?:higher|greater|above)",
+    ),
+    "le": (
+        r"o menos",
+        r"o menor(?:es)?",
+        r"o inferior(?:es)?",
+        r"como m[aá]ximo",
+        r"or less",
+        r"or (?:lower|fewer|below)",
+    ),
+}
 COMPARISON_REFERENCE = (
     r"(?:(?:el|la|los|las|the|a)\s+)?(?:(?:guideline|reference|alert)\s+)?"
     r"(?:nivel(?:es)?|valor(?:es)?|umbral(?:es)?|l[ií]mites?|levels?|values?|"
@@ -304,6 +326,14 @@ REQUESTED_STATISTICS = {
     "stddev": ("desvio estandar", "desviacion estandar", "standard deviation"),
     "count": ("cuantos", "cuantas", "how many"),
 }
+# Un «cuántos» seguido de «por» y una unidad pide una concentración medida, no un conteo de registros
+# («¿cuántas cianobacterias por mililitro?», «how many cells per mL»); «cuántas mediciones por sitio» sí cuenta.
+COUNT_CUE = re.compile(r"\b(?:cu[aá]nt[oa]s|how\s+many)\b", re.IGNORECASE)
+RATE_COUNT = re.compile(
+    r"\b(?:cu[aá]nt[oa]s|how\s+many)\b(?:\s+[^\s,.;:?¿!]+){0,6}?\s+(?:por|per)\s+(?:cada\s+)?(?:mililitros?|"
+    r"microlitros?|litros?|ml|l|m3|metros?\s+c[uú]bicos?|cm2|cm3|gramos?|g|kg|unidad(?:es)?\s+de\s+volumen)\b",
+    re.IGNORECASE,
+)
 
 CHART_WORDS = (
     r"(?:gr[aá]fic\w*|plot\w*|chart\w*|diagrama\w*|histograma\w*|visualiz\w*|dibuj\w*|"
@@ -405,6 +435,12 @@ MONTH_NAMES = {
             1,
         )
     },
+}
+# Abreviaturas de meses; sólo cuentan escritas entre un día y un año («22 sep 2021»), porque «mar» o «may» son
+# también palabras comunes.
+MONTH_ABBREVIATIONS = {
+    "ene": 1, "jan": 1, "feb": 2, "mar": 3, "abr": 4, "apr": 4, "may": 5, "jun": 6, "jul": 7, "ago": 8, "aug": 8,
+    "sep": 9, "sept": 9, "set": 9, "oct": 10, "nov": 11, "dic": 12, "dec": 12,
 }
 REQUESTED_YEAR = re.compile(r"\b(1[89]\d{2}|2\d{3})\b")
 PERIOD_BOUND_CUES = {
@@ -542,4 +578,43 @@ FULL_ORDER_CUES = (*FULL_ORDER_CUES, *DESCENDING_ORDER_CUES, *ASCENDING_ORDER_CU
 ORDER_KEY = r"\b(?:orden\w*|sort\w*)\b[^.?!]*?\b(?:por|by)\s+(?:la\s+|el\s+|the\s+)?(?P<key>[^\W\d_]+)"
 INNER_STATISTIC_WORDS = frozenset(
     {"max", "min", "maximo", "maxima", "minimo", "minima", "promedio", "prom", "media", "mediana"}
+)
+# Pedidos de las fechas que cubren los datos, por familias de expresiones: el período («indicá promedios y
+# períodos»), qué fechas abarcan, entre o desde qué fechas, primera y última fecha, cuándo empiezan o terminan, el
+# rango o el lapso. No cuentan un período dado como filtro («en el período 2020-2021») ni una agrupación («por
+# período»); una mención de fecha sin fecha («qué fechas abarcan») también lo pide (planning.context).
+PERIOD_SPAN_CUES = re.compile(
+    r"(?<!por )\b(?:per[ií]odos?(?!\s+(?:de\s+muestreo\s+)?(?:(?:de|del|entre)\s+)?(?:\d|enero|febrero|marzo|"
+    r"abril|mayo|junio|julio|agosto|septiembre|setiembre|octubre|noviembre|diciembre))|"
+    r"rangos?\s+(?:de\s+fechas|temporal(?:es)?)|lapsos?(?:\s+de\s+tiempo)?|intervalos?\s+de\s+fechas|"
+    r"cobertura\s+temporal|alcance\s+temporal|"
+    r"(?:entre|de|desde|hasta)\s+qu[eé]\s+fechas?|"
+    r"qu[eé]\s+fechas?\s+(?:abarca\w*|cubre\w*|comprende\w*|incluye\w*|tiene\w*|hay|corresponde\w*|son|es)|"
+    r"(?:primeras?|[uú]ltimas?|iniciales?|finales?)\s+(?:y\s+(?:la\s+)?(?:primeras?|[uú]ltimas?|finales?)\s+)?fechas?|"
+    r"fechas?\s+(?:de\s+(?:inicio|comienzo|fin|cierre)|iniciales?|finales?|extremas?)|"
+    r"desde\s+cu[aá]ndo|hasta\s+cu[aá]ndo|"
+    r"cu[aá]ndo\s+(?:\w+\s+){0,3}?(?:empie\w*|empez\w*|comien\w*|comenz\w*|termin\w*|finaliz\w*|arranc\w*)|"
+    r"periods?\s+covered|date\s+ranges?|time\s+spans?|(?:what|which)\s+dates|"
+    r"(?:first|earliest)\s+and\s+(?:last|latest)\s+dates?)\b",
+    re.IGNORECASE,
+)
+# Preguntas por un cambio a lo largo del tiempo, como composición de un verbo de cambio y una referencia
+# temporal en cualquier orden («fue cambiando con los años», «aumentó con el tiempo», «over the years… increased»),
+# además de los nombres del cambio («tendencia», «evolución temporal», «variación interanual»). Los adjetivos
+# («la turbidez más baja en los años 2012») no son cambios.
+_CHANGE_WORDS = (
+    r"(?:cambi(?:a|an|ó|aron|ando|ado|ar|os)|vari(?:a|an|ó|aron|ando|ado|ar|aci[oó]n|aciones)|evolucion\w*|"
+    r"aument(?:a|an|ó|aron|ando|ado|ar|o|os)|disminu(?:ye|yen|yó|yeron|yendo|ido|ir|ci[oó]n)|descend\w*|"
+    r"baj(?:ó|aron|ando|ado)|sub(?:ió|ieron|iendo|ido)|crec(?:e|en|ió|ieron|iendo|ido)|decrec\w*|empeor\w*|"
+    r"mejor(?:ó|aron|ando|ado)|increas\w*|decreas\w*|chang\w*|ris(?:e|es|ing|en)|rose|declin\w*|grow\w*|grew)"
+)
+_TIME_SPAN_WORDS = (
+    r"(?:(?:con|a\s+lo\s+largo\s+de|en|durante|con\s+el\s+paso\s+de|through|over|across)\s+"
+    r"(?:(?:los|las|el|la|del|the)\s+)?(?:(?:[uú]ltim[oa]s|primer[oa]s|recent|past|last)\s+)?"
+    r"(?:a[nñ]os|tiempo|d[eé]cadas?|time|years|decades?|campa[nñ]as))"
+)
+TREND_CUES = re.compile(
+    rf"\b(?:tendencias?|trends?|evoluci[oó]n\s+(?:temporal|en\s+el\s+tiempo)|variaci[oó]n\s+(?:temporal|interanual)|"
+    rf"{_CHANGE_WORDS}(?:\s+\S+){{0,5}}?\s+{_TIME_SPAN_WORDS}|{_TIME_SPAN_WORDS}(?:\s+\S+){{0,4}}?\s+{_CHANGE_WORDS})\b",
+    re.IGNORECASE,
 )

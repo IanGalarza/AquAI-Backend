@@ -7,6 +7,7 @@ from time import perf_counter
 from uuid import UUID
 
 from aquai.application.answering.context import response_language
+from aquai.application.answering.drafting import asks_documents_alone
 from aquai.application.answering.measures import measured_results
 from aquai.application.answering.readings import number_readings
 from aquai.application.contracts.retrieval import DocumentFragment, DocumentRetrievalResult, SearchTerms
@@ -21,6 +22,8 @@ from aquai.application.matching import (
     asked_reference,
     names_subject,
     normalize_text,
+    spelled_as,
+    subject_terms,
     variable_name,
     variable_variants,
 )
@@ -29,11 +32,12 @@ from aquai.application.Rules.documents import normalized_text
 from aquai.application.Rules.evidence import (
     GUIDELINE_CUES,
     INTERPRETATION_CUES,
+    LITERATURE_CLAUSE,
     PRINTED_FIGURE_TEXT,
     REFERENCE_LINE_CUES,
     REFERENCE_REQUEST_CLAUSE,
 )
-from aquai.application.units import counts_organisms
+from aquai.application.units import counts_organisms, unitless_name
 
 _logger = logging.getLogger(__name__)
 _RRF_CONSTANT = 60
@@ -47,6 +51,7 @@ _CANDIDATE_SPREAD = 2
 _MAX_ADDED_GUIDELINES = 2
 _ASK_EDGES = re.compile(r"^[\s,;]*(?:y|e|con|and|with)?\s*")
 _RETRIEVAL_ERRORS = (SemanticIndexError, LLMProviderError, ValueError, OSError)
+_UNANSWERED = {"failed", "insufficient_coverage"}
 
 
 @dataclass
@@ -97,7 +102,10 @@ class RetrieveDocumentsService:
         if state.routing.asks_citations:
             return DocumentRetrievalResult(purpose="question", status="skipped")
 
-        request = _question_request(state) if state.routing.route == "document" else _result_request(state)
+        if state.routing.route == "document":
+            request = _question_request(state)
+        else:
+            request = _result_request(state) or _unanswered_request(state)
         if request is None:
             return DocumentRetrievalResult(purpose="enrichment", status="skipped")
 
@@ -154,11 +162,42 @@ class RetrieveDocumentsService:
         selected = await self._selected(request, candidates, result)
         selected = [*stated, *(item for item in selected if item not in stated)]
         per_document = self._fragments if request.document_ids else self._per_document
-        chosen = _distinct(selected, per_document)[: self._fragments]
+        chosen = await self._bridged(_distinct(selected, per_document)[: self._fragments])
         result.discarded = len(candidates) - len(chosen)
         result.unselected = [_traced(item) for item in candidates if item not in chosen]
         result.fragments = [_fragment(item, index) for index, item in enumerate(chosen, 1)]
         result.status = "found" if chosen else "no_relevant_evidence"
+
+    #
+    # Agrega, hasta el cupo de fragmentos, el que queda entre dos elegidos de una misma sección (posiciones p y p+2):
+    # el texto continuo sigue el mismo argumento («8.7.1» entre la introducción de «8.7» y «8.7.2») aunque la búsqueda
+    # no lo haya traído. Sólo fragmentos sin marcas de duda.
+    #
+    async def _bridged(self, chosen):
+        room = self._fragments - len(chosen)
+        gaps = dict(list(_section_gaps(chosen).items())[:room]) if room > 0 else {}
+        if not gaps:
+            return chosen
+
+        found = {}
+        for document_id in dict.fromkeys(owner for owner, _ in gaps):
+            positions = [position for owner, position in gaps if owner == document_id]
+            found.update(await asyncio.to_thread(self._queries.chunks_at, document_id, positions))
+        bridges = {
+            key: item
+            for item in found.values()
+            if (key := (item["document_id"], item["position"])) in gaps
+            and _usable(item)
+            and not item["doubts"]
+            and (item["section_path"] or [])[: len(gaps[key])] == gaps[key]
+        }
+        bridged = []
+        for item in chosen:
+            bridged.append(item)
+            bridge = bridges.get((item["document_id"], item["position"] + 1))
+            if bridge is not None:
+                bridged.append(bridge)
+        return bridged
 
     #
     # Pide las búsquedas autónomas en español y en inglés de cada pedido.
@@ -256,6 +295,33 @@ def _stated_guidelines(ranked, subject) -> list:
 
 
 #
+# Devuelve, por documento y posición, los fragmentos que faltan entre dos elegidos separados por uno solo, con las
+# secciones que esos dos comparten: el intermedio tiene que estar dentro de ellas.
+#
+def _section_gaps(chosen) -> dict[tuple, list[str]]:
+    placed = {(item["document_id"], item["position"]): item for item in chosen}
+    gaps = {}
+    for (document_id, position), item in placed.items():
+        following = placed.get((document_id, position + 2))
+        shared = _shared_section(item, following) if following is not None else []
+        if shared and (document_id, position + 1) not in placed:
+            gaps[(document_id, position + 1)] = shared
+    return gaps
+
+
+#
+# Devuelve las secciones que dos fragmentos comparten desde el comienzo de su ruta.
+#
+def _shared_section(left, right) -> list[str]:
+    shared = []
+    for first, second in zip(left["section_path"] or [], right["section_path"] or []):
+        if first != second:
+            break
+        shared.append(first)
+    return shared
+
+
+#
 # Indica si un fragmento es una tabla cuya leyenda la presenta como valores guía o límites.
 #
 def _normative_table(chunk) -> bool:
@@ -319,7 +385,9 @@ def _question_request(state) -> _Request:
 def _reference_request(state) -> _Request:
     routing = state.routing
     variables = [
-        item.text for item in routing.data_mentions if not isinstance(item, str) and item.kind == "variable"
+        _spelled(state, item.text)
+        for item in routing.data_mentions
+        if not isinstance(item, str) and item.kind == "variable"
     ]
     request = f"{' y '.join(variables)}: {routing.reference_comparison}" if variables else routing.reference_comparison
 
@@ -329,9 +397,34 @@ def _reference_request(state) -> _Request:
         focus=request[:_MAX_FOCUS_CHARS],
         lexical=[0],
         document_ids=routing.document_ids,
-        subject=[name for mention in variables for name in variable_variants(variable_name(mention))],
+        subject=[name for mention in variables for name in subject_terms(mention)],
         guidelines=True,
     )
+
+
+#
+# Devuelve la variable mencionada escrita como en el encabezado de la columna que el sistema le asoció: una mención
+# abreviada («cianos potencialmente tóxicas») se busca con el nombre completo que usan los documentos.
+#
+def _spelled(state, mention) -> str:
+    retrieval = getattr(state, "retrieval", None)
+    if retrieval is None:
+        return mention
+
+    columns = {
+        (dataset.dataset_id, column.sql_name): column
+        for dataset in retrieval.candidates
+        for column in dataset.columns_metadata
+    }
+    for item in retrieval.evidence:
+        for name in item.variable_matches.get(mention, []):
+            column = columns.get((item.dataset_id, name))
+            if column is not None and column.derived_from:
+                column = columns.get((item.dataset_id, column.derived_from), column)
+            spelled = spelled_as(mention, unitless_name(column.original_name)) if column is not None else None
+            if spelled and spelled != normalize_text(mention):
+                return spelled
+    return mention
 
 
 #
@@ -371,7 +464,7 @@ def _cited_requests(state) -> list[str]:
 def _cited_variables(state) -> list[str]:
     mentions = [item.text for item in _retaken_scope(state) if item.kind == "variable"]
 
-    return [name for mention in mentions for name in variable_variants(variable_name(mention))]
+    return [name for mention in mentions for name in subject_terms(mention)]
 
 
 #
@@ -407,12 +500,30 @@ def _lists_records(results, charted) -> bool:
 
 
 #
-# Indica si la pregunta pide interpretar el resultado, compararlo con valores de referencia o un extremo.
+# Indica si la pregunta pide interpretar el resultado, compararlo con valores de referencia o un extremo, lo que
+# dice la bibliografía o lo que comunica un documento que nombra.
 #
-def _asks_meaning(question) -> bool:
+def _asks_meaning(state) -> bool:
+    question = state.routing.original_question
     asked = INTERPRETATION_CUES.search(question) or REFERENCE_LINE_CUES.search(question)
+    literature = state.routing.document_ids or LITERATURE_CLAUSE.search(question)
 
-    return bool(asked) or extreme_requested(question)
+    return bool(asked or literature) or extreme_requested(question)
+
+
+#
+# Devuelve la búsqueda de la parte documental de una consulta mixta cuyo cálculo no se pudo verificar («¿hubo
+# recuentos altos con menos de 25 °C? Contrastalo con lo que comunica Giannuzzi»): lo que dicen los documentos
+# se puede responder igual, aclarando que falta el cálculo. None si la consulta no pide a los documentos nada que
+# se responda sin el cálculo: interpretar un resultado que no existe no es una parte documental.
+#
+def _unanswered_request(state) -> _Request | None:
+    validation = state.validation
+    unanswered = validation is not None and validation.status in _UNANSWERED and not validation.usable_evidence
+    if not unanswered or not asks_documents_alone(state, state.routing.original_question):
+        return None
+
+    return _question_request(state)
 
 
 #
@@ -434,16 +545,20 @@ def _result_request(state) -> _Request | None:
     charted = state.python_execution is not None and state.python_execution.visualizations
     if not results or not (charted or any(item.values for item in results)):
         return None
-    if _lists_records(results, charted) and not _asks_meaning(state.routing.original_question):
+    if _lists_records(results, charted) and not _asks_meaning(state):
         return None
 
     variables = list(dict.fromkeys(_searched_name(item) for item in results))[:_MAX_VARIABLES]
     places = _places(state)
     requests, lexical = [], []
-    asked = REFERENCE_REQUEST_CLAUSE.search(state.routing.original_question)
-    reference = _ASK_EDGES.sub("", asked.group()) if asked else asked_reference(state.routing.original_question)
-    if reference:
+    question = state.routing.original_question
+    if state.routing.document_ids or LITERATURE_CLAUSE.search(question) or _relates_variables(state):
         lexical.append(0)
+        requests.append(question[:_MAX_FOCUS_CHARS])
+    asked = REFERENCE_REQUEST_CLAUSE.search(question)
+    reference = _ASK_EDGES.sub("", asked.group()) if asked else asked_reference(question)
+    if reference:
+        lexical.append(len(requests))
         requests.append(f"{variables[0]}: {reference}")
     for variable in variables:
         lexical.append(len(requests))
@@ -460,10 +575,21 @@ def _result_request(state) -> _Request | None:
         requests=requests[:6],
         focus=_focus(variables, places, lacks_unit),
         lexical=[item for item in lexical if item < 6],
+        document_ids=state.routing.document_ids,
         subject=list(dict.fromkeys(name for item in results for name in item.names)),
         strict_subject=True,
         guidelines=bool(reference),
     )
+
+
+#
+# Indica si el resultado relaciona dos variables (un gráfico de dispersión): la bibliografía útil es la que trata
+# esa relación, que la propia pregunta describe mejor que el nombre de cada variable.
+#
+def _relates_variables(state) -> bool:
+    execution = state.python_execution
+
+    return execution is not None and any(item.chart_type == "scatter" for item in execution.visualizations)
 
 
 #

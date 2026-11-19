@@ -5,32 +5,29 @@ from aquai.application.answering.wording import dataset_label, file_stem, join_w
 from aquai.application.contracts.planning import MAX_FILTER_VALUES
 from aquai.application.conversations.context import cited_analysis
 from aquai.application.matching import variable_name
-from aquai.application.planning.context import numeric_comparison, period_phrase
+from aquai.application.planning.context import asks_period_span, numeric_comparison, period_phrase
 from aquai.application.planning.temporalText import within_period
 from aquai.application.planning.validation import period_columns
 from aquai.application.units import comparable_unit
 
 _UNPLANNED_STATUSES = {"insufficient_coverage", "failed"}
+_DATE_TYPES = {"DATE", "TIMESTAMP"}
 
 
 #
-# Devuelve el aviso de archivos del resultado citado cuyo período no se pudo leer.
+# Devuelve el aviso de archivos cuyo período no se pudo leer: los del resultado citado cuando se pregunta su
+# período, o los de un cálculo sin fechas cuando la pregunta pide también el período que cubren los datos.
 #
 def period_notes(state, language) -> list[str]:
     routing, plan = state.routing, state.planning
-    if routing is None or plan is None or not routing.requested_period:
+    if routing is None or plan is None:
         return []
-
-    analysis = cited_analysis(state.conversation_history, routing.history_message_ids)
-    if analysis is None:
+    if routing.requested_period:
+        missing = _cited_without_period(state, routing, plan)
+    elif asks_period_span(routing.original_question, routing.data_mentions):
+        missing = _results_without_period(state, plan)
+    else:
         return []
-
-    used = {str(item.dataset_id) for item in plan.selected_datasets}
-    missing = [
-        file_stem(item["provenance"]["source_name"])
-        for item in analysis.sources
-        if str(item["dataset_id"]) not in used
-    ]
     if not missing:
         return []
 
@@ -45,6 +42,45 @@ def period_notes(state, language) -> list[str]:
         f"I could not tell the period of the result from {files}: "
         "its records have no single readable date column."
     ]
+
+
+#
+# Devuelve los archivos del resultado citado que el plan del período no pudo leer.
+#
+def _cited_without_period(state, routing, plan) -> list[str]:
+    analysis = cited_analysis(state.conversation_history, routing.history_message_ids)
+    if analysis is None:
+        return []
+
+    used = {str(item.dataset_id) for item in plan.selected_datasets}
+    return [
+        file_stem(item["provenance"]["source_name"])
+        for item in analysis.sources
+        if str(item["dataset_id"]) not in used
+    ]
+
+
+#
+# Devuelve los archivos de los cálculos publicados sin agrupar que no informan ninguna fecha.
+#
+def _results_without_period(state, plan) -> list[str]:
+    if state.validation is None:
+        return []
+
+    steps = {step.id: step for step in plan.operations}
+    datasets = {item.dataset_id: item for item in plan.selected_datasets}
+    missing = []
+    for evidence in state.validation.usable_evidence:
+        step = steps.get(evidence.operation_id)
+        if evidence.kind != "table" or not evidence.is_requested_output or step is None:
+            continue
+        if step.operation != "aggregate" or step.group_by:
+            continue
+        if any(field.sql_type in _DATE_TYPES for field in step.output_fields):
+            continue
+        owners = {ref.dataset_id for field in step.output_fields for ref in field.sources}
+        missing += [file_stem(datasets[key].provenance.source_name) for key in owners if key in datasets]
+    return missing
 
 
 #

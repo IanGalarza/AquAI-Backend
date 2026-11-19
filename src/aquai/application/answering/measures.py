@@ -5,7 +5,7 @@ from aquai.application.answering.naming import FieldNames
 from aquai.application.answering.presentation import format_number
 from aquai.application.answering.wording import NUMERIC_TYPES, column_label, spoken_label
 from aquai.application.execution import decode_rows, execution_records
-from aquai.application.matching import contains_phrase, variable_name, variable_variants
+from aquai.application.matching import contains_phrase, spelled_as, variable_name, variable_variants
 from aquai.application.units import (
     concentration_basis,
     is_ph_name,
@@ -35,14 +35,16 @@ class MeasuredResult:
     sources: tuple[tuple[str, str], ...]
 
     #
-    # Devuelve los nombres con que los documentos pueden referirse a la variable.
+    # Devuelve los nombres con que los documentos pueden referirse a la variable: la mención, la mención escrita como
+    # en el encabezado de su columna («cianos» es «cianobacterias»), la columna y el nombre con que empieza.
     #
     @property
     def names(self) -> list[str]:
         column = unitless_name(self.column).strip()
-        words = self.variable.split()
+        spelled = spelled_as(self.variable, column) if column else self.variable
+        words = spelled.split()
         head = words[0] if words and len(words[0]) >= _MIN_HEAD_LENGTH else None
-        names = [*variable_variants(self.variable), *variable_variants(column)]
+        names = [*variable_variants(self.variable), *variable_variants(spelled), *variable_variants(column)]
         if head is not None:
             names += variable_variants(head)
 

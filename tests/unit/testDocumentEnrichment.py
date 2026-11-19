@@ -153,7 +153,7 @@ def _request(*results) -> object:
         python_execution=None,
         validation=SimpleNamespace(status="validated", usable_evidence=["e1"]),
         routing=SimpleNamespace(
-            requested_period=None, original_question="¿Cuál es el mayor valor?", data_mentions=[]
+            requested_period=None, original_question="¿Cuál es el mayor valor?", data_mentions=[], document_ids=[]
         ),
     )
     with mock.patch.object(retrieveDocumentsService, "measured_results", return_value=list(results)):
@@ -182,6 +182,15 @@ class AuditedParagraphTests(unittest.TestCase):
 
         self.assertEqual([item.text for item in reviewed.accepted], [f"{_LEAD} {_CLOSING}"])
         self.assertEqual(_codes(reviewed), ["unsupported_claim"])
+
+    def test_the_clause_after_a_removed_one_goes_with_it(self) -> None:
+        removed = "La acción del viento influye en el nivel de la marea;"
+        example = "por ejemplo, los vientos del norte lo bajan."
+        paragraph = _segment("documented", _LEAD, removed, example, _CLOSING)
+
+        reviewed = _audited([paragraph], [(paragraph, removed)])
+
+        self.assertEqual([item.text for item in reviewed.accepted], [f"{_LEAD} {_CLOSING}"])
 
     def test_a_paragraph_without_any_support_is_not_an_orphan(self) -> None:
         paragraph = _segment("documented", _LEAD, _DETAIL)
@@ -240,6 +249,16 @@ class AuditedParagraphTests(unittest.TestCase):
 
         self.assertEqual([item.text for item in reviewed.accepted], [_MEASURE])
         self.assertEqual(_codes(reviewed), ["unsupported_claim", "lost_presentation"])
+
+    def test_a_general_statement_with_its_own_source_stands_without_its_presentation(self) -> None:
+        origin = "Según registros fósiles, son los primeros organismos fotosintéticos aparecidos en el planeta."
+        diversity = "Presentan una gran diversidad de formas, desde microscópicas hasta visibles a simple vista."
+        paragraph = _segment("documented", _LEAD, origin, diversity, _CLOSING)
+
+        reviewed = _audited([paragraph], [(paragraph, _LEAD)])
+
+        self.assertEqual([item.text for item in reviewed.accepted], [f"{origin} {diversity}"])
+        self.assertEqual(reviewed.rejections[-1][1].detail, _CLOSING)
 
     def test_a_count_of_cases_is_not_a_measured_value(self) -> None:
         method = "Se realizó un análisis de redundancia sobre 31 casos con ln(x+1)."
@@ -519,6 +538,46 @@ class EnrichmentSearchTests(unittest.TestCase):
         results = (_result("Abundancia absoluta", "cél/ml"), _result("Abundancia absoluta", "cél/ml"))
 
         self.assertEqual(len(_request(*results).requests), 3)
+
+
+class ContiguousFragmentTests(unittest.TestCase):
+    _SECTION = ["CHAPTER 8 Algae and cyanobacteria", "8.7 Guideline values"]
+
+    @staticmethod
+    def _chunk(position, path, doubts=()):
+        return {
+            "chunk_id": f"c{position}",
+            "document_id": "who",
+            "position": position,
+            "section_path": path,
+            "doubts": list(doubts),
+            "kind": "text",
+            "text": "A guideline level of cyanobacterial cells per millilitre.",
+            "token_count": 300,
+        }
+
+    def _bridged(self, chosen, stored):
+        queries = SimpleNamespace(
+            chunks_at=lambda document_id, positions: {
+                item["chunk_id"]: item for item in stored if item["position"] in positions
+            }
+        )
+        service = retrieveDocumentsService.RetrieveDocumentsService(None, queries, None, fragments=6)
+        return [item["position"] for item in asyncio.run(service._bridged(chosen))]
+
+    def test_the_fragment_between_two_chosen_of_one_section_is_added(self) -> None:
+        chosen = [self._chunk(417, self._SECTION), self._chunk(419, [*self._SECTION, "8.7.2 Moderate"])]
+        stored = [self._chunk(418, [*self._SECTION, "8.7.1 Low"])]
+
+        self.assertEqual(self._bridged(chosen, stored), [417, 418, 419])
+
+    def test_a_doubtful_or_foreign_fragment_is_not_added(self) -> None:
+        chosen = [self._chunk(417, self._SECTION), self._chunk(419, self._SECTION)]
+        doubtful = [self._chunk(418, self._SECTION, doubts=["table_uncertain"])]
+        foreign = [self._chunk(418, ["CHAPTER 9 Other"])]
+
+        self.assertEqual(self._bridged(chosen, doubtful), [417, 419])
+        self.assertEqual(self._bridged(chosen, foreign), [417, 419])
 
 
 if __name__ == "__main__":

@@ -12,7 +12,7 @@ from aquai.application.answering.verification import (
     Rejection,
     RequiredValue,
 )
-from aquai.application.answering.wording import file_stem, sentence
+from aquai.application.answering.wording import dataset_label, file_stem, sentence
 from aquai.application.contracts.answering import (
     AnswerSegment,
     DocumentReference,
@@ -22,6 +22,7 @@ from aquai.application.execution import decode_rows, execution_records
 from aquai.application.matching import variable_name, variable_variants
 from aquai.application.Rules.evidence import (
     ANAPHORIC_START,
+    ATTRIBUTED_SOURCE,
     ATTRIBUTION_LEAD,
     COMPARISON_DIRECTIONS,
     EVIDENCE_GAP,
@@ -29,15 +30,18 @@ from aquai.application.Rules.evidence import (
     GUIDELINE_CUES,
     INTERPRETATION_CUES,
     LEADING_CONNECTOR,
+    LITERATURE_CLAUSE,
     ORGANIZATION_NAMES,
+    PAST_NARRATION,
     PENDING_CONFIRMATION,
     REFERENCE_LINE_CUES,
+    UNNAMED_STUDY_START,
 )
 
 _REQUIRED_KINDS = {"result"}
 _KEPT_KINDS = {"scope", "detail"}
 _INTERPRETING_ROLES = {"documented", "relation"}
-_UNRETRIED_CODES = {"unbacked_citation", "unaudited_claim"}
+_UNRETRIED_CODES = {"unbacked_citation", "unaudited_claim", "scoped_claim"}
 _CITATION_MARGIN = 0.03
 _MAX_EXCERPT = 600
 _MISSING_INTERPRETATION = (
@@ -63,7 +67,12 @@ _VALUE_NOTES = {
 }
 _MIN_SENTENCE_WORDS = 6
 _MIN_PASSAGE_CHARS = 10
+_CONTRAST_SPLIT = re.compile(
+    r";\s+|,\s+(?:while|whereas|but|mientras\s+que|en\s+tanto\s+que|pero|aunque)\s+", re.IGNORECASE
+)
 _LISTING_MARKS = 3
+_PHRASE_BREAK = re.compile(r"\s*(?:[,;:()\[\]|·•]|\s[-–]\s|\band/or\b|\by/o\b)\s*", re.IGNORECASE)
+_MIN_PHRASE_WORDS = 2
 _MAX_RESTORED_COMPARISONS = 2
 _MAX_FACT_VALUES = 400
 _MAX_PREVIOUS_ANSWER = 1500
@@ -71,6 +80,8 @@ _WORD = re.compile(r"[^\W\d_]+")
 _STEM = 5
 _SHORT_WORD = 3
 _REPEATED_SHARE = 0.7
+_REPEATED_SENTENCE = 0.7
+_MIN_REPEATED_WORDS = 4
 _CORRECTIONS = {
     "unsupported_place": "el fragmento no nombra ese lugar: atribuí el dato al estudio o sistema que sí nombra",
     "unsupported_unit": "copiá la unidad tal como figura junto a ese número en la evidencia",
@@ -81,12 +92,22 @@ _CORRECTIONS = {
     "mixed_sources": "no mezcles en una oración cifras de fragmentos distintos: una oración por fuente",
     "lost_qualifier": (
         "agregá esa acotación del fragmento con tus palabras, en esa oración o antes en el mismo párrafo "
-        "(por ejemplo: en agua dulce, en aguas marinas, en ese estudio, en laboratorio, algunas, puede)"
+        "(por ejemplo: en agua dulce, en aguas marinas, en ese estudio, en laboratorio, algunas, puede); si "
+        "viene de otra frase del fragmento (cómo es el sitio de estudio), no la mezcles: decí el hallazgo en "
+        "una oración propia"
     ),
     "unsupported_link": "el fragmento no establece esa relación de causa o influencia: decí sólo lo que afirma",
     "unsupported_statistic": "no agregues conclusiones estadísticas que el fragmento no expresa",
     "hidden_value": "no copies [valor no confirmado]: si un valor no está confirmado, no lo menciones",
-    "unsupported_result_word": "un párrafo result sólo repite su fact; lo demás va en otro párrafo",
+    "unsupported_result_word": (
+        "esa valoración, variable o nombre no figura en los facts que cita el párrafo: decí sólo lo que esos "
+        "facts dicen, con tus palabras"
+    ),
+    "wrong_direction": "esa comparación invierte el orden de los valores: revisá cuál es mayor",
+    "unsupported_absence": (
+        "no afirmes que no hay datos: que el análisis no los haya obtenido no prueba que no existan; las notas ya "
+        "avisan qué parte no se pudo responder"
+    ),
     "observed_in_documented": "un párrafo documented habla de los documentos, no de los datos analizados",
     "unsupported_claim": "reescribí esa oración más cerca del texto del fragmento",
     "unsupported_comparison": "no compares lo observado sin un fact de kind comparison",
@@ -125,6 +146,7 @@ class ReviewedDraft:
     accepted: list
     rejections: list[tuple[str, Rejection]]
     missing_facts: list[str]
+    dropped: int = 0
 
     #
     # Indica si conviene publicar el borrador sin otro intento: resultados completos, los valores de
@@ -281,7 +303,7 @@ def _record(body, budget, omitted) -> ResponseContextRecord:
 def analytical_request(state, context, language, budget, *, notes=(), comparisons=(), ambiguities=()):
     catalog = {item["sentence_id"]: item for item in context.evidence["sentence_catalog"]}
     question = state.routing.original_question if state.routing else state.question
-    requested = asks_interpretation(question)
+    requested = asks_documents(state, question)
     analyzed = requested or _charted(state)
     body = {
         "question": question,
@@ -313,18 +335,37 @@ def analytical_request(state, context, language, budget, *, notes=(), comparison
         doubtful_documents={item.evidence_id for item in kept if item.doubts},
         document_labels={item.evidence_id: fragment_label(item) for item in kept},
         document_sources={item.evidence_id: _fragment_source(item) for item in kept},
+        document_owners={item.evidence_id: str(item.document_id) for item in kept},
         hypothesis_values=_hypothesis_texts(legible),
         question=question,
         result_names=[name for item in measured_results(state, language) for name in item.names],
         allows_hypotheses=bool(legible),
-        documents_required=analyzed and bool(kept),
+        documents_required=requested and bool(kept),
         required_values=required,
         language=language,
         places=_asked_places(state),
         document_contexts={item.evidence_id: _fragment_context(item) for item in kept},
+        variable_names=_asked_variables(state),
+        source_names=_source_names(state),
     )
 
     return WriterRequest(_record(body, budget, context.omitted_rows), evidence, catalog, legible)
+
+
+#
+# Devuelve los nombres de los archivos y hojas del análisis, que un párrafo puede mencionar aunque tengan dígitos
+# («BaseCiano_PARA BELEN_5MAR2024 (2)»), del más largo al más corto.
+#
+def _source_names(state) -> list[str]:
+    plan = state.planning
+    names = {
+        name
+        for item in (plan.selected_datasets if plan else [])
+        for name in (item.provenance.source_name, file_stem(item.provenance.source_name), dataset_label(item.name))
+        if name
+    }
+
+    return sorted(names, key=len, reverse=True)
 
 
 #
@@ -335,8 +376,28 @@ def asks_interpretation(question: str) -> bool:
 
 
 #
-# Indica si la respuesta publica un gráfico: mostrar un patrón pide explicar qué significa, como una
-# interpretación, con los documentos que lo respalden.
+# Indica si la pregunta pide que la respuesta se apoye en los documentos: interpretar o contrastar el resultado,
+# lo que dice la bibliografía o lo que comunica un documento que nombra («lo que comunica Giannuzzi et al.»).
+#
+def asks_documents(state, question: str) -> bool:
+    return asks_interpretation(question) or asks_documents_alone(state, question)
+
+
+#
+# Indica si la pregunta pide a los documentos algo que no depende del resultado calculado: lo que dice la
+# bibliografía, lo que comunica un documento que nombra o un valor de referencia. Pedir que se interprete el
+# resultado no alcanza: si el cálculo falló no hay nada que interpretar («decime si puede interpretarse como
+# una tendencia»).
+#
+def asks_documents_alone(state, question: str) -> bool:
+    named = state.routing is not None and bool(state.routing.document_ids)
+
+    return named or bool(REFERENCE_LINE_CUES.search(question) or LITERATURE_CLAUSE.search(question))
+
+
+#
+# Indica si la respuesta publica un gráfico: mostrar un patrón invita a explicar qué significa, aunque los
+# documentos sólo se exigen si la pregunta los pide.
 #
 def _charted(state) -> bool:
     return any(item.kind == "visualization" for item in state.validation.usable_evidence)
@@ -416,6 +477,7 @@ def documental_request(state, language, budget, previous, analyses=(), notes=())
         doubtful_documents={item.evidence_id for item in kept if item.doubts},
         document_labels={item.evidence_id: fragment_label(item) for item in kept},
         document_sources={item.evidence_id: _fragment_source(item) for item in kept},
+        document_owners={item.evidence_id: str(item.document_id) for item in kept},
         question=state.question,
         previous_answers=body["previous_answers"],
         documents_required=bool(kept),
@@ -423,6 +485,7 @@ def documental_request(state, language, budget, previous, analyses=(), notes=())
         language=language,
         places=list(dict.fromkeys([*named, *retaken])),
         document_contexts={item.evidence_id: _fragment_context(item) for item in kept},
+        variable_names=_asked_variables(state),
     )
 
     return WriterRequest(_record(body, budget, {}), evidence)
@@ -486,6 +549,15 @@ def _asked_subject(state) -> list[str]:
     ]
 
     return named or searched
+
+
+#
+# Devuelve los nombres de las variables que la consulta pide, tal como los escribió.
+#
+def _asked_variables(state) -> list[str]:
+    mentions = state.routing.data_mentions if state.routing else []
+
+    return [item.text for item in mentions if not isinstance(item, str) and item.kind == "variable"]
 
 
 #
@@ -580,12 +652,11 @@ def review_draft(draft, evidence: DraftEvidence) -> ReviewedDraft:
 
 
 #
-# Conserva de un párrafo documental rechazado las oraciones que sí se pueden respaldar.
+# Conserva de un párrafo rechazado las oraciones que sí se pueden respaldar, cada una verificada sola con lo que
+# cita el párrafo: un número mal puesto en una oración no se lleva las demás. Lo que falte de los resultados
+# obligatorios se restituye después.
 #
 def _salvaged(segment, verifier, lost=False):
-    if segment.role == "result":
-        return None
-
     kept, dropped = [], lost
     for item in sentences(segment.text):
         continues = dropped and ANAPHORIC_START.search(item) is not None
@@ -661,9 +732,8 @@ def published_segments(reviewed: ReviewedDraft, request: WriterRequest, language
     kept = [item for item in reviewed.accepted if not _covers_missing(item, reviewed.missing_facts)]
     if request.ambiguities and not reviewed.reads_ambiguity:
         kept = [item for item in kept if item.role != "hypothesis"]
-    segments = [_segment(item, catalog, language) for item in kept]
-    restored = [_restored(catalog[key]) for key in _facts_to_restore(reviewed, kept, catalog)]
-    published = _with_attachments([*restored, *segments], reviewed.accepted, catalog, language)
+    segments = _without_repetitions([_segment(item, catalog, language) for item in kept])
+    published = _with_attachments(_with_restored(segments, reviewed, kept, catalog), reviewed.accepted, catalog, language)
     published.extend(_unused_comparisons(reviewed.accepted, catalog))
     if request.ambiguities and not reviewed.reads_ambiguity:
         published.extend(_written_hypotheses(request.ambiguities, language))
@@ -751,6 +821,22 @@ def _reading(item, language) -> str:
 
 
 #
+# Restituye los hechos obligatorios que el borrador no dijo en el orden del catálogo: los anteriores a lo que dicen
+# los párrafos de resultado van primero y los posteriores (un aviso sobre esos resultados), después de ellos.
+#
+def _with_restored(segments, reviewed, kept, catalog) -> list[AnswerSegment]:
+    order = {key: index for index, key in enumerate(catalog)}
+    cited = [order[key] for item in kept if item.role == "result" for key in item.fact_ids if key in order]
+    last = max(cited, default=-1)
+    keys = _facts_to_restore(reviewed, kept, catalog)
+    published = [*(_restored(catalog[key]) for key in keys if order[key] < last), *segments]
+    index = _after_results(published)
+    published[index:index] = [_restored(catalog[key]) for key in keys if order[key] > last]
+
+    return published
+
+
+#
 # Devuelve los hechos obligatorios que ningún párrafo conservado sigue mostrando.
 #
 def _facts_to_restore(reviewed, kept, catalog) -> list[str]:
@@ -790,6 +876,48 @@ def _segment(item, catalog, language) -> AnswerSegment:
         evidence_ids=list(dict.fromkeys(evidence_ids)),
         document_ids=list(dict.fromkeys(item.document_ids)),
     )
+
+
+#
+# Quita de los párrafos documentales las oraciones que repiten otra ya publicada: casi todas sus palabras dichas y
+# ningún número nuevo. El modelo a veces reformula al final lo que dijo al principio.
+#
+def _without_repetitions(segments) -> list[AnswerSegment]:
+    said, published = [], []
+    for segment in segments:
+        texts = sentences(segment.text)
+        kept = [text for text in texts if segment.role not in _INTERPRETING_ROLES or not _said_before(text, said)]
+        said.extend(_sentence_content(text) for text in kept)
+        if kept == texts:
+            published.append(segment)
+        elif kept:
+            published.append(segment.model_copy(update={"text": _tidied(kept)}))
+
+    return published
+
+
+#
+# Indica si una oración repite alguna de las ya publicadas.
+#
+def _said_before(text, said) -> bool:
+    words, numbers = _sentence_content(text)
+    if len(words) < _MIN_REPEATED_WORDS:
+        return False
+
+    return any(
+        numbers <= earlier_numbers and len(words & earlier_words) >= _REPEATED_SENTENCE * len(words)
+        for earlier_words, earlier_numbers in said
+    )
+
+
+#
+# Devuelve las raíces de las palabras con contenido de una oración y sus números.
+#
+def _sentence_content(text) -> tuple[set, frozenset]:
+    words = {word[:_STEM] for word in _WORD.findall(folded(text)) if len(word) > _SHORT_WORD}
+    numbers = frozenset(value for reading in number_readings(text) for value in reading.values)
+
+    return words, numbers
 
 
 #
@@ -961,13 +1089,36 @@ def support_passages(segment, request: WriterRequest) -> list[str]:
 
 
 #
+# Devuelve las frases de las oraciones de evidencia, separadas por comas, paréntesis, punto y coma o «y/o»: el ítem
+# de una lista traduce una de esas frases («contacto total del cuerpo» es «whole-body contact») y comparado con la
+# oración entera, más larga y en otro idioma, parecería no tener respaldo aunque lo tenga.
+#
+def support_phrases(lines) -> list[str]:
+    parts = (part.strip() for line in lines for part in _PHRASE_BREAK.split(line))
+    known = set(lines)
+
+    return list(dict.fromkeys(part for part in parts if len(part.split()) >= _MIN_PHRASE_WORDS and part not in known))
+
+
+#
 # Devuelve las oraciones de un fragmento y cada par de oraciones seguidas: una oración puede resumir dos
 # consecutivas del mismo fragmento, nunca de fragmentos distintos.
 #
 def _lines_and_pairs(text) -> list[str]:
     lines = _lines(text)
+    clauses = [clause for line in lines for clause in _contrasted(line)]
 
-    return [*lines, *(f"{first} {second}" for first, second in zip(lines, lines[1:]))]
+    return [*lines, *clauses, *(f"{first} {second}" for first, second in zip(lines, lines[1:]))]
+
+
+#
+# Separa una oración que une dos hallazgos con un contraste («…, while the winds and tide had a secondary effect»):
+# la paráfrasis de uno solo se compara con ese hallazgo y no con la oración entera, que la diluye.
+#
+def _contrasted(line) -> list[str]:
+    parts = [part.strip() for part in _CONTRAST_SPLIT.split(line)]
+
+    return [part for part in parts if len(part) >= _MIN_PASSAGE_CHARS] if len(parts) > 1 else []
 
 
 #
@@ -1034,9 +1185,11 @@ def _is_listing(text) -> bool:
 
 
 #
-# Quita del borrador las oraciones sin respaldo y registra cuáles fueron.
+# Quita del borrador las oraciones sin respaldo, aplica las reescrituras que las acotan (como «según el estudio
+# citado») y registra ambas cosas.
 #
-def apply_support(reviewed: ReviewedDraft, unsupported: list, required=()) -> ReviewedDraft:
+def apply_support(reviewed: ReviewedDraft, unsupported: list, required=(), rewritten=None) -> ReviewedDraft:
+    rewritten = rewritten or {}
     rejected = {id(segment): set() for segment in reviewed.accepted}
     rejections = list(reviewed.rejections)
     for segment, text, *problem in unsupported:
@@ -1044,32 +1197,69 @@ def apply_support(reviewed: ReviewedDraft, unsupported: list, required=()) -> Re
         rejections.append((segment.role, problem[0] if problem else Rejection("unsupported_claim", text[:120])))
 
     values = frozenset(value for item in required for value in item.values)
-    kept = [_without_claims(item, rejected[id(item)], values) for item in reviewed.accepted]
+    kept = [
+        _without_claims(item, rejected[id(item)], values, _replacements(item, rewritten))
+        for item in reviewed.accepted
+    ]
     rejections += [
         (item.role, Rejection("lost_presentation", text[:120]))
         for item in reviewed.accepted
         for text in _orphans(item, rejected[id(item)], values)
     ]
+    rejections += [
+        (item.role, Rejection("scoped_claim", text[:120]))
+        for item in reviewed.accepted
+        for text in _replacements(item, rewritten)
+    ]
+
+    dropped = sum(
+        1
+        for item, result in zip(reviewed.accepted, kept, strict=True)
+        if item.document_ids and item.role != "result" and (result is None or len(result.items) < len(item.items))
+    )
 
     return ReviewedDraft(
-        [item for item in kept if item is not None], rejections, reviewed.missing_facts
+        [item for item in kept if item is not None], rejections, reviewed.missing_facts, reviewed.dropped + dropped
     )
 
 
 #
-# Devuelve un párrafo sin las oraciones rechazadas ni las que quedan sueltas, o None si no queda nada.
+# Devuelve las reescrituras de las oraciones de un párrafo.
 #
-def _without_claims(segment, rejected, values=frozenset()):
-    if not rejected:
+def _replacements(segment, rewritten) -> dict:
+    return {text: new for (key, text), new in rewritten.items() if key == id(segment)}
+
+
+#
+# Devuelve un párrafo sin las oraciones rechazadas ni las que quedan sueltas, con sus reescrituras, o None si no
+# queda nada.
+#
+def _without_claims(segment, rejected, values=frozenset(), replacements=None):
+    replacements = replacements or {}
+    if not rejected and not replacements:
         return segment
 
     dropped = {*rejected, *_orphans(segment, rejected, values)}
-    kept = [item for item in sentences(segment.text) if item not in dropped]
+    kept, previous = [], None
+    for item in sentences(segment.text):
+        if item in dropped or (previous in dropped and _continues_clause(item, values)):
+            dropped.add(item)
+        else:
+            kept.append(replacements.get(item, item))
+        previous = item
     items = [item for item in segment.items if item not in rejected]
     if not kept:
         return None
 
     return segment.model_copy(update={"text": _tidied(kept), "items": items})
+
+
+#
+# Indica si un trozo sigue la cláusula anterior, separado sólo por «;» («…; por ejemplo, los vientos del norte…»):
+# empieza en minúscula y no trae un valor pedido, así que cae con ella.
+#
+def _continues_clause(text, values) -> bool:
+    return text[:1].islower() and not any(reading.values & values for reading in number_readings(text))
 
 
 #
@@ -1086,15 +1276,24 @@ def _orphans(segment, rejected, values=frozenset()) -> list[str]:
 
 
 #
-# Indica si una oración se sostiene sin la que la presentaba.
+# Indica si una oración se sostiene sin la que la presentaba: informa un valor con su unidad, nombra su propia
+# fuente («Según registros fósiles, …») o enuncia algo general en presente («presentan una gran diversidad de
+# formas»). No se sostiene si remite a lo quitado («Estos organismos…»), habla de un estudio sin nombrarlo («El
+# análisis incluyó…», «Se observó…») o narra en pasado lo que hizo un estudio («Las abundancias se
+# transformaron…»): leída sola parecería un análisis propio. Una que remite a lo quitado sólo queda si presenta un
+# valor de referencia pedido.
 #
 def _stands_alone(text, values) -> bool:
-    if not _reports_a_measure(text):
+    if ANAPHORIC_START.search(text) is not None:
+        return _reports_a_measure(text) and any(reading.values & values for reading in number_readings(text))
+    if _reports_a_measure(text):
+        return True
+    if UNNAMED_STUDY_START.search(text) is not None:
         return False
-    if ANAPHORIC_START.search(text) is None:
+    if ATTRIBUTION_LEAD.match(text) or ATTRIBUTED_SOURCE.search(text):
         return True
 
-    return any(reading.values & values for reading in number_readings(text))
+    return PAST_NARRATION.search(text) is None
 
 
 #
@@ -1119,7 +1318,7 @@ def backed_citations(reviewed: ReviewedDraft, request: WriterRequest, support, t
         ]
         accepted.append(segment.model_copy(update={"document_ids": kept}))
 
-    return ReviewedDraft(accepted, rejections, reviewed.missing_facts)
+    return ReviewedDraft(accepted, rejections, reviewed.missing_facts, reviewed.dropped)
 
 
 #

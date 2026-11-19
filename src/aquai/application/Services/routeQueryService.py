@@ -1,10 +1,12 @@
 import asyncio
 import logging
 import re
+from collections import Counter
 from time import perf_counter
 from uuid import UUID
 
 from aquai.application.answering.context import response_language
+from aquai.application.answering.wording import join_words
 from aquai.application.contracts.routing import (
     DataMention,
     DatasetBinding,
@@ -21,14 +23,20 @@ from aquai.application.matching import (
     documented_reference,
     mentioned_count,
     named_documents,
+    named_variable_groups,
     names_known_variable,
+    names_subject,
     normalize_name,
     normalize_text,
     numeric_comparisons,
+    period_ranges,
     qualified_period,
     qualified_variable,
     qualifies_variable,
+    searchable_value,
     starts_with_phrase,
+    stored_parts,
+    value_parts,
     variable_core,
     without_reference_request,
 )
@@ -45,8 +53,11 @@ from aquai.application.Rules.evidence import (
     ORGANIZATION_NAMES,
     REFERENTIAL_QUESTION,
     REPEAT_REQUEST,
+    SEARCH_STOPWORDS,
 )
+from aquai.application.Rules.language import INTERROGATIVE_WORDS
 from aquai.application.Rules.units import SIMPLE_UNIT
+from aquai.application.Rules.variables import PH_ALIASES
 from aquai.application.units import spelled_symbol
 from aquai.application.Rules.vocabulary import (
     ADDITIVE_CUES,
@@ -62,12 +73,22 @@ from aquai.application.Rules.vocabulary import (
     SOURCE_CUE_WINDOW,
     SOURCE_CUE_WORDS,
     SOURCE_NAME_CONNECTORS,
+    SPREADSHEET_EXTENSION,
     TIME_GRAIN_CUES,
     UPLOADED_FILE_EXTENSION,
 )
 
 _logger = logging.getLogger(__name__)
 _MAX_REFERENTIAL_WORDS = 10
+_MIN_TOPIC_WORD = 5
+_LEADING_WORDS = 3
+_ACRONYM = re.compile(r"(?<![\w])(?=[A-Za-z]*[A-Z][A-Za-z]*[A-Z])[A-Za-z]{3,}(?![\w])")
+_SENTENCE_END = re.compile(r"[?!;]|\.\s")
+_TRAILING_CONNECTORS = re.compile(r"(?:\s+(?:y|e|o|u|en|de|del|durante|entre|para)\b|\s*,)+\s*$", re.IGNORECASE)
+_TOPICAL_FOLLOW_UP = "La consulta retoma el tema de la última respuesta: se respondió como seguimiento con sus documentos."
+_NAMED_DATA_REQUEST = (
+    "La pregunta acota registros de una fuente de datos que nombra: se consultaron los datos y los documentos."
+)
 _NUMERIC_KINDS = {"value", "limit", "threshold"}
 _SCOPE_KINDS = {"value", "dimension", "threshold", "date"}
 _CONSERVED_KINDS = {"variable", "value", "dimension", "date"}
@@ -98,6 +119,14 @@ SOURCE_ALIAS = re.compile(
     r"(?P<name>[^\W_][\w-]*)",
     re.IGNORECASE,
 )
+_FILE_CUES = {"base", "archivo", "planilla", "fuente", "file"}
+_NAME_BREAK = re.compile(
+    r"[,;:?¿!()\[\]]|\s(?:y|e|o|u|de|del|en|para|con|entre|sobre|seg[uú]n|durante|desde|hasta|por|que|"
+    r"qu[eé]|cu[aá]l(?:es)?|c[oó]mo|a|al|la|el|los|las|lo|un|una|and|or|of|in|for|with|from|to|the|between|"
+    r"during)\b",
+    re.IGNORECASE,
+)
+_MAX_NAME_WORDS = 6
 SOURCE_CUE = re.compile(
     rf"\b(?:{'|'.join(SOURCE_CUE_WORDS)})\s+"
     rf"(?:(?:{'|'.join(SOURCE_NAME_CONNECTORS)})\s+)*[«\"“']?\s*$",
@@ -112,6 +141,51 @@ _SOURCE_WORD = re.compile(rf"\b(?:{'|'.join(SOURCE_CUE_WORDS)})s?\b", re.IGNOREC
 def _sheet(dataset_name: str) -> str:
     parts = [part.strip() for part in dataset_name.split(" / ")]
     return parts[1] if len(parts) >= 3 else dataset_name
+
+
+#
+# Devuelve las menciones con las reemplazadas por sus partes, en el mismo orden.
+#
+def _replaced(mentions, replaced) -> list:
+    return [part for item in mentions for part in replaced.get(id(item), [item])]
+
+
+#
+# Une los vínculos de cada mención de fuente sin repetir datasets. Si la pregunta nombra un archivo y una de sus
+# hojas («la hoja BASE FQ de BaseCiano.xlsx»), el archivo queda acotado a esa hoja: no suma las demás.
+#
+#
+# Devuelve la referencia documental que se busca, sin lo que la pregunta agrega después («…de la OMS en 2005 y en
+# 2021? decime sobre cuántos datos» busca «niveles guía de la OMS»): termina donde termina su oración y sin las
+# fechas, que acotan los datos y no el valor de referencia.
+#
+def _reference_phrase(reference, mentions):
+    phrase = _SENTENCE_END.split(reference, maxsplit=1)[0]
+    for item in mentions:
+        if not isinstance(item, str) and item.kind == "date":
+            phrase = re.sub(rf"(?:\s+(?:en|de|del|durante|entre|para))?\s+{re.escape(item.text)}", "", phrase, flags=re.IGNORECASE)
+    phrase = _TRAILING_CONNECTORS.sub("", phrase).strip(" ,")
+
+    return phrase or reference
+
+
+def _narrowed_to_sheets(bindings, catalog) -> list:
+    sizes = {
+        source["source_id"]: sum(1 for dataset in source["datasets"] if dataset["available"]) for source in catalog
+    }
+    sheets = {}
+    for items in bindings.values():
+        owners = {item.source_id for item in items}
+        owner = next(iter(owners), None)
+        if len(owners) == 1 and len(items) < sizes.get(owner, 0):
+            sheets.setdefault(owner, set()).update(item.dataset_id for item in items)
+
+    kept = {}
+    for items in bindings.values():
+        for item in items:
+            if item.source_id not in sheets or item.dataset_id in sheets[item.source_id]:
+                kept.setdefault(item.dataset_id, item)
+    return list(kept.values())
 
 
 #
@@ -219,13 +293,14 @@ class RouteQueryService:
         cited = [provided[key] for key in decision.history_message_ids]
         messages = self._with_context(cited, provided)
         last = self._last_assistant_message(state.conversation_history, allowed)
-        route, messages = self._clarification_route(
-            decision, last, messages, provided, result, state.question
-        )
-
         asked = [
             item for item in decision.data_mentions if self._literal(item.text, state.question)
         ]
+        topical = self._continues_topic(state.question, last, state.conversation_history, asked)
+        route, messages = self._clarification_route(
+            decision, last, messages, provided, result, state.question, topical
+        )
+
         if route == "historical" and (
             self._changes(asked, decision.source_mentions, state.question, messages)
             or chart_requested(state.question)
@@ -233,6 +308,15 @@ class RouteQueryService:
             route = "data"
 
         route = self._documentary_route(route, asked, state.question, documents)
+        if route == "general" and topical:
+            route = "document"
+            messages = self._with_context([last], provided)
+            result.warnings.append(_TOPICAL_FOLLOW_UP)
+        elif route == "document" and not messages and self._continues_statement(
+            state.question, last, state.conversation_history, asked
+        ):
+            messages = self._with_context([last], provided)
+            result.warnings.append(_TOPICAL_FOLLOW_UP)
         if route == "catalog" and self._counts_observations(state.question):
             route = "data"
             result.warnings.append(
@@ -273,6 +357,9 @@ class RouteQueryService:
         if route == "needs_clarification":
             return self._model_clarification(result, decision, route, messages, state.question)
 
+        if route == "document" and await self._asks_named_data(state.question, result.data_mentions, catalog, decision):
+            route = "data"
+            result.warnings.append(_NAMED_DATA_REQUEST)
         if route == "document":
             return self._document_result(state, result, messages, documents)
 
@@ -283,17 +370,47 @@ class RouteQueryService:
         return result
 
     #
-    # Registra la referencia documental con que se pide comparar los datos y los documentos que la pregunta
-    # nombra, para buscar ese valor antes de planificar.
+    # Indica si una pregunta que el modelo envió a los documentos también acota registros de una fuente de datos que
+    # nombra («en 2005, en la base fq, ¿hubo recuentos de 20.000 cél/mL o más…? y qué dice Giannuzzi»): una variable
+    # con un umbral o un período sobre una fuente del catálogo es una consulta de datos, que además busca los
+    # documentos que nombra.
+    #
+    async def _asks_named_data(self, question, mentions, catalog, decision):
+        mentions = [item for item in mentions if not isinstance(item, str)]
+        restricted = any(
+            (item.kind == "threshold" and numeric_comparisons(item.text))
+            or (item.kind == "date" and period_ranges(item.text))
+            for item in mentions
+        )
+        if not restricted or not any(item.kind == "variable" for item in mentions):
+            return False
+
+        explicit = [item for item in decision.source_mentions if self._literal(item, question)]
+        if any(self._names_catalog_source(item, catalog) for item in explicit):
+            return True
+        found, _aliases = await self._catalog_references(question, mentions, catalog, explicit)
+        return bool(found)
+
+    #
+    # Registra los documentos que la pregunta nombra («contrastá con lo que comunica Giannuzzi et al.») y la
+    # referencia documental con que pide comparar los datos, para buscar ese valor antes de planificar. Un valor
+    # que sólo nombra un documento no acota registros.
     #
     @staticmethod
     def _record_reference_comparison(result, question, documents):
+        named = named_documents(question, documents)
+        result.document_ids = [item["document_id"] for item in named]
+        result.data_mentions = [
+            item
+            for item in result.data_mentions
+            if isinstance(item, str) or item.kind != "value" or not named_documents(item.text, named)
+        ]
         reference = documented_reference(question)
         if reference is None:
             return
 
+        reference = _reference_phrase(reference, result.data_mentions)
         result.reference_comparison = reference
-        result.document_ids = [item["document_id"] for item in named_documents(question, documents)]
         result.data_mentions = [
             item
             for item in result.data_mentions
@@ -366,6 +483,68 @@ class RouteQueryService:
         return repeats and unnamed and latest and (names_last or not cited)
 
     #
+    # Indica si la consulta retoma el tema de la última respuesta con evidencia, aunque esté escrita como afirmación
+    # o sin signos («Entonces la temperatura es un principal factor»): nombra una variable conocida o una palabra
+    # que esa pregunta y su respuesta comparten, y no acota registros con valores, fechas ni umbrales propios. Un
+    # saludo, un agradecimiento o un pedido sobre las capacidades no comparten ese tema.
+    #
+    @staticmethod
+    def _continues_topic(question, last, history, asked) -> bool:
+        if not RouteQueryService._cites_evidence(last) or any(item.kind in _RECORD_SCOPE_KINDS for item in asked):
+            return False
+
+        words = normalize_text(question).split()
+        if named_variable_groups(question) or any(word in PH_ALIASES for word in words):
+            return True
+
+        return RouteQueryService._shares_topic(words, last, history)
+
+    #
+    # Indica si una afirmación sin pregunta propia retoma la última respuesta con evidencia: no empieza con una
+    # palabra interrogativa y comparte con ese intercambio una palabra del tema o una variable que la respuesta
+    # trató. Con o sin signo de pregunta se resuelve igual; una pregunta autocontenida («¿Y qué es una
+    # cianobacteria?») conserva la decisión del modelo.
+    #
+    @staticmethod
+    def _continues_statement(question, last, history, asked) -> bool:
+        if not RouteQueryService._cites_evidence(last) or any(item.kind in _RECORD_SCOPE_KINDS for item in asked):
+            return False
+
+        words = normalize_text(question).split()
+        if any(word in INTERROGATIVE_WORDS for word in words[:_LEADING_WORDS]):
+            return False
+
+        treated = named_variable_groups(question) & named_variable_groups(last.text)
+
+        return bool(treated) or RouteQueryService._shares_topic(words, last, history)
+
+    #
+    # Indica si alguna palabra de la consulta (no vacía de contenido) figura en la pregunta que originó la
+    # última respuesta y en esa respuesta: es el tema de ese intercambio.
+    #
+    @staticmethod
+    def _shares_topic(words, last, history) -> bool:
+        before = RouteQueryService._asked_before(last, history)
+
+        return any(
+            len(word) >= _MIN_TOPIC_WORD
+            and word not in SEARCH_STOPWORDS
+            and names_subject(before, [word])
+            and names_subject(last.text, [word])
+            for word in words
+        )
+
+    #
+    # Devuelve la pregunta del usuario que originó un mensaje del asistente.
+    #
+    @staticmethod
+    def _asked_before(message, history) -> str:
+        position = next((index for index, item in enumerate(history) if item.message_id == message.message_id), 0)
+        asked = [item.text for item in history[:position] if item.role == "user"]
+
+        return asked[-1] if asked else ""
+
+    #
     # Indica si una pregunta documental breve remite a la última respuesta («¿Eso es normal?»).
     #
     @staticmethod
@@ -414,6 +593,7 @@ class RouteQueryService:
     # Resuelve la ruta decidida: fuentes nombradas, valores guardados y resultado de cada ruta.
     #
     async def _resolve_route(self, state, catalog, result, decision, route, messages):
+        await self._without_composite_values(result, catalog)
         explicit, aliases = await self._named_sources(decision, state.question, catalog, result)
         explicit = await self._stored_values(explicit, state.question, catalog, result)
         if route == "general" and explicit:
@@ -425,8 +605,11 @@ class RouteQueryService:
         if route == "general":
             return self._general_result(result, messages)
 
+        unknown = await self._unknown_cued_sources(
+            state.question, result.data_mentions, catalog, [*explicit, *aliases]
+        )
         bindings, resolved = self._resolve_sources(
-            explicit, state.question, catalog, partial=route == "catalog"
+            explicit, state.question, catalog, partial=route == "catalog", unknown=unknown
         )
         self._record_sources(result, resolved, aliases)
         if route == "catalog" and self._restricts_records(result):
@@ -440,6 +623,92 @@ class RouteQueryService:
             return self._catalog_result(result, bindings)
 
         return self._data_result(state, result, messages, bindings, resolved)
+
+    #
+    # Quita los valores que repiten otro valor de la pregunta con un agregado que ningún registro guarda («Club de
+    # Pesca de Punta Lara» junto a «Club de Pesca»): el compuesto no se puede filtrar y haría declarar cobertura
+    # insuficiente; el valor contenido conserva lo que acota.
+    #
+    async def _without_composite_values(self, result, catalog):
+        values = [item for item in result.data_mentions if not isinstance(item, str) and item.kind == "value"]
+        composite = [
+            (item, other)
+            for item in values
+            for other in values
+            if normalize_text(other.text) != normalize_text(item.text) and contains_phrase(item.text, other.text)
+        ]
+        dropped = {}
+        for item, other in composite:
+            if id(item) not in dropped and not await self._stored_anywhere(item.text, catalog):
+                dropped[id(item)] = (item, other)
+        if dropped:
+            result.data_mentions = [item for item in result.data_mentions if id(item) not in dropped]
+            result.conserved_mentions = [item for item in result.conserved_mentions if id(item) not in dropped]
+            result.warnings.extend(
+                f"Se acotó por «{other.text}»: «{item.text}» no figura en los registros."
+                for item, other in dropped.values()
+            )
+        await self._narrowed_values(result, catalog)
+
+    #
+    # Reemplaza la mención de un valor que ningún registro guarda por las partes que sí figuran: una enumeración
+    # («Pta Lara y Balandra» son dos sitios) o las frases guardadas que contiene («agua cruda superficial de Punta
+    # Lara» es el lugar «Cruda Superficial» y la localidad «Punta Lara»). Lo que queda afuera no puede ser un nombre
+    # propio, para no cambiar de sitio. Una fecha que no nombra un período pero figura en los registros
+    # («03122004», un código) es un valor.
+    #
+    async def _narrowed_values(self, result, catalog):
+        mentions = [item for item in result.data_mentions if not isinstance(item, str)]
+        values = [item for item in mentions if item.kind == "value"]
+        codes = [item for item in mentions if item.kind == "date" and not period_ranges(item.text)]
+        parts = {item.text: value_parts(item.text) for item in values}
+        terms = [*(item.text for item in [*values, *codes]), *(part for found in parts.values() for part in found)]
+        stored = await self._stored_terms(terms, catalog)
+
+        replaced = {}
+        for item in values:
+            found = None if item.text in stored else stored_parts(item.text, parts[item.text], stored)
+            if found:
+                replaced[id(item)] = [item.model_copy(update={"text": part}) for part in found]
+                result.warnings.append(
+                    f"Se interpretó «{item.text}» como {join_words([f'«{part}»' for part in found], 'es')}: "
+                    "así figura en los registros."
+                )
+        for item in codes:
+            if item.text in stored:
+                replaced[id(item)] = [item.model_copy(update={"kind": "value"})]
+        if replaced:
+            result.data_mentions = _replaced(result.data_mentions, replaced)
+            result.conserved_mentions = _replaced(result.conserved_mentions, replaced)
+
+    #
+    # Devuelve, de cada texto que figura en los registros de algún dataset disponible, las columnas donde figura, con
+    # una sola consulta. Si la consulta falla, ninguno: la mención queda como la dio el intérprete.
+    #
+    async def _stored_terms(self, terms, catalog) -> dict[str, set]:
+        searched = [term for term in dict.fromkeys(terms) if searchable_value(term)]
+        dataset_ids = [
+            dataset["dataset_id"] for source in catalog for dataset in source["datasets"] if dataset["available"]
+        ]
+        if not searched or not dataset_ids:
+            return {}
+        try:
+            datasets = await asyncio.to_thread(self._sources.verified_datasets, dataset_ids)
+            found = await asyncio.to_thread(self._sources.find_text_values, datasets, searched)
+        except Exception:
+            return {}
+
+        stored = {}
+        for dataset_id, matches in found.items():
+            for term, rows in matches.items():
+                columns = {
+                    (dataset_id, row["column"])
+                    for row in rows
+                    if isinstance(row["value"], str) and contains_phrase(row["value"], term)
+                }
+                if columns:
+                    stored.setdefault(term, set()).update(columns)
+        return stored
 
     #
     # Reinterpreta como valores de los registros los nombres que no son fuentes del catálogo.
@@ -527,7 +796,7 @@ class RouteQueryService:
     # Decide la ruta cuando el modelo pidió aclaración, continuando una aclaración ya respondida.
     #
     @staticmethod
-    def _clarification_route(decision, last, messages, provided, result, question):
+    def _clarification_route(decision, last, messages, provided, result, question, topical=False):
         if decision.route != "needs_clarification":
             return decision.route, messages
 
@@ -538,6 +807,10 @@ class RouteQueryService:
 
         if RouteQueryService._refers_to_last("document", [], question, last):
             result.warnings.append("La pregunta breve remite a la última respuesta, que tiene evidencia citable.")
+            return "document", RouteQueryService._with_context([last], provided)
+
+        if topical and decision.context_required:
+            result.warnings.append(_TOPICAL_FOLLOW_UP)
             return "document", RouteQueryService._with_context([last], provided)
 
         mentions_variable = any(item.kind == "variable" for item in decision.data_mentions)
@@ -1227,7 +1500,8 @@ class RouteQueryService:
                 if RouteQueryService._overlaps(item.text, comparison, text)
             ]
             copied = item.kind == "threshold" or any(char.isdigit() for char in item.text)
-            if item.kind not in _NUMERIC_KINDS or not compared or not copied:
+            numeric = item.kind in _NUMERIC_KINDS or (item.kind == "date" and not period_ranges(item.text))
+            if not numeric or not compared or not copied:
                 kept.append(item)
             elif item.kind == "threshold":
                 variables.extend(RouteQueryService._compared_variable(item.text, compared[0]))
@@ -1445,14 +1719,16 @@ class RouteQueryService:
         return bool(target) and (target in normalize_text(text) or aligned_span(mention, text) is not None)
 
     #
-    # Filtra las menciones de fuente que aparecen en la pregunta, descartando valores sin señal de fuente.
+    # Filtra las menciones de fuente que aparecen en la pregunta, descartando valores sin señal de fuente. Un nombre
+    # al que el modelo le agregó la extensión («base completa fq» → «base completa fq.xlsx») figura en la pregunta y
+    # se conserva con ella: es el modelo quien lo leyó como un archivo, y si no existe se avisa que falta.
     #
     @staticmethod
     def _explicit_mentions(mentions, question, data_mentions, result):
         values = {value.text.strip().casefold() for value in data_mentions if value.kind == "value"}
         explicit = []
         for mention in dict.fromkeys(item.strip() for item in mentions):
-            if not mention or mention.casefold() not in question.casefold():
+            if not mention or not RouteQueryService._written_in(mention, question):
                 result.warnings.append(
                     "Se descartó una mención de fuente que no aparece en la pregunta."
                 )
@@ -1464,22 +1740,36 @@ class RouteQueryService:
         return explicit
 
     #
+    # Indica si el nombre de fuente figura en la pregunta, con la extensión o sin ella.
+    #
+    @staticmethod
+    def _written_in(mention, question):
+        bare = SPREADSHEET_EXTENSION.sub("", mention).strip()
+        return any(name and name.casefold() in question.casefold() for name in (mention, bare))
+
+    #
     # Detecta fuentes nombradas en la pregunta que el modelo no marcó como tales.
     #
     async def _catalog_references(self, question, mentions, catalog, explicit):
         known = {normalize_name(item) for item in explicit}
         found = self._multiword_sources_in(question, catalog, known)
+        found += [name for name in self._acronym_sources(question, catalog, known) if name not in found]
         aliases = []
-        sources = [item for item in explicit if self._names_catalog_source(item, catalog)]
+        sources = [
+            item
+            for item in explicit
+            if self._names_catalog_source(item, catalog) or self._has_source_cue(item, question)
+        ]
 
         values = [item.text for item in mentions if item.kind == "value"]
-        for text in dict.fromkeys([*values, *self._cued_names(question)]):
+        for text in dict.fromkeys([*values, *self._cued_names(question, catalog)]):
             if any(contains_phrase(name, text) for name in [*sources, *found]):
                 continue
 
-            owners = self._value_owners(text, catalog)
+            owners = self._value_owners(text, catalog) or self._acronym_owners(text, catalog)
             if len(owners) == 1 and not await self._stored_anywhere(text, catalog):
-                found.append(next(iter(owners.values()))["name"])
+                name = next(iter(owners.values()))["name"]
+                found += [] if name in found else [name]
                 aliases.append(text)
         return found, aliases
 
@@ -1498,22 +1788,129 @@ class RouteQueryService:
     # Devuelve los nombres que siguen a expresiones como «los datos de» o «la base».
     #
     @staticmethod
-    def _cued_names(question):
-        return [match.group("name") for match in SOURCE_ALIAS.finditer(question)]
+    def _cued_names(question, catalog=()):
+        return [name for _cue, name in RouteQueryService._cued_sources(question, catalog)]
 
     #
-    # Devuelve las fuentes y hojas de nombre compuesto que la pregunta menciona («la hoja BASE CIANO»).
+    # Devuelve cada señal de fuente («la base», «la planilla») con el nombre completo que la sigue: después de la
+    # primera palabra siguen las que tienen forma de nombre (mayúscula, dígitos) o figuran en los nombres del
+    # catálogo, hasta la puntuación o una palabra de enlace. «la base completa fq, y…» nombra «completa fq»; «los
+    # datos de RdlP pasaron…», «RdlP».
+    #
+    @staticmethod
+    def _cued_sources(question, catalog=()):
+        known = {
+            word
+            for source in catalog
+            for name in [source["name"], *(_sheet(dataset["name"]) for dataset in source["datasets"])]
+            for word in normalize_name(name).split()
+        }
+        found = []
+        for match in SOURCE_ALIAS.finditer(question):
+            rest = question[match.start("name") :]
+            first, *others = _NAME_BREAK.split(f" {rest}", maxsplit=1)[0].split()[:_MAX_NAME_WORDS] or [""]
+            words = [first]
+            for word in others:
+                if not (word[:1].isupper() or any(char.isdigit() for char in word) or normalize_text(word) in known):
+                    break
+                words.append(word)
+            if first:
+                found.append((match.group().split()[0].casefold(), " ".join(words)))
+        return found
+
+    #
+    # Devuelve los nombres que la pregunta presenta como un archivo o una base («la planilla Rio 12-1», «la base
+    # completa fq») y que no son ninguna fuente cargada: ni la contiene una fuente, ni sus palabras son las de una
+    # sola fuente, ni es una variable o un valor guardado. Se avisan como fuentes que no existen en vez de vincular
+    # otra fuente por una palabra suelta.
+    #
+    async def _unknown_cued_sources(self, question, mentions, catalog, known):
+        named = [item.text for item in mentions if not isinstance(item, str) and item.kind != "value"]
+        unknown = []
+        for cue, name in self._cued_sources(question, catalog):
+            if cue not in _FILE_CUES or len(name.split()) < 2:
+                continue
+            if any(contains_phrase(item, name) for item in known) or any(
+                contains_phrase(item, name) or contains_phrase(name, item) for item in named
+            ):
+                continue
+            if self._value_owners(name, catalog) or self._acronym_owners(name, catalog):
+                continue
+            if self._within_one_source(name, catalog) or await self._stored_anywhere(name, catalog):
+                continue
+            unknown.append(f"{cue} {name}" if cue == "base" else name)
+        return unknown
+
+    #
+    # Indica si todas las palabras del nombre están entre las del nombre o las hojas de una misma fuente: es una
+    # forma de nombrarla, no otra fuente.
+    #
+    @staticmethod
+    def _within_one_source(name, catalog):
+        words = set(normalize_text(name).split())
+        for source in catalog:
+            names = [source["name"], *(_sheet(dataset["name"]) for dataset in source["datasets"])]
+            if words <= {word for item in names for word in normalize_name(item).split()}:
+                return True
+        return False
+
+    #
+    # Devuelve las fuentes y hojas de nombre compuesto que la pregunta menciona («la hoja BASE CIANO»). Un nombre
+    # que comparten varios archivos («Hoja1», el nombre por defecto de una hoja) no identifica ninguna fuente.
     #
     @staticmethod
     def _multiword_sources_in(question, catalog, known):
+        names = {
+            source["source_id"]: dict.fromkeys(
+                [source["name"], *(_sheet(dataset["name"]) for dataset in source["datasets"])]
+            )
+            for source in catalog
+        }
+        owners = Counter(normalize_name(original) for originals in names.values() for original in originals)
         found = []
-        for source in catalog:
-            sheets = [_sheet(dataset["name"]) for dataset in source["datasets"]]
-            for original in dict.fromkeys([source["name"], *sheets]):
+        for originals in names.values():
+            for original in originals:
                 name = normalize_name(original)
-                if len(name.split()) >= 2 and name not in known and contains_phrase(question, name):
+                unique = owners[name] == 1
+                if len(name.split()) >= 2 and unique and name not in known and contains_phrase(question, name):
                     found.append(original)
         return list(dict.fromkeys(found))
+
+    #
+    # Devuelve las fuentes que la pregunta nombra por una sigla de su nombre escrita tal cual («registró ABSA»,
+    # «la tabla RdlP»): sólo siglas de al menos tres letras con dos mayúsculas que pertenecen a un único nombre del
+    # catálogo, comparadas respetando mayúsculas para no confundirlas con palabras comunes («BASE», «PARA»).
+    #
+    @staticmethod
+    def _acronym_sources(question, catalog, known):
+        holders = {}
+        for source in catalog:
+            names = [source["name"], *(_sheet(dataset["name"]) for dataset in source["datasets"])]
+            for name in dict.fromkeys(names):
+                for token in _ACRONYM.findall(name):
+                    holders.setdefault(token, set()).add(name)
+
+        return [
+            next(iter(names))
+            for token, names in holders.items()
+            if len(names) == 1
+            and normalize_name(next(iter(names))) not in known
+            and re.search(rf"(?<!\w){re.escape(token)}(?!\w)", question)
+        ]
+
+    #
+    # Devuelve las fuentes cuya sigla figura tal cual en el valor («el excel de ABSA»): un valor que nombra la sigla
+    # de una única fuente y no figura en los registros es una referencia a esa fuente, no un valor que filtrar.
+    #
+    @staticmethod
+    def _acronym_owners(value, catalog):
+        owners = {}
+        for source in catalog:
+            names = [source["name"], *(_sheet(dataset["name"]) for dataset in source["datasets"])]
+            tokens = {token for name in names for token in _ACRONYM.findall(name)}
+            if any(re.search(rf"(?<!\w){re.escape(token)}(?!\w)", value) for token in tokens):
+                owners[source["source_id"]] = source
+        return owners
 
     #
     # Devuelve las fuentes cuyo nombre o cuyas hojas contienen el valor.
@@ -1569,10 +1966,11 @@ class RouteQueryService:
         return False
 
     #
-    # Resuelve las menciones de fuente contra el catálogo y devuelve los vínculos a datasets.
+    # Resuelve las menciones de fuente contra el catálogo y devuelve los vínculos a datasets. Si falta alguna fuente
+    # nombrada, la aclaración las nombra a todas, antes que preguntar por un nombre que coincide con varias.
     #
-    def _resolve_sources(self, mentions, question, catalog, *, partial=False):
-        bindings, resolved = [], []
+    def _resolve_sources(self, mentions, question, catalog, *, partial=False, unknown=()):
+        bindings, resolved, unknown, ambiguous = {}, [], list(unknown), None
         for mention in dict.fromkeys(mentions):
             target = normalize_name(mention)
             if not target:
@@ -1583,16 +1981,24 @@ class RouteQueryService:
             matches = self._catalog_matches(mention, target, identifier, catalog, strict)
             if not matches:
                 if strict or identifier is not None:
-                    raise ValueError(self._unknown_source_message(mention, catalog))
+                    unknown.append(mention)
                 continue
 
-            available = self._available_matches(mention, matches)
-            bindings.extend(
+            try:
+                available = self._available_matches(mention, matches)
+            except ValueError as error:
+                ambiguous = ambiguous or error
+                continue
+            bindings[mention] = [
                 DatasetBinding(dataset_id=dataset["dataset_id"], source_id=source["source_id"])
                 for source, dataset in available
-            )
+            ]
             resolved.append(mention)
-        return bindings, resolved
+        if unknown:
+            raise ValueError(self._unknown_source_message(list(dict.fromkeys(unknown)), catalog))
+        if ambiguous is not None:
+            raise ambiguous
+        return _narrowed_to_sheets(bindings, catalog), resolved
 
     #
     # Devuelve el UUID de una mención o None si no lo es.
@@ -1641,17 +2047,17 @@ class RouteQueryService:
         ]
 
     #
-    # Construye el mensaje de que no existe una fuente con ese nombre.
+    # Construye el mensaje de que no existen fuentes con esos nombres.
     #
     @staticmethod
-    def _unknown_source_message(mention, catalog):
+    def _unknown_source_message(mentions, catalog):
         names = "; ".join(source["name"] for source in catalog[:8])
         listed = f" ({names})" if names else ""
-        return (
-            f"No encontré una fuente llamada {mention} entre las cargadas"
-            + listed
-            + ". ¿Cuál querés usar?"
-        )
+        if len(mentions) == 1:
+            missing = f"una fuente llamada {mentions[0]}"
+        else:
+            missing = "fuentes llamadas " + ", ".join(mentions[:-1]) + f" ni {mentions[-1]}"
+        return f"No encontré {missing} entre las cargadas" + listed + ". ¿Cuál querés usar?"
 
     #
     # Devuelve los datasets disponibles de la fuente coincidente, rechazando coincidencias ambiguas o inactivas.

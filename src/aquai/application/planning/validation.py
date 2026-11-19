@@ -26,7 +26,12 @@ from aquai.application.units import comparable_unit, presentation_unit_status
 _EQUALITY_OPERATORS = {"eq", "ieq", "in"}
 _RANGE_OPERATORS = {"lt", "le", "gt", "ge"}
 _NUMERIC_TYPES = {"BIGINT", "NUMERIC"}
-INCOMPLETE_REQUEST_CODES = frozenset({"missing_named_source"})
+# Partes pedidas que el plan puede dejar sin cubrir sin invalidar lo que sí calcula: el gráfico, una estadística o
+# un umbral. Si el modelo no las resuelve en ningún intento, la respuesta publica lo calculado y avisa qué faltó.
+UNMET_REQUEST_CODES = frozenset(
+    {"missing_requested_chart", "missing_requested_statistic", "missing_requested_threshold"}
+)
+INCOMPLETE_REQUEST_CODES = frozenset({"missing_named_source", "unverified_branch", *UNMET_REQUEST_CODES})
 _TEMPORAL_TYPES = {"DATE", "TIMESTAMP"}
 _TEXT_PERIOD_KINDS = {None: "text", True: "text-dmy", False: "text-mdy"}
 _DATE_WORDS = {"fecha", "date", "ano", "anio", "year", "mes", "month", "dia", "day"}
@@ -45,7 +50,7 @@ _AGGREGATE_FUNCTIONS = {
     "stddev",
     "quantile",
 }
-_PYTHON_ONLY_FUNCTIONS = {"median", "stddev", "quantile"}
+PYTHON_ONLY_FUNCTIONS = frozenset({"median", "stddev", "quantile"})
 _COUNT_FUNCTIONS = {"count", "count_distinct"}
 _STATISTIC_FUNCTIONS = {"count": _COUNT_FUNCTIONS}
 _EXTREME_FUNCTIONS = {"min", "max"}
@@ -220,13 +225,16 @@ def validate_requested_variables(operations, output_steps, variables) -> list[Va
                 and all(columns and ref.column not in columns for ref, columns in zip(field.sources, asked))
             )
             if unrequested:
+                used = ", ".join(dict.fromkeys(ref.column for ref in field.sources))
+                pedidas = ", ".join(sorted({name for columns in asked if columns for name in columns}))
                 issues.append(
                     ValidationIssue(
                         code="unrequested_variable",
                         severity="clarification",
                         step_id=step.id,
-                        message=f"El paso {step.id} calcula {field.name}, una variable que la consulta no pide "
-                        "ni conserva del análisis citado: calculá sólo las variables pedidas.",
+                        message=f"El paso {step.id} calcula {field.name} con {used}, que no es una variable que la "
+                        f"consulta pida ni conserve del análisis citado: si ese cálculo responde la consulta, hacelo "
+                        f"sobre la variable pedida ({pedidas}); si no, quitalo.",
                     )
                 )
 
@@ -816,6 +824,7 @@ def _alternative_issues(key, chain, steps, group) -> list[ValidationIssue]:
             severity="clarification",
             step_id=key,
             message=f"La consulta pide por separado {texts}: la salida {key} debe filtrar con uno solo.",
+            subject=texts,
         )
     ]
 
@@ -833,6 +842,7 @@ def _uncovered_alternatives(chains, group) -> list[ValidationIssue]:
             code="missing_requested_threshold",
             severity="clarification",
             message=f"La consulta pide {item.text}, pero ninguna salida de uno de los datasets lo aplica.",
+            subject=item.text,
         )
         for members in by_dataset.values()
         for item in group
@@ -858,6 +868,7 @@ def _output_threshold_issues(key, chain, steps, threshold) -> list[ValidationIss
                 step_id=key,
                 message=f"La consulta pide {threshold.text}, pero la salida {key} no filtra con "
                 f"{threshold.operator} {threshold.value}.",
+                subject=threshold.text,
             )
         ]
 
@@ -914,6 +925,7 @@ def _statistic_issues(published, statistics) -> list[ValidationIssue]:
             severity="clarification",
             message=f"La consulta pide la estadística {function}, pero ninguna salida la calcula: "
             "agregá un aggregate con ese cálculo; un read sin aggregate no la responde.",
+            subject=function,
         )
         for function in statistics
         if not _STATISTIC_FUNCTIONS.get(function, {function}) & computed
@@ -1168,6 +1180,23 @@ def _invented_columns(dataset: VerifiedDataset, invented: list[str]) -> str:
 #
 def _names_date(name: str) -> bool:
     return bool(set(singular_words(name)) & _DATE_WORDS)
+
+
+#
+# Explica por qué el eje x no sirve para una línea: una fecha guardada como texto no se interpreta como eje y una
+# categoría (un sitio) se compara con barras o como serie de una línea sobre fechas.
+#
+def _line_axis_problem(field) -> str:
+    if _names_date(field.name):
+        return (
+            f"Una línea requiere un eje numérico o temporal verificado: {field.name} guarda fechas como texto, "
+            "que no se interpretan como eje. Usá un gráfico de barras o un eje numérico."
+        )
+
+    return (
+        f"Una línea requiere en el eje x una fecha o un número verificados, y {field.name} es una categoría: para "
+        f"comparar categorías usá chart_type bar, o poné la fecha en x y {field.name} como series."
+    )
 
 
 #
@@ -1458,10 +1487,7 @@ class _OperationValidator:
             )
 
         if chart.chart_type == "line":
-            _require(
-                _is_numeric(x) or x.sql_type in _TEMPORAL_TYPES,
-                "Una línea requiere un eje numérico o temporal verificado; no se interpretan fechas TEXT.",
-            )
+            _require(_is_numeric(x) or x.sql_type in _TEMPORAL_TYPES, _line_axis_problem(x))
 
         if y is not None:
             _require(
@@ -1643,7 +1669,7 @@ class _OperationValidator:
             (function in _AGGREGATE_FUNCTIONS) == (step.operation == "aggregate"),
             "La función no corresponde al tipo de operación.",
         )
-        if function in _PYTHON_ONLY_FUNCTIONS:
+        if function in PYTHON_ONLY_FUNCTIONS:
             _require(
                 step.tool == "python",
                 "La nueva función estadística está habilitada exclusivamente en Python.",
@@ -1901,8 +1927,9 @@ def validate_execution_plan(plan: PlanningResult, catalog: list[VerifiedDataset]
             dated_columns=period_columns(selected, plan.temporal_text_columns),
         )
     )
+    accepted = _accepted_gaps(plan)
     _require(
-        not any(issue.severity == "clarification" for issue in issues),
+        not any(issue.severity == "clarification" and issue.code not in accepted for issue in issues),
         "La operación requiere resolver una aclaración antes de ejecutarse.",
     )
 
@@ -1913,6 +1940,18 @@ def validate_execution_plan(plan: PlanningResult, catalog: list[VerifiedDataset]
     _require(not schema_changed, "El esquema del plan no coincide con el derivado del catálogo.")
 
     return selected, operations
+
+
+#
+# Devuelve las partes pedidas que el plan ya aceptó dejar sin cubrir (el gráfico, una estadística o un umbral): la
+# respuesta se publica parcial y avisa qué faltó, así que la revalidación no las vuelve a exigir.
+#
+def _accepted_gaps(plan: PlanningResult) -> set[str]:
+    return {
+        issue.code
+        for issue in plan.validation_issues
+        if issue.severity == "warning" and issue.code in UNMET_REQUEST_CODES
+    }
 
 
 #

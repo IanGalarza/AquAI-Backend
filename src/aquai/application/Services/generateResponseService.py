@@ -16,7 +16,7 @@ from aquai.application.answering.drafting import (
     ATTACHMENT_LEADS,
     analytical_request,
     apply_support,
-    asks_interpretation,
+    asks_documents,
     backed_citations,
     cited_lines,
     cited_references,
@@ -29,6 +29,7 @@ from aquai.application.answering.drafting import (
     retry_record,
     review_draft,
     support_passages,
+    support_phrases,
 )
 from aquai.application.answering.readings import number_readings
 from aquai.application.answering.segments import answer_text
@@ -57,9 +58,12 @@ from aquai.application.matching import (
     variable_variants,
     without_medium,
 )
-from aquai.application.Rules.evidence import EXPLANATION_CUES, LITERATURE_CLAUSE
+from aquai.application.Rules.evidence import CITATION_YEAR, EXPLANATION_CUES, LITERATURE_CLAUSE
 
-_MIN_SUPPORT = 0.7
+_MIN_SUPPORT = 0.6
+# Un ítem de lista comparado con una frase corta de la evidencia necesita más parecido que con una oración: las
+# frases cortas se parecen más entre sí, y un ítem inventado del mismo tema llega a 0,68 (calibrado con bge-m3).
+_MIN_PHRASE_SUPPORT = 0.7
 _UNCOVERED_LITERATURE = {
     "es": "La consulta pide qué dice la bibliografía sobre {topic}, pero los documentos que pude verificar no tratan "
     "ese tema, así que esa parte queda sin responder.",
@@ -76,7 +80,9 @@ _MIN_LISTED_SUPPORT = 0.45
 _ALIGNMENT_MARGIN = 0.03
 _PAIR_MARGIN = 0.03
 _ALIGNED_ROLES = {"documented", "relation"}
-_RANK = {"result": 0, "meaning": 1, "summary": 2, "chart": 3, "scope": 4, "detail": 5}
+_STUDY_SCOPE = "alcance del estudio"
+_STUDY_SCOPE_SUFFIX = {"es": ", según el estudio citado", "en": ", according to the cited study"}
+_RANK = {"result": 0, "pattern": 1, "meaning": 2, "summary": 3, "chart": 4, "scope": 5, "detail": 6}
 
 _MESSAGES = {
     "es": {
@@ -92,6 +98,7 @@ _MESSAGES = {
         "no_interpretation": "No encontré en los documentos cargados evidencia específica para interpretar este resultado.",
         "interpretation_unavailable": "No pude consultar los documentos para interpretar este resultado.",
         "interpretation_unverified": "Encontré documentos relacionados, pero no pude incorporar su interpretación de forma verificable.",
+        "dropped_claims": "Parte de lo que encontré en los documentos no se pudo verificar contra los fragmentos citados y quedó afuera, así que la respuesta puede estar incompleta.",
     },
     "en": {
         "validated": "",
@@ -106,6 +113,7 @@ _MESSAGES = {
         "no_interpretation": "I found no specific evidence in the loaded documents to interpret this result.",
         "interpretation_unavailable": "I could not query the documents to interpret this result.",
         "interpretation_unverified": "I found related documents, but I could not include their interpretation in a verifiable way.",
+        "dropped_claims": "Part of what I found in the documents could not be verified against the cited fragments and was left out, so the answer may be incomplete.",
     },
 }
 
@@ -158,7 +166,8 @@ class GenerateResponseService:
             return self._finish(response, started)
 
         if _cannot_answer(validation):
-            self._publish_unanswered(response, state, validation, language)
+            if not await self._answered_from_documents(response, state, language):
+                self._publish_unanswered(response, state, validation, language)
             return self._finish(response, started)
 
         steps = {step.id: step for step in plan.operations}
@@ -179,13 +188,14 @@ class GenerateResponseService:
             *contrast.notes,
         ]
         thresholds = _threshold_notes(state.routing, language)
-        told = [*notes, *(item.text for item in thresholds)]
-        written = await self._written(response, state, context, told, contrast, language)
-        body = written if written is not None else [*self._verified_text(context, refs), *_compared(contrast)]
+        missing = []
         if validation.status == "partial":
             missing = [*blocked_explanations(state, language), *request_gaps(state, language)]
             missing = missing or [self._message("partial", language)]
-            body = [*(AnswerSegment(kind="note", text=text) for text in missing), *body]
+        told = [*notes, *(item.text for item in thresholds), *missing]
+        written = await self._written(response, state, context, told, contrast, language)
+        body = written if written is not None else [*self._verified_text(context, refs), *_compared(contrast)]
+        body = [*(AnswerSegment(kind="note", text=text) for text in missing), *body]
 
         interpretation = _interpretation_notes(state, body, language, self._message)
         unanswered = [
@@ -244,6 +254,30 @@ class GenerateResponseService:
         return self._finish(response, started)
 
     #
+    # Responde la parte documental de una consulta mixta cuyo cálculo no se pudo verificar: publica lo que los
+    # documentos respaldan y avisa que el cálculo quedó sin hacer y por qué. Devuelve False si no hay documentos
+    # para la pregunta o no se pudo redactar con ellos; entonces se publica sólo el motivo.
+    #
+    async def _answered_from_documents(self, response, state, language) -> bool:
+        retrieval = state.document_retrieval
+        if retrieval is None or retrieval.purpose != "question" or retrieval.status != "found":
+            return False
+
+        request = documental_request(state, language, self._provider.context_budget_bytes, [])
+        segments = await self._reviewed_segments(response, request, language)
+        _record_trace(response, state)
+        if segments is None:
+            return False
+
+        reasons = [*blocked_explanations(state, language), *text_measurement_notes(state, language)]
+        notes = [AnswerSegment(kind="note", text=text) for text in [self._message("partial", language), *reasons]]
+        response.status = "partial"
+        response.document_references = cited_references(segments, retrieval.fragments)
+        self._publish(response, [notes[0], *segments, *notes[1:]])
+
+        return True
+
+    #
     # Redacta una respuesta analítica; si no se puede verificar devuelve None.
     #
     async def _written(self, response, state, context, notes, contrast, language):
@@ -294,8 +328,11 @@ class GenerateResponseService:
             return None
 
         generation.status = "generated"
+        published = published_segments(reviewed, request, language)
+        if reviewed.dropped:
+            published.append(AnswerSegment(kind="note", text=self._message("dropped_claims", language)))
 
-        return published_segments(reviewed, request, language)
+        return published
 
     #
     # Quita las oraciones que no se parecen a lo que dicen los fragmentos que citan o que pierden o agregan
@@ -307,19 +344,22 @@ class GenerateResponseService:
             return reviewed
 
         passages = {id(item[0]): support_passages(item[0], request) for item in claims}
+        phrases = {id(segment): support_phrases(passages[id(segment)]) for segment, _ in claims if segment.items}
         texts = list(
             dict.fromkeys(
                 [
                     *(variant for _, text in claims for variant in claim_variants(text)),
-                    *(line for lines in passages.values() for line in lines),
+                    *(line for lines in [*passages.values(), *phrases.values()] for line in lines),
                 ]
             )
         )
         try:
             vectors = dict(zip(texts, await self._embeddings.embed(texts), strict=True))
-            unsupported = self._unsupported(vectors, claims, passages, request)
-            drifted = self._drifted(vectors, claims, request, unsupported)
-            audited = apply_support(reviewed, [*unsupported, *drifted], request.evidence.required_values)
+            unsupported = self._unsupported(vectors, claims, passages, request, phrases)
+            drifted, scoped = self._drifted(vectors, claims, request, unsupported)
+            audited = apply_support(
+                reviewed, [*unsupported, *drifted], request.evidence.required_values, scoped
+            )
             vectors |= await self._rewritten_vectors(audited, vectors)
         except LLMProviderError:
             return self._unaudited(response, reviewed, claims)
@@ -335,11 +375,13 @@ class GenerateResponseService:
     # Devuelve las oraciones que no se parecen lo suficiente a lo que citan.
     #
     @staticmethod
-    def _unsupported(vectors, claims, passages, request) -> list:
+    def _unsupported(vectors, claims, passages, request, phrases=None) -> list:
+        phrases = phrases or {}
         return [
             (segment, text)
             for segment, text in claims
             if not _resembles(vectors, text, passages[id(segment)], _MIN_SUPPORT)
+            and not _phrase_supported(vectors, segment, text, phrases)
             and not (
                 listed_values(text, segment, request)
                 and _resembles(vectors, text, passages[id(segment)], _MIN_LISTED_SUPPORT)
@@ -348,19 +390,21 @@ class GenerateResponseService:
 
     #
     # Devuelve las oraciones con respaldo que, frente a la oración del fragmento que parafrasean, pierden una
-    # acotación o agregan una causa, una generalidad o una conclusión estadística.
+    # acotación o agregan una causa, una generalidad o una conclusión estadística. Una oración que sólo pierde el
+    # alcance del estudio («in this study») no se quita: se acota con «según el estudio citado», que es lo que
+    # expresaba, y se devuelve aparte como reescritura.
     #
     @staticmethod
-    def _drifted(vectors, claims, request, unsupported) -> list:
+    def _drifted(vectors, claims, request, unsupported) -> tuple[list, dict]:
         rejected = {(id(segment), text) for segment, text in unsupported}
-        question = request.evidence.question
-        drifted = []
+        language = request.evidence.language
+        drifted, scoped = [], {}
         for segment, text in claims:
             if segment.role not in _ALIGNED_ROLES or (id(segment), text) in rejected:
                 continue
 
             lines = cited_lines(segment, request)
-            numbered, contributing = _numbered_lines(text, lines, request.evidence.language)
+            numbered, contributing = _numbered_lines(CITATION_YEAR.sub(" ", text), lines, language)
             aligned = (
                 [*_closest(vectors, text, numbered), *contributing]
                 if numbered
@@ -369,17 +413,15 @@ class GenerateResponseService:
             if not aligned:
                 continue
 
-            earlier = _earlier_text(segment, text)
-            relation = segment.role == "relation"
-            problems = [
-                paraphrase_drift(text, _paraphrased(vectors, text, line, pairs), heading, earlier, question, relation)
-                for line, heading, pairs in aligned
-            ]
-            problem = next((item for item in problems if item is not None), None)
-            if problem is not None:
+            check = _drift_check(vectors, segment, text, aligned, request)
+            problem = check(text)
+            rewritten = _scoped_claim(text, language) if problem is not None and problem.family == _STUDY_SCOPE else None
+            if rewritten is not None and check(rewritten) is None:
+                scoped[(id(segment), text)] = rewritten
+            elif problem is not None:
                 drifted.append((segment, text, problem))
 
-        return drifted
+        return drifted, scoped
 
     #
     # Quita las oraciones documentales que no se pudieron auditar, sin descartar lo ya verificado.
@@ -767,7 +809,7 @@ def _interpretation_notes(state, segments, language, message):
     question = state.routing.original_question if state.routing else state.question
     if retrieval is None or retrieval.purpose != "enrichment" or retrieval.status == "skipped":
         return []
-    if not (asks_interpretation(question) or LITERATURE_CLAUSE.search(question)):
+    if not asks_documents(state, question):
         return []
     if any(item.role in _ALIGNED_ROLES and item.document_ids for item in segments):
         return []
@@ -844,8 +886,11 @@ def _variable_terms(mention) -> list[str]:
 #
 def _unexplained(state, interpretation) -> bool:
     question = state.routing.original_question if state.routing else state.question
+    named = state.routing is not None and bool(state.routing.document_ids)
 
-    return bool(interpretation) and bool(EXPLANATION_CUES.search(question) or LITERATURE_CLAUSE.search(question))
+    return bool(interpretation) and bool(
+        named or EXPLANATION_CUES.search(question) or LITERATURE_CLAUSE.search(question)
+    )
 
 
 #
@@ -912,6 +957,14 @@ def _resembles(vectors, text, passages, threshold) -> bool:
 
 
 #
+# Indica si el ítem de una lista se parece lo suficiente a una frase de su evidencia, que es lo que un ítem suele
+# traducir («contacto total del cuerpo» es «whole-body contact»); una oración se compara sólo con oraciones.
+#
+def _phrase_supported(vectors, segment, text, phrases) -> bool:
+    return text in segment.items and _resembles(vectors, text, phrases.get(id(segment), []), _MIN_PHRASE_SUPPORT)
+
+
+#
 # Devuelve el mayor parecido entre una oración y las de su evidencia.
 #
 def _best_support(vectors, text, passages) -> float:
@@ -948,7 +1001,9 @@ def _aligned_lines(vectors, text, lines) -> list[tuple[str, str, tuple]]:
 #
 # Devuelve las oraciones de los fragmentos de donde salen las cifras de una oración, con su sección y los
 # pares con sus vecinas: las que contienen más de sus números y, aparte, las que aportan las cifras que esas
-# no tienen; una oración que funde dos frases debe conservar las acotaciones de ambas.
+# no tienen; una oración que funde dos frases debe conservar las acotaciones de ambas. El año de una cita
+# («Sathicq et al. (2014)») se quita antes: no es una cifra del hallazgo y la alinearía con los datos de
+# publicación del fragmento.
 #
 def _numbered_lines(text, lines, language) -> tuple[list, list]:
     wanted = [reading.values for reading in number_readings(text, language)]
@@ -984,6 +1039,39 @@ def _closest(vectors, text, lines) -> list[tuple[str, str, tuple]]:
     best = max(score for score, _ in scored)
 
     return [item for score, item in scored if score >= best - _ALIGNMENT_MARGIN]
+
+
+#
+# Devuelve la revisión de lo que una oración pierde o agrega frente a las oraciones del fragmento que parafrasea,
+# aplicable también a una reescritura suya: el pasaje se elige con la oración original. Las acotaciones de otra
+# cláusula sólo se ignoran si todos los fragmentos citados están en el idioma de la respuesta.
+#
+def _drift_check(vectors, segment, text, aligned, request):
+    evidence = request.evidence
+    earlier = _earlier_text(segment, text)
+    relation = segment.role == "relation"
+    same_language = all(evidence.document_languages.get(key) == evidence.language for key in segment.document_ids)
+    passages = [(_paraphrased(vectors, text, line, pairs), heading) for line, heading, pairs in aligned]
+
+    def check(claim):
+        problems = (
+            paraphrase_drift(claim, passage, heading, earlier, evidence.question, relation, same_language)
+            for passage, heading in passages
+        )
+        return next((item for item in problems if item is not None), None)
+
+    return check
+
+
+#
+# Devuelve la oración acotada al estudio que la sostiene, con el cierre que tenía.
+#
+def _scoped_claim(text, language) -> str:
+    body = text.rstrip()
+    end = body[-1] if body[-1:] in {".", "!", "?"} else ""
+    core = body[:-1] if end else body
+
+    return f"{core}{_STUDY_SCOPE_SUFFIX[language]}{end or '.'}"
 
 
 #

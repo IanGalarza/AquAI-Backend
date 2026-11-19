@@ -8,6 +8,7 @@ from sqlalchemy import (
     Date,
     DateTime,
     Numeric,
+    String,
     and_,
     case,
     cast,
@@ -35,6 +36,12 @@ _FILTER_OPERATORS = {
     "is_null": lambda column, values: column.is_(None),
     "is_not_null": lambda column, values: column.is_not(None),
 }
+
+#
+# Igualdades de texto que comparan el valor guardado sin espacios en los extremos: el plan nunca los conserva
+# (sus textos se recortan) y una planilla puede guardar « C: AVENIDA…» con un espacio inicial.
+#
+_TRIMMED_OPERATORS = {"eq", "ne", "ieq", "in", "not_in"}
 
 _AGGREGATES = {"sum": _pg.sum, "mean": _pg.avg, "min": _pg.min, "max": _pg.max}
 
@@ -130,6 +137,8 @@ class _StepCompiler:
     def _filter_predicate(self, predicate):
         column = self._resolve(predicate.field)
         values = [_filter_value(column, value) for value in predicate.values]
+        if predicate.operator in _TRIMMED_OPERATORS and isinstance(column.type, String):
+            column = _pg.btrim(column)
         return _FILTER_OPERATORS[predicate.operator](column, values)
 
     #

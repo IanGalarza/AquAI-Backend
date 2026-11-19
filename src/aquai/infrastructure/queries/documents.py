@@ -115,6 +115,21 @@ class SqlAlchemyDocumentQueries:
         if not chunk_ids:
             return {}
 
+        return self._verified(DocumentChunk.id.in_(chunk_ids))
+
+    #
+    # Devuelve los fragmentos vigentes de un documento en esas posiciones, con su procedencia completa.
+    #
+    def chunks_at(self, document_id: UUID, positions: list[int]) -> dict[UUID, dict[str, Any]]:
+        if not positions:
+            return {}
+
+        return self._verified(DocumentChunk.document_id == document_id, DocumentChunk.position.in_(positions))
+
+    #
+    # Lee los fragmentos que cumplen las condiciones, sólo de fuentes activas y procesadas.
+    #
+    def _verified(self, *conditions) -> dict[UUID, dict[str, Any]]:
         statement = (
             select(
                 DocumentChunk.id.label("chunk_id"),
@@ -146,7 +161,7 @@ class SqlAlchemyDocumentQueries:
             .outerjoin(DocumentSection, DocumentSection.id == DocumentChunk.section_id)
             .outerjoin(DocumentElement, DocumentElement.id == DocumentChunk.element_id)
             .where(
-                DocumentChunk.id.in_(chunk_ids),
+                *conditions,
                 Source.is_active.is_(True),
                 Source.processing_status.in_(_READY_STATUSES),
             )

@@ -26,11 +26,17 @@ UNSUPPORTED_VERDICTS = re.compile(
     r"sin\s+riesgo\s+(?:para|sanitario)|poses?\s+no\s+risk|no\s+health\s+risk)\b",
     re.IGNORECASE,
 )
+# Lo que sigue a «provienen de» cuando nombra de dónde salen los datos y no una causa («provienen de archivos
+# distintos», «come from two sheets»).
+_DATA_ORIGIN = (
+    r"(?!\s+(?:\w+\s+){0,2}?(?:archivos?|fuentes?|hojas?|planillas?|tablas?|datasets?|bases?\s+de\s+datos|files?|"
+    r"sources?|sheets?|tables?)\b)"
+)
 CAUSAL_CLAIMS = re.compile(
     r"\b(?:se\s+deb(?:e|en|i[oó]|ieron)\s+a|debid[oa]s?\s+a|a\s+causa\s+de|causad[oa]s?|caus[oó]|provocad[oa]s?|"
     r"provoc[oó]|origin[oó]|producto\s+de|consecuencia\s+de|por\s+culpa\s+de|gracias\s+a|explicad[oa]s?\s+por|"
-    r"originad[oa]s?\s+por|generad[oa]s?\s+por|producid[oa]s?\s+por|obedecen?\s+a|responden?\s+a|provienen?\s+de|"
-    r"derivan?\s+de|resultan?\s+de|se\s+origina(?:n|ron)?|results?\s+from|stems?\s+from|comes?\s+from|"
+    rf"originad[oa]s?\s+por|generad[oa]s?\s+por|producid[oa]s?\s+por|obedecen?\s+a|responden?\s+a|provienen?\s+de{_DATA_ORIGIN}|"
+    rf"derivan?\s+de|resultan?\s+de|se\s+origina(?:n|ron)?|results?\s+from|stems?\s+from|comes?\s+from{_DATA_ORIGIN}|"
     r"originat(?:es?|ed)\s+from|generated\s+by|produced\s+by|a\s+consequence\s+of|"
     r"se\s+explica\s+por|atribuid[oa]s?\s+a|atribuible\s+a|demuestra\s+que|prueba\s+que|is\s+due\s+to|was\s+due\s+to|"
     r"due\s+to|because\s+of|caused(?:\s+by)?|as\s+a\s+result\s+of|owing\s+to|explained\s+by|attributable\s+to|"
@@ -199,16 +205,30 @@ RELATIVE_QUANTITIES = re.compile(
     r"\w+\s+veces\s+(?:m[aá]s|menos|mayor|menor)|twice|double|triple|half\s+of|\w+\s+times\s+(?:more|less|higher|lower))\b",
     re.IGNORECASE,
 )
+# Sentido de una comparación con una referencia. Los verbos van por familia («superaron», «sobrepasan», «rebasó»);
+# «pasar» sólo compara seguido de «de» o de un artículo («pasaron los niveles guía», «pasa de 100»), no en «qué pasó
+# con»; «no llegar» o «no alcanzar» un nivel es quedar por debajo.
 COMPARISON_DIRECTIONS = {
     "above": re.compile(
-        r"\b(?:por\s+encima|super(?:a|an|ar|aron|ó|ior(?:es)?)\b|exced\w*|mayor(?:es)?\b|above|exceed\w*|higher)\b",
+        r"\b(?:por\s+encima|super(?:a|an|ar|aron|ó|ior(?:es)?)\b|exced\w*|sobrepas\w*|rebas\w*|"
+        r"pas(?:a|an|ar|ó|aron|e|en|ara|aran)\s+(?:de|del|los|las|el|la|lo)\b|mayor(?:es)?\b|above|exceed\w*|"
+        r"higher)\b",
         re.IGNORECASE,
     ),
     "below": re.compile(
-        r"\b(?:por\s+debajo|inferior(?:es)?\b|menor(?:es)?\b|below|lower)\b", re.IGNORECASE
+        r"\b(?:por\s+debajo|inferior(?:es)?\b|menor(?:es)?\b|no\s+(?:lleg|alcanz)\w*|below|lower)\b", re.IGNORECASE
     ),
     "within": re.compile(r"\b(?:dentro\s+del?|within)\b", re.IGNORECASE),
 }
+# Comparaciones que incluyen el límite: «alcanzaron o superaron», «igual o mayor», «al menos», «or more».
+INCLUSIVE_BOUND = re.compile(
+    r"\b(?:(?:alcanz|iguala|lleg)\w*\s+o\s+(?:super|exced|sobrepas|rebas|pas)\w*|(?:super|exced|sobrepas|rebas|pas)"
+    r"\w*\s+o\s+(?:alcanz|iguala|lleg)\w*|(?:mayor|menor|superior|inferior)(?:es)?\s+o\s+igual\w*|igual\w*\s+o\s+"
+    r"(?:mayor|menor|superior|inferior)\w*|al\s+menos|como\s+m[ií]nimo|como\s+m[aá]ximo|o\s+m[aá]s|o\s+menos|"
+    r"at\s+least|at\s+most|or\s+(?:more|less|above|below)|reach\w*\s+or\s+exceed\w*|"
+    r"equal\s+(?:to\s+)?or\s+(?:greater|higher|above|less|lower|below))\b|[≥≤]",
+    re.IGNORECASE,
+)
 RESULT_WORDS = frozenset(
     """a al alcanzo alcanzaron ano anos aparece aparecen archivo calculado calculada calculados calculadas cada
     como con correspondiente correspondientes dato datos de del dicho durante e el en entre es esa ese esta este
@@ -223,6 +243,81 @@ RESULT_WORDS = frozenset(
     a an and are as at by chart data during file for from in is it its measured obtained observed of on or per
     place recorded records registered result results sheet site sites table that the this to value values was
     were with year years""".split()
+)
+#
+# Afirmaciones de que no existen datos («No hay información disponible sobre…»): que el análisis no haya podido
+# obtener algo no prueba que no exista, así que un párrafo de resultado sólo puede decirlo si un hecho lo dice.
+#
+ABSENCE_CLAIM = re.compile(
+    r"\b(?:no\s+(?:hay|hab[ií]a|existen?|figuran?|se\s+(?:registr|encontr|dispon|report|midi|cuenta)\w*)\s+"
+    r"(?:\w+\s+){0,3}?(?:informaci[oó]n|datos?|registros?|mediciones|valores|recuentos?)|"
+    r"(?:there\s+(?:is|are|was|were)\s+no|no)\s+(?:\w+\s+){0,2}?(?:data|records?|information|measurements?)\s+"
+    r"(?:is|are|was|were|available|exists?))\b",
+    re.IGNORECASE,
+)
+EMPTY_RESULT = re.compile(r"\b(?:no\s+(?:encontr|hay|tiene|se\s+pudo)\w*|sin\s+(?:dato|valor)\w*|no\s+records?)\b", re.IGNORECASE)
+#
+# Valoraciones de lo observado que un párrafo de resultado sólo puede hacer si sus hechos las dicen: intensidad,
+# nivel, cambio, estabilidad, tipicidad y relación. Se comparan palabras normalizadas (sin tildes); la intensidad,
+# el nivel y el sentido del cambio se distinguen por grado, porque «débil» no autoriza «fuerte».
+#
+ASSESSMENT_FAMILIES = {
+    "fuerte": re.compile(
+        r"fuertes?|fuertemente|marcad[oa]s?|marcadamente|pronunciad[oa]s?|considerables?|considerablemente|"
+        r"sustancial(?:es|mente)?|notables?|notablemente|strong(?:er|est|ly)?|marked(?:ly)?|pronounced|"
+        r"considerabl[ey]|substantial(?:ly)?|notabl[ey]"
+    ),
+    "moderado": re.compile(r"moderad[oa]s?|moderadamente|moderate(?:ly)?"),
+    "debil": re.compile(
+        r"debil(?:es|mente)?|leves?|levemente|liger[oa]s?|ligeramente|escas[oa]s?|escasamente|weak(?:er|est|ly)?|"
+        r"slight(?:ly)?|mild(?:ly)?"
+    ),
+    "nulo": re.compile(r"nul[oa]s?|inexistentes?|despreciables?|negligibl[ey]|nonexistent"),
+    "alto": re.compile(
+        r"alt[oa]s?|altisim[oa]s?|elevad[oa]s?|maxim[oa]s?|high(?:er|est)?|elevated|maximum|peak"
+    ),
+    "bajo": re.compile(r"baj[oa]s?|bajisim[oa]s?|reducid[oa]s?|minim[oa]s?|low(?:er|est)?|minimum"),
+    "aumento": re.compile(
+        r"aument\w*|crec\w*|ascend\w*|ascenso|sub(?:e|en|io|ieron|ir)|increment\w*|increas\w*|ris(?:e|es|ing)|"
+        r"rose|grow\w*|grew|upward"
+    ),
+    "descenso": re.compile(
+        r"disminu\w*|decrec\w*|descend\w*|descenso|reduj\w*|reducc\w*|reduce|reducen|reducir|caida|caidas|cayo|"
+        r"cayeron|decreas\w*|declin\w*|fell|fall(?:s|ing)?|downward|drop\w*"
+    ),
+    "estable": re.compile(
+        r"estab(?:le|les|ilidad|ilizo|ilizaron)|constantes?|invariab\w*|stable|stability|constant|unchanged|steady"
+    ),
+    "tipico": re.compile(
+        r"habitual(?:es|mente)?|tipic[oa]s?|tipicamente|frecuentes?|frecuentemente|normal(?:es|mente)?|"
+        r"esperables?|esperad[oa]s?|excepcional(?:es|mente)?|inusual(?:es|mente)?|extrem[oa]s?|atipic[oa]s?|"
+        r"anomal[oa]s?|outliers?|typical(?:ly)?|usual(?:ly)?|unusual(?:ly)?|frequent(?:ly)?|normal(?:ly)?|"
+        r"expected|exceptional(?:ly)?|extreme(?:ly|s)?|atypical|anomalous"
+    ),
+    "relacion": re.compile(
+        r"relacion\w*|asoci\w*|vincul\w*|depend\w*|correlacion\w*|correlaciona\w*|influ\w*|efectos?|impact\w*|"
+        r"related|relationships?|relation|relations|associat\w*|linked|correlat\w*|effects?"
+    ),
+}
+#
+# Comienzo de una oración que habla de un estudio, un resultado o una observación sin nombrar de quién: sin la
+# oración que presentaba la fuente se leería como un análisis propio («El análisis incluyó…», «Se observó…»).
+#
+UNNAMED_STUDY_START = re.compile(
+    r"^(?:(?:el|la|los|las|este|esta|estos|estas|dich[oa]s?|the|this|these|our)\s+"
+    r"(?:an[aá]lisis|estudios?|trabajos?|investigaci[oó]n(?:es)?|muestreos?|monitoreos?|resultados?|datos|valores|"
+    r"mediciones|concentraciones|autor(?:es|as?)?|study|studies|analysis|work|results?|data|values|measurements|"
+    r"concentrations|authors?|survey|sampling)\b|se\s+(?:observ|registr|midi|mid|encontr|detect|hall|report|analiz|"
+    r"estudi|evalu|determin|compar|realiz|aplic|utiliz|emple|transform|calcul|tom|recolect|colect|muestre|obtuv|"
+    r"identific|cuantific|estim)\w*\b|(?:we|nosotros|nuestros?|nuestras?)\b)",
+    re.IGNORECASE,
+)
+#
+# Verbos en pasado con que un estudio narra lo que hizo u observó («se transformaron», «se realizó», «fueron»):
+# una oración así, sin la que nombraba el estudio, se leería como parte del análisis propio.
+#
+PAST_NARRATION = re.compile(
+    r"\b(?:[a-záéíúñ]+(?:aron|ieron)|[a-záéíúñ]+ó|fue|fueron|hubo|was|were|did|had)\b", re.IGNORECASE
 )
 ANAPHORIC_START = re.compile(
     r"^(?:esto|esta|este|ese|esa|eso|estos|estas|esos|esas|en\s+ese\s+caso|de\s+ser\s+as[ií]|this|these|that|those|"
@@ -386,7 +481,7 @@ _EXPLANATION = (
 EXPLANATION_CUES = re.compile(rf"\b(?:{_EXPLANATION})\b", re.IGNORECASE)
 INTERPRETATION_CUES = re.compile(
     rf"\b(?:{_EXPLANATION}|es\s+(?:normal|alto|alta|bajo|baja|mucho|poco|preocupante|habitual|esperable|bueno|"
-    r"malo)|compar\w*\s+con|en\s+comparaci[oó]n|respecto\s+(?:de|a)\s+(?:los|las|la|el)\s+"
+    r"malo)|compar\w*\s+con|en\s+comparaci[oó]n|contrast\w*|cotej\w*|respecto\s+(?:de|a)\s+(?:los|las|la|el)\s+"
     r"(?:valor|nivel|l[ií]mite|norma|gu[ií]a)\w*|is\s+(?:it|this|that)\s+(?:normal|high|low|a\s+lot)|"
     r"compare\w*\s+(?:with|to))\b",
     re.IGNORECASE,
@@ -396,7 +491,7 @@ PENDING_CONFIRMATION = re.compile(
     r".{0,80}\b(?:unidad|fuente|dato|equivalencia|unit|source|original)\b",
     re.IGNORECASE,
 )
-CHEMICAL_NAME = re.compile(r"[-–]?(?:[A-Z][a-z]?\d{0,3}[-–]?)+")
+CHEMICAL_NAME = re.compile(r"[-–]?(?:[A-Z][a-z]?[\d₀-₉]{0,3}[-–]?)+(?:[\d⁰¹²³⁴-⁹]?[+⁺−⁻])?")
 ATTRIBUTED_SOURCE = re.compile(
     r"\b(?:[Ss]eg[uú]n|[Dd]e\s+acuerdo\s+(?:con|a)|[Cc]onforme\s+a|[Aa]ccording\s+to|[Aa]s\s+reported\s+by)\s+"
     r"(?:(?:la|el|lo|los|las|the)\s+)?"
@@ -409,6 +504,16 @@ ATTRIBUTION_LEAD = re.compile(
     r"afirma|afirman|reporta|reportan|informa|informan|describe|describen|define|definen|plantea|plantean|"
     r"explica|explican|states?|indicates?|reports?|describes?|defines?|explains?)\s+(?:que|that)\s+)",
     re.IGNORECASE,
+)
+# Fechas escritas con números («01/09/2021», «2021-09-01»).
+DATE_TOKEN = re.compile(r"\b(?:\d{1,2}/\d{1,2}/\d{2,4}|\d{4}-\d{1,2}-\d{1,2})\b")
+# Citas de autor y año («Sathicq et al. (2014)», «Pérez y colaboradores, 2010», «Gianuzzi (2011)», «(OMS, 2003)»):
+# su año dice de qué obra es la afirmación, no es una cifra de lo que afirma.
+CITATION_YEAR = re.compile(
+    r"\b[A-ZÁÉÍÓÚÑ][\w'’-]+\s+(?:et\s+al\.?|y\s+col(?:aboradores|\.)|and\s+colleagues)(?:\s*,|\s+de|\s+in)?\s*\(?\s*"
+    r"(?:19|20)\d{2}[a-z]?\)?"
+    r"|\b[A-ZÁÉÍÓÚÑ][\w'’-]+\s*\(\s*(?:19|20)\d{2}[a-z]?\s*\)"
+    r"|\(\s*[A-ZÁÉÍÓÚÑ][^()]{0,80}?,\s*(?:19|20)\d{2}[a-z]?\s*\)"
 )
 BOUND_WORDS = re.compile(
     r"\b(?:menor(?:es)?|inferior(?:es)?|mayor(?:es)?|superior(?:es)?|debajo|encima|menos\s+de|m[aá]s\s+de|hasta|"

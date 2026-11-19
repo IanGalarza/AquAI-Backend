@@ -22,6 +22,7 @@ from aquai.application.matching import (
     other_quantity,
     secondary_quantity,
     singular_words,
+    spelled_as,
     symbol_named,
     variable_core,
     variable_in_unit,
@@ -65,7 +66,7 @@ def _variable_columns_found(dataset, text):
         column
         for column in dataset.columns_metadata
         if _identifies_variable(column, base, variants) or _measured_as_asked(column, text)
-    ]
+    ] or _abbreviated_columns(dataset, base)
     discarded = {
         column.sql_name: reason
         for column in named
@@ -81,6 +82,19 @@ def _variable_columns_found(dataset, text):
         discarded |= {column.sql_name: "secondary" for column in kept if column not in primary}
 
     return primary or kept, discarded
+
+
+#
+# Devuelve las columnas que nombran la variable con las palabras que la mención abrevia («cianos totales» en
+# «Cianobacterias totales»): sólo si ninguna columna la nombra tal cual.
+#
+def _abbreviated_columns(dataset, base):
+    columns = []
+    for column in dataset.columns_metadata:
+        spelled = spelled_as(base, column.original_name)
+        if spelled != normalize_text(base) and _identifies_variable(column, spelled, variable_variants(spelled)):
+            columns.append(column)
+    return columns
 
 
 #

@@ -249,6 +249,7 @@ def build_query_planning_graph(
             ),
             conserved_mentions=state.routing.conserved_mentions,
             requested_period=state.routing.requested_period,
+            reference_request=None if state.routing.reference_options else state.routing.reference_comparison,
         )
 
         return {

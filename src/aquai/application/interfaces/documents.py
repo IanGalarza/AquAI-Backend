@@ -62,6 +62,11 @@ class DocumentQueries(Protocol):
     def verified_chunks(self, chunk_ids: list[UUID]) -> dict[UUID, dict[str, Any]]: ...
 
     #
+    # Devuelve los fragmentos vigentes de un documento en esas posiciones, con su procedencia completa.
+    #
+    def chunks_at(self, document_id: UUID, positions: list[int]) -> dict[UUID, dict[str, Any]]: ...
+
+    #
     # Devuelve una huella del contenido consultable, que cambia al cargar o desactivar fuentes.
     #
     def searchable_version(self) -> tuple: ...

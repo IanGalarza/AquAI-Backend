@@ -26,7 +26,7 @@ from aquai.application.contracts.retrieval import DatasetProvenance, VerifiedDat
 from aquai.application.contracts.routing import CatalogDataset
 from aquai.application.dtos.requests.listSources import SourceSort
 from aquai.application.errors import SourceNotFoundError
-from aquai.application.matching import aligned_span
+from aquai.application.matching import abbreviates, aligned_span
 from aquai.application.Rules.documents import DOCUMENT_FILE_TYPES, TABULAR_FILE_TYPES
 from aquai.domain.enums.sourceStatus import ProcessingStatus
 from aquai.domain.models import Dataset, Document, Source
@@ -280,7 +280,7 @@ class SqlAlchemySourceQueries:
             for row in connection.execute(statement).mappings()
             if (row["column"], row["value"]) not in known
             and isinstance(row["value"], str)
-            and (aligned_span(term, row["value"]) or aligned_span(row["value"], term))
+            and (aligned_span(term, row["value"]) or aligned_span(row["value"], term) or abbreviates(row["value"], term))
         ]
 
     #

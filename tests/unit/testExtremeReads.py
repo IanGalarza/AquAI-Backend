@@ -1,12 +1,14 @@
 import asyncio
 import json
 import unittest
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
+from types import SimpleNamespace
 from uuid import uuid4
 
 from pydantic import TypeAdapter
 
-from aquai.application.contracts.planning import PlannerOutput, PlannerReply
+from aquai.application.answering.context import _date_pairs, _Writer
+from aquai.application.contracts.planning import PlannerOutput, PlannerReply, ValidationIssue
 from aquai.application.contracts.retrieval import (
     DatasetEvidence,
     DatasetProvenance,
@@ -15,8 +17,9 @@ from aquai.application.contracts.retrieval import (
     VerifiedDataset,
 )
 from aquai.application.contracts.routing import DataMention
+from aquai.application.errors import PlannerValidationError
 from aquai.application.planning.context import asked_extremes, extreme_orders
-from aquai.application.Services.planQueryService import PlanQueryService
+from aquai.application.Services.planQueryService import PlanQueryService, _Requested
 from aquai.domain.enums.sourceStatus import ProcessingStatus, SemanticIndexStatus
 
 _RAW = "abundancia_absoluta_cel_ml"
@@ -25,6 +28,9 @@ _TURBIDITY = "turbiedad_ntu"
 _PH = "ph"
 _SITE = "sitio"
 _SPECIES = "merismopedia_minima"
+_YEAR = "ano"
+_DATE = "fecha"
+_ADDRESS = "direccion"
 _READ = "read_rows"
 _SORT = f"{_READ}_extreme"
 _MISSING = "missing_requested_extreme"
@@ -35,6 +41,9 @@ _COLUMNS = {
     _PH: ("pH", "NUMERIC", None, None),
     _SITE: ("Sitio", "TEXT", None, None),
     _SPECIES: ("Merismopedia minima", "NUMERIC", None, None),
+    _YEAR: ("Año", "BIGINT", None, None),
+    _DATE: ("Fecha", "DATE", None, None),
+    _ADDRESS: ("Direccion", "TEXT", None, None),
 }
 
 
@@ -455,6 +464,245 @@ class UntouchedPlanTests(unittest.TestCase):
 
         self._assert_untouched(result)
         self.assertEqual(result.output_steps, [_READ])
+
+
+class PlanFormRepairTests(unittest.TestCase):
+    def test_a_threshold_written_as_text_becomes_a_number(self) -> None:
+        dataset = _dataset(_TURBIDITY)
+        threshold = {"field": _ref(dataset, _TURBIDITY), "operator": "ge", "values": ["20.000"]}
+        mentions = [DataMention(text="turbiedad", kind="variable"), DataMention(text="al menos 20.000", kind="threshold")]
+
+        result, _ = _planned(
+            dataset,
+            "¿Qué registros tienen una turbiedad de al menos 20.000?",
+            [_plan(dataset, [_TURBIDITY], filters=[threshold])],
+            matched=(_TURBIDITY,),
+            mentions=mentions,
+        )
+
+        self.assertEqual(result.status, "plannable")
+        self.assertEqual(_step(result, _READ).filters[0].values, [20000])
+
+    def test_a_value_filtered_in_the_wrong_column_moves_where_it_was_found(self) -> None:
+        dataset = _dataset(_TURBIDITY, _SITE, _ADDRESS)
+        stored = "C: AVENIDA ALTE G BROWN N 330 [Club de Pesca][Toma de Agua]"
+        wrong = {"field": _ref(dataset, _SITE), "operator": "eq", "values": ["Club de Pesca"]}
+        plan = _plan(dataset, [_TURBIDITY, _SITE], filters=[wrong])
+        requested = _Requested(
+            thresholds=[], periods=[], statistics=[], dimensions={}, chart=False, chart_required=False,
+            values=["Club de Pesca"], categories=False, several_rows=True,
+            value_matches={dataset.dataset_id: {"Club de Pesca": [(_ADDRESS, [stored])]}},
+        )
+
+        repaired = PlanQueryService._misplaced_values(plan, requested)
+        predicate = repaired.steps[0].filters[0]
+
+        self.assertEqual((predicate.field.column, predicate.operator, predicate.values), (_ADDRESS, "in", [stored]))
+        self.assertIn(_ADDRESS, repaired.datasets[0].columns)
+
+    def test_an_unrequested_limit_by_year_is_removed(self) -> None:
+        dataset = _dataset(_TURBIDITY, _YEAR)
+        latest = {
+            "id": "latest_year",
+            "tool": "sql",
+            "operation": "sort",
+            "depends_on": [_READ],
+            "order_by": [{"field": {"kind": "result", "step_id": _READ, "field": _YEAR}, "direction": "desc"}],
+            "limit": 1,
+            "purpose": "Quedarse con el último año.",
+        }
+        plan = _plan(dataset, [_TURBIDITY, _YEAR], [latest], output="latest_year")
+
+        result, _ = _planned(dataset, "Mostrame los registros de turbiedad", [plan], matched=(_TURBIDITY,))
+
+        self.assertEqual(result.output_steps, [_READ])
+        self.assertNotIn("latest_year", [step.id for step in result.operations])
+
+    def test_a_series_by_month_gets_a_line_chart(self) -> None:
+        dataset = _dataset(_TURBIDITY, _DATE)
+        monthly = {
+            "id": "monthly_mean",
+            "tool": "sql",
+            "operation": "aggregate",
+            "depends_on": [_READ],
+            "group_by": [
+                {"field": {"kind": "result", "step_id": _READ, "field": _DATE}, "output_name": "mes", "time_grain": "month"}
+            ],
+            "calculations": [
+                {"function": "mean", "inputs": [{"kind": "result", "step_id": _READ, "field": _TURBIDITY}], "output_name": "promedio"}
+            ],
+            "purpose": "Promediar por mes.",
+        }
+        plan = _plan(dataset, [_TURBIDITY, _DATE], [monthly], output="monthly_mean")
+
+        result, _ = _planned(dataset, "¿Cuál fue la turbiedad promedio por mes?", [plan], matched=(_TURBIDITY,))
+
+        charts = [step for step in result.operations if step.operation == "visualize"]
+        self.assertEqual(result.status, "plannable")
+        self.assertEqual([item.visualization.chart_type for item in charts], ["line"])
+        self.assertEqual(result.output_steps, ["monthly_mean", charts[0].id])
+
+    def test_an_unrequested_chart_of_records_that_feed_a_mean_publishes_only_the_mean(self) -> None:
+        dataset = _dataset(_TURBIDITY, _DATE)
+        mean = {
+            "id": "mean",
+            "tool": "sql",
+            "operation": "aggregate",
+            "depends_on": [_READ],
+            "calculations": [
+                {"function": "mean", "inputs": [{"kind": "result", "step_id": _READ, "field": _TURBIDITY}], "output_name": "promedio"}
+            ],
+            "purpose": "Promediar.",
+        }
+        trend = {
+            "id": "trend",
+            "tool": "python",
+            "operation": "visualize",
+            "depends_on": [_READ],
+            "visualization": {
+                "chart_type": "line",
+                "title": "Turbiedad",
+                "x": {"kind": "result", "step_id": _READ, "field": _DATE},
+                "y": {"kind": "result", "step_id": _READ, "field": _TURBIDITY},
+                "x_label": "Fecha",
+                "y_label": "Turbiedad",
+            },
+            "purpose": "Ver la tendencia.",
+        }
+        plan = _plan(dataset, [_TURBIDITY, _DATE], [mean, trend], output="mean")
+        plan.output_steps = ["mean", "trend"]
+
+        repaired = PlanQueryService._unrequested_charts(plan, False)
+
+        self.assertEqual(repaired.output_steps, ["mean"])
+        self.assertNotIn("trend", [step.id for step in repaired.steps])
+
+    def test_a_python_only_statistic_left_in_sql_moves_to_python_with_its_dependents(self) -> None:
+        dataset = _dataset(_TURBIDITY)
+        median = {
+            "id": "median",
+            "tool": "sql",
+            "operation": "aggregate",
+            "depends_on": [_READ],
+            "calculations": [
+                {"function": "median", "inputs": [{"kind": "result", "step_id": _READ, "field": _TURBIDITY}], "output_name": "mediana"}
+            ],
+            "purpose": "Mediana.",
+        }
+        ordered = {
+            "id": "ordered",
+            "tool": "sql",
+            "operation": "sort",
+            "depends_on": ["median"],
+            "order_by": [{"field": {"kind": "result", "step_id": "median", "field": "mediana"}, "direction": "desc"}],
+            "purpose": "Ordenar.",
+        }
+        plan = _plan(dataset, [_TURBIDITY], [median, ordered], output="ordered")
+
+        repaired = PlanQueryService._python_only_steps(plan)
+
+        self.assertEqual([step.tool for step in repaired.steps], ["sql", "python", "python"])
+
+    def test_a_branch_that_fails_verification_is_left_out_and_the_rest_answers(self) -> None:
+        dataset = _dataset(_TURBIDITY, _PH)
+        mean = {
+            "id": "mean",
+            "tool": "sql",
+            "operation": "aggregate",
+            "depends_on": [_READ],
+            "calculations": [
+                {"function": "mean", "inputs": [{"kind": "result", "step_id": _READ, "field": _TURBIDITY}], "output_name": "promedio"}
+            ],
+            "purpose": "Promediar.",
+        }
+        broken = {
+            "id": "broken",
+            "tool": "sql",
+            "operation": "aggregate",
+            "depends_on": [_READ],
+            "calculations": [
+                {"function": "max", "inputs": [{"kind": "result", "step_id": _READ, "field": "no_existe"}], "output_name": "maximo"}
+            ],
+            "purpose": "Máximo.",
+        }
+        plan = _plan(dataset, [_TURBIDITY, _PH], [mean, broken], output="mean")
+        plan.output_steps = ["mean", "broken"]
+
+        result, feedback = _planned(dataset, "¿Cuál es la turbiedad promedio?", [plan, plan], matched=(_TURBIDITY,))
+
+        self.assertEqual(result.status, "plannable")
+        self.assertEqual(result.output_steps, ["mean"])
+        self.assertIn("unverified_branch", [item.code for item in result.validation_issues])
+        self.assertTrue(feedback[1])
+
+    def test_a_plan_missing_only_a_named_source_survives_a_failed_retry(self) -> None:
+        class Provider:
+            context_budget_bytes = 100_000
+
+            async def propose(self, context):
+                return SimpleNamespace(decision=None, model="scripted", input_tokens=1, output_tokens=1)
+
+        gap = ValidationIssue(code="missing_named_source", severity="warning", message="Falta BASE FQ.", subject="BASE FQ")
+        first, calls = SimpleNamespace(issues=[gap]), []
+
+        async def verify(decision):
+            calls.append(decision)
+            if len(calls) == 1:
+                return first
+            raise PlannerValidationError("El modelo seleccionó una columna inexistente: sitio.")
+
+        context = SimpleNamespace(evidence={}, sent_to_model=False)
+        proposal = asyncio.run(PlanQueryService(Provider(), None)._propose(context, verify))
+
+        self.assertIs(proposal.verified, first)
+        self.assertIsNone(proposal.error)
+        self.assertEqual((proposal.attempts, len(proposal.rejections)), (2, 2))
+
+    def test_a_requested_period_adds_the_first_and_last_date_to_the_mean(self) -> None:
+        dataset = _dataset(_TURBIDITY, _DATE)
+        mean = {
+            "id": "mean",
+            "tool": "sql",
+            "operation": "aggregate",
+            "depends_on": [_READ],
+            "calculations": [
+                {"function": "mean", "inputs": [{"kind": "result", "step_id": _READ, "field": _TURBIDITY}], "output_name": "promedio"}
+            ],
+            "purpose": "Promediar.",
+        }
+        plan = _plan(dataset, [_TURBIDITY], [mean], output="mean")
+
+        result, _ = _planned(
+            dataset, "Indicá la turbiedad promedio y el período que cubren los datos", [plan], matched=(_TURBIDITY,)
+        )
+        calculations = {item.output_name: item for item in _step(result, "mean").calculations}
+
+        self.assertEqual(result.status, "plannable")
+        self.assertEqual((calculations["primera_fecha"].function, calculations["ultima_fecha"].function), ("min", "max"))
+        self.assertEqual(calculations["primera_fecha"].inputs[0].field, _DATE)
+        self.assertIn(_DATE, [ref.column for ref in _step(result, _READ).columns])
+
+    def test_the_first_and_last_date_of_a_mean_are_said_as_one_period(self) -> None:
+        writer = _Writer({}, {}, "es", False)
+        fields = {
+            "promedio": SimpleNamespace(sql_type="NUMERIC"),
+            "primera_fecha": SimpleNamespace(sql_type="DATE"),
+            "ultima_fecha": SimpleNamespace(sql_type="DATE"),
+        }
+        field = SimpleNamespace(field=_DATE)
+        calculations = {
+            "promedio": SimpleNamespace(function="mean", inputs=[SimpleNamespace(field=_TURBIDITY)]),
+            "primera_fecha": SimpleNamespace(function="min", inputs=[field]),
+            "ultima_fecha": SimpleNamespace(function="max", inputs=[field]),
+        }
+
+        self.assertEqual(_date_pairs(list(fields), calculations, fields), {"primera_fecha": "ultima_fecha"})
+        self.assertEqual(
+            writer.correlation_summary(0.109, 51), "Se calculó con 51 pares de valores: una relación lineal débil y positiva."
+        )
+        self.assertEqual(
+            writer._records_span(date(2021, 9, 1), date(2022, 3, 31)), "los registros van del 01/09/2021 al 31/03/2022"
+        )
 
 
 if __name__ == "__main__":
