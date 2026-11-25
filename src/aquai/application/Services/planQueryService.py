@@ -102,7 +102,6 @@ from aquai.application.planning.validation import (
 
 _logger = logging.getLogger(__name__)
 _USER_DECISIONS = {"ambiguous_filter_value"}
-_MAX_ATTEMPTS = 2
 _CATEGORY_LENGTH = 80
 _EXTREME_ROWS = 5
 _EXTREME_SUFFIX = "_extreme"
@@ -635,11 +634,12 @@ def _groups_by(grain, kinds) -> bool:
 
 class PlanQueryService:
     #
-    # Guarda el proveedor del Planner y las consultas de fuentes que usa el servicio.
+    # Guarda el proveedor del Planner, las consultas de fuentes que usa el servicio y el máximo de intentos.
     #
-    def __init__(self, provider: PlannerProvider, queries: SourceQueries) -> None:
+    def __init__(self, provider: PlannerProvider, queries: SourceQueries, *, max_attempts: int = 2) -> None:
         self._provider = provider
         self._queries = queries
+        self._max_attempts = max_attempts
 
     #
     # Planifica la consulta: arma el contexto, propone y verifica un plan y devuelve el resultado.
@@ -1098,7 +1098,7 @@ class PlanQueryService:
                 context.sent_to_model = True
                 _logger.warning("Planner intento %s rechazado: %s", attempt, error)
                 rejections.append(f"intento {attempt}: {error}")
-                if attempt < _MAX_ATTEMPTS:
+                if attempt < self._max_attempts:
                     feedback = self._rejection_feedback(error)
                     continue
                 if (kept := partial or fallback) is not None:
@@ -1114,12 +1114,12 @@ class PlanQueryService:
             answerable = self._answerable(verified, defects)
             if any(issue.code in _TEXT_COMPARISONS for issue in defects):
                 context.evidence["text_comparison_rejected"] = True
-            if defects and attempt >= _MAX_ATTEMPTS:
+            if defects and attempt >= self._max_attempts:
                 current = _Proposal(attempt, model, tokens, verified=answerable) if answerable else None
                 if (kept := partial or current or fallback) is not None:
                     rejections.append(f"intento {attempt}: {' '.join(issue.message for issue in defects)}")
                     return replace(kept, attempts=attempt, rejections=rejections)
-            if not (defects or gaps) or attempt >= _MAX_ATTEMPTS:
+            if not (defects or gaps) or attempt >= self._max_attempts:
                 return _Proposal(attempt, model, tokens, verified=verified, rejections=rejections)
             if not defects:
                 partial = _Proposal(attempt, model, tokens, verified=verified)

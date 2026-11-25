@@ -33,4 +33,6 @@ def create_response_generator():
         OllamaResponseProvider(models.ollama, models.response),
         embeddings=OllamaEmbeddingProvider(models.ollama, models.document_embedding),
         max_preview_rows=get_answering_settings().max_preview_rows,
+        draft_attempts=models.response.max_attempts,
+        document_draft_attempts=models.response.document_max_attempts,
     )

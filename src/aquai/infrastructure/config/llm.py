@@ -71,6 +71,7 @@ class PlannerModelSettings(AgentModelSettings):
 
     max_output_tokens: int = Field(default=4096, ge=1)
     context_max_bytes: int = Field(default=96000, ge=2048, le=96000)
+    max_attempts: int = Field(default=2, ge=1, le=5)
 
 
 class ResponseModelSettings(AgentModelSettings):
@@ -78,6 +79,8 @@ class ResponseModelSettings(AgentModelSettings):
 
     max_output_tokens: int = Field(default=2048, ge=1)
     context_max_bytes: int = Field(default=24000, ge=2048, le=96000)
+    max_attempts: int = Field(default=2, ge=1, le=5)
+    document_max_attempts: int = Field(default=2, ge=1, le=5)
 
 
 class EvidenceModelSettings(AgentModelSettings):

@@ -30,7 +30,11 @@ from aquai.infrastructure.queries.sources import SqlAlchemySourceQueries
 def create_query_planning_graph() -> CompiledStateGraph:
     models = get_llm_settings()
     sources = SqlAlchemySourceQueries(get_db_context())
-    planner = PlanQueryService(OllamaPlannerProvider(models.ollama, models.planner), sources)
+    planner = PlanQueryService(
+        OllamaPlannerProvider(models.ollama, models.planner),
+        sources,
+        max_attempts=models.planner.max_attempts,
+    )
     router = RouteQueryService(OllamaRoutingProvider(models.ollama, models.router), sources)
     direct = GenerateDirectResponseService(
         OllamaGeneralResponseProvider(models.ollama, models.general), sources

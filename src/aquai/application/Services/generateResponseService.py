@@ -139,11 +139,13 @@ class GenerateResponseService:
         embeddings: TextEmbeddings | None = None,
         max_preview_rows=3,
         draft_attempts=2,
+        document_draft_attempts=2,
     ):
         self._provider = provider
         self._embeddings = embeddings
         self._max_preview_rows = max_preview_rows
         self._draft_attempts = draft_attempts
+        self._document_draft_attempts = document_draft_attempts
 
     #
     # Genera la respuesta final a partir de la validación, la evidencia y los documentos del turno.
@@ -242,7 +244,7 @@ class GenerateResponseService:
             _retaken_analyses(state),
             notes=[item.text for item in closing],
         )
-        segments = await self._reviewed_segments(response, request, language)
+        segments = await self._reviewed_segments(response, request, language, self._document_draft_attempts)
         if segments is None:
             self._publish_unwritten(response, language, closing)
         else:
@@ -264,7 +266,7 @@ class GenerateResponseService:
             return False
 
         request = documental_request(state, language, self._provider.context_budget_bytes, [])
-        segments = await self._reviewed_segments(response, request, language)
+        segments = await self._reviewed_segments(response, request, language, self._draft_attempts)
         _record_trace(response, state)
         if segments is None:
             return False
@@ -293,7 +295,7 @@ class GenerateResponseService:
             comparisons=contrast.comparisons,
             ambiguities=contrast.hypotheses,
         )
-        segments = await self._reviewed_segments(response, request, language)
+        segments = await self._reviewed_segments(response, request, language, self._draft_attempts)
         if segments is None:
             return None
 
@@ -310,14 +312,14 @@ class GenerateResponseService:
         return segments
 
     #
-    # Pide la redacción, la verifica y reintenta una vez con los problemas encontrados.
+    # Pide la redacción, la verifica y reintenta con los problemas encontrados hasta agotar los intentos.
     #
-    async def _reviewed_segments(self, response, request, language):
+    async def _reviewed_segments(self, response, request, language, attempts):
         generation = response.generation
         generation.model = self._provider.model
         started = perf_counter()
         try:
-            reviewed = await self._best_draft(response, request)
+            reviewed = await self._best_draft(response, request, attempts)
         except LLMProviderError as error:
             _record_generation_error(generation, error, request)
             return None
@@ -448,11 +450,11 @@ class GenerateResponseService:
     #
     # Devuelve el borrador con menos problemas entre los intentos permitidos.
     #
-    async def _best_draft(self, response, request):
+    async def _best_draft(self, response, request, attempts):
         generation = response.generation
         record = request.record
         best = None
-        for _ in range(self._draft_attempts):
+        for _ in range(attempts):
             record.sent_to_model = True
             generation.context = record
             try:
