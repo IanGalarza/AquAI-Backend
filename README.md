@@ -1,33 +1,119 @@
 # AquAI Backend
 
-Backend de AquAI para cargar archivos CSV, XLSX, PDF y DOCX, gestionar fuentes y
-almacenar sus conjuntos de datos y documentos. Ofrece una API HTTP con FastAPI y capacidades semánticas
-mediante modelos locales.
+## Descripción general
+
+API de AquAI, un asistente que responde preguntas sobre calidad del agua. Carga y procesa las
+fuentes (planillas CSV y XLSX, documentos PDF y DOCX), gestiona las conversaciones y genera las
+respuestas con modelos de lenguaje que se ejecutan localmente en Ollama. La interfaz web está en
+AquAI-Frontend.
+
+## Tecnologías utilizadas
+
+| Área | Tecnologías |
+|---|---|
+| Lenguaje | Python 3.11 |
+| API | FastAPI, Uvicorn, Pydantic |
+| Persistencia | PostgreSQL 18, SQLAlchemy, Alembic |
+| Búsqueda | Qdrant |
+| Agentes | LangGraph, Ollama |
+| Datos y documentos | pandas, Plotly, Docling, RapidOCR |
+| Servicios locales | Docker Compose |
+| Pruebas | unittest |
 
 ## Arquitectura
 
-El proyecto sigue Clean Architecture y se organiza en cuatro capas:
+El código sigue Clean Architecture y se divide en cuatro capas dentro de `src/aquai`:
 
 | Capa | Responsabilidad |
 |---|---|
-| Domain | Entidades y estados del negocio. |
-| Application | Casos de uso, contratos, interfaces y DTOs. |
-| Infrastructure | Persistencia, migraciones e integración con servicios externos. |
-| Presentation | Controladores HTTP y manejo de solicitudes y errores de la API. |
+| `domain` | Entidades (fuentes, datasets, documentos, conversaciones y mensajes) y sus estados. |
+| `application` | Casos de uso, servicios, reglas de interpretación, prompts de los agentes e interfaces que implementa la infraestructura. No depende de FastAPI, SQLAlchemy, LangGraph ni de los clientes de Qdrant y Ollama. |
+| `infrastructure` | Persistencia y migraciones, procesamiento de archivos, clientes de Qdrant y Ollama, grafo de LangGraph, workers y composición de dependencias. |
+| `presentation` | API HTTP: routers de FastAPI, traducción de errores y middlewares. |
 
-PostgreSQL almacena las fuentes y los datos. Ollama ejecuta los modelos de
-lenguaje y embeddings. Qdrant almacena el índice semántico.
+Los controladores de `presentation` invocan los casos de uso, que `infrastructure/providers` arma
+con las implementaciones de la infraestructura.
 
-## Requisitos
+## Estructura del proyecto
+
+```text
+AquAI-Backend/
+├── alembic.ini                 Configuración de Alembic
+├── docker-compose.yml          PostgreSQL y Qdrant
+├── pyproject.toml              Dependencias del paquete
+├── .env.example                Variables de entorno de ejemplo
+├── src/aquai/
+│   ├── main.py                 Aplicación FastAPI
+│   ├── domain/
+│   │   ├── enums/              Estados y tipos del dominio
+│   │   └── models/             Entidades
+│   ├── application/
+│   │   ├── useCases/           Casos de uso, divididos en Commands y Queries
+│   │   ├── Services/           Servicios de los casos de uso, el grafo y los workers
+│   │   ├── planning/           Validación y reparación de planes
+│   │   ├── answering/          Construcción y verificación de respuestas
+│   │   ├── conversations/      Contexto y presentación de las conversaciones
+│   │   ├── Rules/              Reglas de interpretación (unidades, variables, idioma)
+│   │   ├── prompts/            Prompts de los agentes
+│   │   ├── contracts/          Contratos entre etapas y de conversaciones
+│   │   ├── dtos/               Solicitudes y respuestas HTTP de fuentes
+│   │   ├── interfaces/         Interfaces que implementa la infraestructura
+│   │   ├── validation/         Validación de gráficos
+│   │   └── utils/              Utilidades
+│   ├── infrastructure/
+│   │   ├── config/             Configuración leída de .env
+│   │   ├── persistence/        Mapeo de SQLAlchemy y sesiones
+│   │   ├── migrations/         Migraciones de Alembic
+│   │   ├── commands/           Escrituras en PostgreSQL
+│   │   ├── queries/            Lecturas y agente SQL
+│   │   ├── analysis/           Agente Python y gráficos Plotly
+│   │   ├── processing/         Lectura y conversión de planillas y documentos
+│   │   ├── graphs/             Grafo de LangGraph
+│   │   ├── providers/          Composición de dependencias, índices y clientes de Ollama
+│   │   └── workers/            Workers de fuentes y scripts de mantenimiento
+│   └── presentation/           Dependencias, errores HTTP y middlewares
+│       └── controllers/        Routers de /sources y /conversations
+└── tests/
+    ├── unit/                   Pruebas unitarias
+    └── integration/            Pruebas de integración de la API
+```
+
+## Endpoints
+
+| Método | Ruta | Descripción |
+|---|---|---|
+| POST | `/sources` | Carga un archivo CSV, XLSX, PDF o DOCX (campo `file`). |
+| GET | `/sources` | Lista las fuentes con paginación, filtros y orden. |
+| GET | `/sources/{id}` | Devuelve el estado y el detalle de una fuente. |
+| PATCH | `/sources/{id}` | Activa o desactiva una fuente. |
+| PUT | `/sources/{id}/file` | Reemplaza el archivo de un documento PDF o DOCX. |
+| DELETE | `/sources/{id}` | Elimina un documento PDF o DOCX. |
+| POST | `/conversations` | Crea una conversación. |
+| GET | `/conversations` | Lista las conversaciones. |
+| GET | `/conversations/{id}` | Devuelve una conversación. |
+| PATCH | `/conversations/{id}` | Renombra una conversación. |
+| DELETE | `/conversations/{id}` | Elimina una conversación y sus mensajes. |
+| GET | `/conversations/{id}/messages` | Devuelve el historial de mensajes. |
+| POST | `/conversations/{id}/messages` | Envía una pregunta y devuelve la respuesta al terminar. |
+| POST | `/conversations/{id}/messages/stream` | Envía una pregunta y transmite el progreso y la respuesta por SSE. |
+| GET | `/conversations/{id}/messages/{message_id}/events` | Retoma el seguimiento de una respuesta en curso. |
+| POST | `/conversations/{id}/messages/{message_id}/cancel` | Cancela una respuesta en curso. |
+
+Swagger UI, en `http://localhost:8000/docs`, describe cada solicitud y respuesta. Las escrituras
+(POST, PUT, PATCH y DELETE) solo se aceptan desde el origen del frontend o sin encabezado `Origin`,
+como las de `curl.exe`; desde Swagger UI se rechazan con 403.
+
+## Requisitos previos
 
 - Python 3.11 o superior.
 - Docker con Docker Compose.
-- Ollama instalado en el equipo.
+- Ollama con los modelos configurados en `.env`.
+- Conexión a internet la primera vez que se procesa un documento, para descargar los modelos de
+  Docling y el tokenizador `BAAI/bge-m3`.
 
-Los comandos siguientes están preparados para PowerShell y deben ejecutarse
-desde la raíz del repositorio.
+## Instalación y configuración
 
-## Instalación
+Los comandos se ejecutan en PowerShell desde la raíz del repositorio, donde se lee el archivo `.env`.
 
 ### 1. Crear el entorno virtual e instalar las dependencias
 
@@ -39,35 +125,23 @@ python -m pip install -e .
 
 ### 2. Configurar las variables de entorno
 
-Crear `.env` a partir del ejemplo si todavía no existe:
-
 ```powershell
-if (-not (Test-Path -LiteralPath .env)) {
-    Copy-Item .env.example .env
-}
+if (-not (Test-Path .env)) { Copy-Item .env.example .env }
 ```
 
-Editar `.env` con las credenciales y conexiones del entorno. `DATABASE_URL` debe
-coincidir con las variables `POSTGRES_*`. Los caracteres especiales del usuario
-y la contraseña deben codificarse en la URL; por ejemplo, `@` como `%40`.
-
-El archivo también permite configurar Ollama, Qdrant, los límites de carga y, en
-las variables `LLM_*`, el modelo, el contexto y los tokens de cada agente.
+`.env.example` documenta cada variable con su valor por defecto. Si se cambian las credenciales de
+`POSTGRES_*`, actualizar también `DATABASE_URL`; los caracteres especiales se codifican (por ejemplo,
+`@` como `%40`).
 
 ### 3. Iniciar PostgreSQL y Qdrant
-
-Con Docker iniciado:
 
 ```powershell
 docker compose up -d postgres qdrant
 ```
 
-### 4. Instalar los modelos de Ollama
+### 4. Descargar los modelos de Ollama
 
-Ollama debe estar ejecutándose. Si no está iniciado, ejecutar `ollama serve`
-en otra terminal y dejarla abierta.
-
-Luego, instalar los modelos definidos en `.env`. Con la configuración predeterminada:
+Con Ollama en ejecución, descargar los modelos definidos en `.env`. Con la configuración por defecto:
 
 ```powershell
 ollama pull qwen3.5:9b
@@ -75,72 +149,46 @@ ollama pull nomic-embed-text
 ollama pull bge-m3
 ```
 
-### 5. Aplicar las migraciones
+## Migraciones
+
+Las migraciones se gestionan con Alembic y están en `src/aquai/infrastructure/migrations/versions/`.
+Con el entorno virtual activo y PostgreSQL en ejecución:
 
 ```powershell
+# Aplicar las migraciones pendientes
 python -m alembic upgrade head
+
+# Generar una migración a partir de los cambios en el mapeo de SQLAlchemy
+python -m alembic revision --autogenerate -m "descripcion del cambio"
 ```
+
+La migración generada debe revisarse antes de aplicarla. `--autogenerate` ignora las tablas
+`dataset_<id>`, que se crean al procesar las planillas.
 
 ## Ejecución
 
-Con PostgreSQL, Qdrant y Ollama iniciados:
+Con PostgreSQL, Qdrant y Ollama en ejecución y las migraciones aplicadas:
 
 ```powershell
 .\.venv\Scripts\Activate.ps1
-python -m uvicorn aquai.main:app --reload
+python -m uvicorn aquai.main:app
 ```
 
-La API queda disponible en `http://localhost:8000`. Para consultar y probar los
-endpoints, abrir [Swagger UI](http://localhost:8000/docs), seleccionar una
-operación y usar **Try it out** y **Execute**.
+La API queda disponible en `http://localhost:8000`. No usar `--workers` con un valor mayor que 1:
+las respuestas en curso se siguen en la memoria del proceso.
 
-## Endpoints
+## Testing
 
-| Método | Ruta | Descripción |
-|---|---|---|
-| POST | `/sources` | Carga un CSV, XLSX, PDF o DOCX mediante `multipart/form-data`, con el campo `file`. Responde con HTTP 202 y el identificador de la fuente. |
-| GET | `/sources` | Lista las fuentes con paginación y filtros. |
-| GET | `/sources/{id}` | Consulta el estado de una fuente y sus datasets, columnas y conteos. |
-| PATCH | `/sources/{id}` | Activa o desactiva una fuente. |
-| PUT | `/sources/{id}/file` | Reemplaza el archivo de un documento PDF o DOCX y lo vuelve a procesar. |
-| DELETE | `/sources/{id}` | Elimina un documento PDF o DOCX con su contenido e índice. |
+Con el entorno virtual activo:
 
-`GET /sources` acepta los parámetros opcionales `page` (predeterminado: 1),
-`page_size` (predeterminado: 20; máximo: 100), `name` y `processing_status`.
-El parámetro `{id}` de las rutas de detalle y activación es un UUID.
+```powershell
+# Todas las pruebas
+python -m unittest discover -s tests -t .
 
-Para activar una fuente, enviar este cuerpo JSON a `PATCH /sources/{id}`:
-
-```json
-{
-  "isActive": true
-}
+# Un módulo, con el detalle de cada prueba
+python -m unittest -v tests.unit.testSimpleTabular
 ```
 
-Usar `false` para desactivarla. Los esquemas de las solicitudes y respuestas
-están disponibles en Swagger UI.
-
-### Conversaciones
-
-| Método | Ruta | Descripción |
-|---|---|---|
-| POST | `/conversations/{id}/messages` | Envía una pregunta y responde con el mensaje guardado del asistente cuando termina. |
-| POST | `/conversations/{id}/messages/stream` | Envía una pregunta y transmite el turno por Server-Sent Events. |
-| GET | `/conversations/{id}/messages/{message_id}/events` | Vuelve a seguir una respuesta en curso, por ejemplo tras recargar la página. |
-| POST | `/conversations/{id}/messages/{message_id}/cancel` | Cancela una respuesta en curso; el turno queda guardado como cancelado, salvo que la respuesta ya se estuviera guardando. |
-
-El flujo SSE emite `turn` (mensajes reservados), `stage` (etapa real del análisis
-que comienza: `interpreting`, `retrieving`, `referencing`, `planning`, `analyzing`,
-`validating`, `documents` o `writing`), `done` (resultado y mensaje guardado, con
-el mismo contenido validado que devuelve el endpoint sin streaming; si se canceló no
-trae mensaje y el cliente debe leer el estado guardado) y `error`. El
-turno se responde en segundo plano: si se corta la conexión, la respuesta se sigue
-generando y se guarda una sola vez. El seguimiento vive en la memoria del proceso,
-así que requiere ejecutar uvicorn con un solo worker.
-
-Cada respuesta en curso reserva su conversación por `CONVERSATIONS_GENERATION_LEASE_SECONDS`
-(45 s por defecto, mínimo 30) y renueva esa reserva cada tercio del plazo mientras se ejecuta,
-sin superar el timeout de la generación más 60 s. Si el backend se reinicia o se corta durante
-una respuesta, la reserva vence en ese plazo: el chat muestra la respuesta como interrumpida, la
-conversación vuelve a aceptar preguntas y, al enviar la siguiente, el turno anterior queda
-registrado como interrumpido.
+`tests/unit` contiene las pruebas unitarias y `tests/integration`, las del ciclo de vida de las
+fuentes a través de la API. No requieren PostgreSQL, Qdrant ni Ollama: usan SQLite y Qdrant en
+memoria y simulan las respuestas de Ollama.
